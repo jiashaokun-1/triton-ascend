@@ -81,6 +81,7 @@ docs/sg_execution_times.rst
 # clangd index. (".clangd" is a config file now, thus trailing slash)
 .clangd/
 .cache
+/.worktrees/
 /compile_commands.json
 .vscode
 .vs
