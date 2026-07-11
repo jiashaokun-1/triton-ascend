@@ -362,7 +362,7 @@ REVIEW
 - 主机和容器没有 HTTP/HTTPS/SOCKS 代理；
 - DNS 可以解析 GitHub，但 HTTPS 访问超时，不能依赖在线下载。
 
-实施时离线同步本地 `/Users/sky/Code/AscendNPU-IR`，排除 `.git`、已有 `build`、缓存和不需要的嵌套子模块产物，在容器内重新构建。
+本地 `/Users/sky/Code/AscendNPU-IR` 是开发源码和 Git 变更的唯一真源；所有代码先在本地修改，便于直接审阅 diff 和保留提交历史。验证批次再离线增量同步到容器 `/home/skj/code/AscendNPU-IR`，排除 `.git`、本地 `build` 和缓存，在容器内构建与运行测试。服务器目录是可重建的验证副本，不能成为代码变更的唯一存储位置。
 
 第一阶段的 compiler-side 校准不依赖 NPU。模型稳定后再用 NPU 验证：
 

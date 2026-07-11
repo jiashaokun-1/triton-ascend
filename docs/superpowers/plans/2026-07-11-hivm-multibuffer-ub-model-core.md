@@ -10,8 +10,9 @@
 
 ## Global Constraints
 
-- Implement in `/home/skj/code/AscendNPU-IR` inside container `sgl-skj` on `root@192.168.25.212`.
-- Sync source offline from `/Users/sky/Code/AscendNPU-IR`; exclude `.git`, `build`, caches, and Torch-MLIR. Temporarily restore the repository-pinned LLVM submodule because the container has no LLVM/MLIR development package.
+- Edit and commit all source in local `/Users/sky/Code/AscendNPU-IR`; this local Git worktree is the only source of truth.
+- Use `/home/skj/code/AscendNPU-IR` inside container `sgl-skj` on `root@192.168.25.212` only as a replaceable build/validation mirror.
+- Before each server build, sync local source offline while excluding `.git`, local `build`, caches, and Torch-MLIR. Temporarily restore the repository-pinned LLVM submodule because the container has no LLVM/MLIR development package.
 - Only `#hivm.address_space<ub>` contributes to UB bytes; GM/L1/L0 remain diagnostic metadata.
 - Consume the second local `MarkMultiBuffer` checkpoint; never read `PlanMemory` pointer offsets as prediction input.
 - Unknown UB-touching semantics, unresolved dynamic size, missing scope, or unmatched Mark source must never produce `SAFE`.
@@ -22,7 +23,7 @@
 
 ## File Structure
 
-Paths are relative to `/home/skj/code/AscendNPU-IR`.
+Source paths are relative to local `/Users/sky/Code/AscendNPU-IR`. The same relative paths appear under the server mirror `/home/skj/code/AscendNPU-IR` during validation.
 
 - `bishengir/include/bishengir/Dialect/HIVM/Analysis/UBModel.h` — public options, result schema, decision, and facade.
 - `bishengir/include/bishengir/Dialect/HIVM/Analysis/UBBufferGraph.h` — buffers, alias groups, operation points, conflicts, and slots.
@@ -33,6 +34,30 @@ Paths are relative to `/home/skj/code/AscendNPU-IR`.
 - `bishengir/test/lib/Dialect/HIVM/TestHIVMUBModel.cpp` — test-only command-line pass.
 - `bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir` — controlled behavior tests.
 
+## Development and Validation Loop
+
+Every implementation task follows this direction only:
+
+```text
+edit + review + commit locally
+  /Users/sky/Code/AscendNPU-IR
+           ↓ rsync (never copy remote .git back)
+build + test remotely
+  /home/skj/code/AscendNPU-IR in sgl-skj
+```
+
+Before each remote build, synchronize the local working tree with:
+
+```bash
+rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
+  --exclude='**/__pycache__/' --exclude='**/.pytest_cache/' \
+  --exclude='third-party/torch-mlir/' \
+  /Users/sky/Code/AscendNPU-IR/ \
+  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
+```
+
+All `git add`, `git diff`, and `git commit` commands run locally. All `ninja`, `bishengir-opt`, and `llvm-lit` commands run inside the remote container. A remote source edit must be discarded and reproduced locally before continuing.
+
 ---
 
 ### Task 1: Prepare the Offline Workspace and Baseline
@@ -42,7 +67,7 @@ Paths are relative to `/home/skj/code/AscendNPU-IR`.
 
 **Interfaces:**
 - Consumes: local source and SSH access.
-- Produces: buildable server tree and a passing memory-pass baseline.
+- Produces: unchanged local source plus a buildable server mirror and passing memory-pass baseline.
 
 - [ ] **Step 1: Dry-run the filtered transfer**
 
@@ -200,10 +225,12 @@ Register `TestHIVMUBModel` in `TestPasses.h`, add its source to `BiShengIRTestDi
 - [ ] **Step 6: Build, test, and commit**
 
 ```bash
-cd /home/skj/code/AscendNPU-IR/build
-ninja bishengir-opt BiShengIRTestDialectHIVM
-./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-buffer-collection.mlir
-cd ..
+rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
+  /Users/sky/Code/AscendNPU-IR/ \
+  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
+ssh root@192.168.25.212 \
+  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ninja bishengir-opt BiShengIRTestDialectHIVM && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-buffer-collection.mlir"'
+cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/include/bishengir/Dialect/HIVM/Analysis \
   bishengir/lib/Dialect/HIVM/Analysis \
   bishengir/test/lib/Dialect/HIVM bishengir/test/lib/Dialect/Test/TestPasses.h \
@@ -279,7 +306,7 @@ Number operations in deterministic pre-order. Treat load/DPS outputs as gen; kil
 ```bash
 ninja bishengir-opt BiShengIRTestDialectHIVM
 ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-alias-liveness.mlir
-cd /home/skj/code/AscendNPU-IR
+cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/include/bishengir/Dialect/HIVM/Analysis/UBBufferGraph.h \
   bishengir/lib/Dialect/HIVM/Analysis \
   bishengir/test/Dialect/HIVM/Analysis/ub-model-alias-liveness.mlir
@@ -339,7 +366,7 @@ Trace Mark source using the same alloc traceback utility used by production. Req
 ```bash
 ninja bishengir-opt BiShengIRTestDialectHIVM
 ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-multibuffer.mlir
-cd /home/skj/code/AscendNPU-IR
+cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/lib/Dialect/HIVM/Analysis \
   bishengir/test/Dialect/HIVM/Analysis/ub-model-multibuffer.mlir
 git commit -m "feat(hivm): expand multibuffer UB slots"
@@ -412,7 +439,7 @@ else decision = UBDecision::Safe;
 ```bash
 ninja bishengir-opt BiShengIRTestDialectHIVM
 ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-planner.mlir
-cd /home/skj/code/AscendNPU-IR
+cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/lib/Dialect/HIVM/Analysis \
   bishengir/test/Dialect/HIVM/Analysis/ub-model-planner.mlir
 git commit -m "feat(hivm): shadow-plan UB memory"
@@ -469,10 +496,12 @@ Each buffer must include ID, raw/aligned bytes, alias group, gen/kill, factor, s
 - [ ] **Step 4: Run every new test and commit**
 
 ```bash
-cd /home/skj/code/AscendNPU-IR/build
-ninja bishengir-opt BiShengIRTestDialectHIVM
-./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir
-cd ..
+rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
+  /Users/sky/Code/AscendNPU-IR/ \
+  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
+ssh root@192.168.25.212 \
+  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ninja bishengir-opt BiShengIRTestDialectHIVM && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir"'
+cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/lib/Dialect/HIVM/Analysis/UBModel.cpp \
   bishengir/test/lib/Dialect/HIVM/TestHIVMUBModel.cpp \
   bishengir/test/Dialect/HIVM/Analysis/ub-model-end-to-end.mlir
@@ -498,13 +527,8 @@ Expected: all five model test files PASS.
 - [ ] **Step 1: Run memory-pass regressions**
 
 ```bash
-cd /home/skj/code/AscendNPU-IR/build
-./bin/llvm-lit -v \
-  ../bishengir/test/Dialect/HIVM/mark-multi-buffer.mlir \
-  ../bishengir/test/Dialect/HIVM/plan-memory.mlir \
-  ../bishengir/test/Dialect/HIVM/enable-multi-buffer.mlir \
-  ../bishengir/test/Dialect/HIVM/infer-hivm-mem-scope.mlir \
-  ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir
+ssh root@192.168.25.212 \
+  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/mark-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/plan-memory.mlir ../bishengir/test/Dialect/HIVM/enable-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/infer-hivm-mem-scope.mlir ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir"'
 ```
 
 Expected: all PASS. Any failure blocks handoff.
@@ -527,9 +551,10 @@ Include all four decisions and a factor-2 before/after example.
 - [ ] **Step 3: Verify formatting and analysis tests**
 
 ```bash
-cd /home/skj/code/AscendNPU-IR
+cd /Users/sky/Code/AscendNPU-IR
 git diff --check
-build/bin/llvm-lit -v bishengir/test/Dialect/HIVM/Analysis
+ssh root@192.168.25.212 \
+  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR && build/bin/llvm-lit -v bishengir/test/Dialect/HIVM/Analysis"'
 ```
 
 Expected: no whitespace errors and all tests PASS.
@@ -537,6 +562,7 @@ Expected: no whitespace errors and all tests PASS.
 - [ ] **Step 4: Commit documentation**
 
 ```bash
+cd /Users/sky/Code/AscendNPU-IR
 git add docs/source/en/developer_guide/features/UBImpactModel.md \
   docs/source/zh_cn/developer_guide/features/UBImpactModel.md \
   docs/source/en/developer_guide docs/source/zh_cn/developer_guide
