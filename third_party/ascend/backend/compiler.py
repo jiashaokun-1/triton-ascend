@@ -212,34 +212,58 @@ FORWARDED_BISHENG_FLAG_CLASSIFICATION = {
     "--tile-mix-cube-loop": ("ub-affecting", "changes mixed cube-loop tiling"),
     "--tile-mix-vector-loop": ("ub-affecting", "changes mixed vector-loop tiling"),
 }
+FORWARDED_BISHENG_FLAG_SCANNED_HELPERS = (
+    "_direct_simt_libdevice_compile_options",
+    "get_common_bishengir_compile_options",
+    "linalg_to_bin_enable_npu_compile_910_95",
+    "linalg_to_bin_enable_npu_compile_A2_A3",
+    "ttir_to_npubin",
+)
 
 
 def _canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-@functools.lru_cache(maxsize=32)
-def _cached_npu_compiler_content_fingerprint(path, device, inode, size, mtime_ns):
-    del device, inode, size, mtime_ns
-    sha256 = hashlib.sha256()
-    with open(path, "rb") as compiler:
-        for chunk in iter(lambda: compiler.read(1024 * 1024), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+def _npu_compiler_kind(path):
+    selected_path = str(path)
+    if selected_path.endswith("bishengir-compile"):
+        return "bishengir-compile"
+    basename = Path(selected_path).name
+    if basename == "npuc":
+        return "npuc"
+    if not basename:
+        raise ValueError("selected NPU compiler has no executable name")
+    return f"other:{basename}"
+
+
+def _npu_compiler_uses_bishengir_frontend(path):
+    return _npu_compiler_kind(path) == "bishengir-compile"
+
+
+def _compiler_file_stat_identity(file_stat):
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
 
 
 def _npu_compiler_content_fingerprint(path):
     resolved = Path(path).expanduser().resolve(strict=True)
     if not resolved.is_file():
         raise OSError(f"selected NPU compiler is not a regular file: {resolved}")
-    stat = resolved.stat()
-    return _cached_npu_compiler_content_fingerprint(
-        str(resolved),
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-    )
+    sha256 = hashlib.sha256()
+    with resolved.open("rb") as compiler:
+        stat_before = os.fstat(compiler.fileno())
+        for chunk in iter(lambda: compiler.read(1024 * 1024), b""):
+            sha256.update(chunk)
+        stat_after = os.fstat(compiler.fileno())
+    if _compiler_file_stat_identity(stat_before) != _compiler_file_stat_identity(stat_after):
+        raise OSError(f"selected NPU compiler changed while hashing: {resolved}")
+    return sha256.hexdigest()
 
 
 def _direct_simt_libdevice_compile_options(metadata):
@@ -256,6 +280,7 @@ def _ub_affecting_identity_options(metadata, *, direct_simt=False):
     auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
     env_vf = os.getenv("TRITON_ENABLE_VF_FUSION")
     npu_compiler_path, _ = _get_npucompiler_path()
+    npu_compiler_kind = _npu_compiler_kind(npu_compiler_path)
     if direct_simt:
         libdevice_enabled, libdevice_forwarded, _ = _direct_simt_libdevice_compile_options(metadata)
     else:
@@ -269,6 +294,8 @@ def _ub_affecting_identity_options(metadata, *, direct_simt=False):
         "effective_disable_ffts": (force_disable_ffts() if metadata.get("compile_on_910_95", False) else None),
         "effective_npu_compiler_content_sha256":
         _npu_compiler_content_fingerprint(npu_compiler_path),
+        "effective_npu_compiler_kind":
+        npu_compiler_kind,
         "effective_enable_vf_fusion":
         ((env_vf.lower() in ("true", "1", "yes") if env_vf is not None else metadata.get("enable_vf_fusion", False))
          if metadata.get("compile_on_910_95", False) else None),
@@ -757,7 +784,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 _compile_option_list += ["--enable-auto-blockify-loop"]
 
         npu_compiler_path, env = _get_npucompiler_path()
-        if npu_compiler_path.endswith("bishengir-compile"):
+        if _npu_compiler_uses_bishengir_frontend(npu_compiler_path):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
@@ -973,7 +1000,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if _is_auto_map_parallel_blocks_enabled():
             _compile_option_list += ["--enable-auto-blockify-loop"]
         npu_compiler_path, env = _get_npucompiler_path()
-        if npu_compiler_path.endswith("bishengir-compile"):
+        if _npu_compiler_uses_bishengir_frontend(npu_compiler_path):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
                 bishengir_hivm_opt,

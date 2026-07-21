@@ -24,6 +24,7 @@ import ast
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import pickle
 from types import SimpleNamespace
@@ -189,6 +190,19 @@ EXPECTED_UB_AFFECTING_OPTIONS = (
     "warp_size",
 )
 
+EXPECTED_FORWARDED_BISHENG_SCANNED_HELPERS = (
+    "_direct_simt_libdevice_compile_options",
+    "get_common_bishengir_compile_options",
+    "linalg_to_bin_enable_npu_compile_910_95",
+    "linalg_to_bin_enable_npu_compile_A2_A3",
+    "ttir_to_npubin",
+)
+EXPECTED_NON_BISHENG_LONG_FLAG_HELPERS = (
+    "bc_to_linalg_by_bishengir_opt",
+    "linalg_to_bc_by_triton_mlir_opt",
+    "ttir_to_linalg",
+)
+
 
 def _identity_runtime(monkeypatch):
     monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
@@ -205,18 +219,12 @@ def _identity_runtime(monkeypatch):
     monkeypatch.delenv("TRITON_ENABLE_VF_FUSION", raising=False)
 
 
-def _forwarded_bisheng_flag_literals():
-    source = inspect.getsource(ascend_compiler).lstrip("\ufeff")
+def _forwarded_bisheng_flag_literals(source=None):
+    source = source or inspect.getsource(ascend_compiler).lstrip("\ufeff")
     tree = ast.parse(source)
-    function_names = {
-        "get_common_bishengir_compile_options",
-        "linalg_to_bin_enable_npu_compile_910_95",
-        "linalg_to_bin_enable_npu_compile_A2_A3",
-        "ttir_to_npubin",
-    }
     flags = set()
     for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
-        if function.name not in function_names:
+        if function.name not in EXPECTED_FORWARDED_BISHENG_SCANNED_HELPERS:
             continue
         for node in ast.walk(function):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
@@ -226,6 +234,18 @@ def _forwarded_bisheng_flag_literals():
             flag = node.value.split("=", 1)[0]
             flags.add(flag)
     return flags
+
+
+def _long_flag_helper_names(source=None):
+    source = source or inspect.getsource(ascend_compiler).lstrip("\ufeff")
+    tree = ast.parse(source)
+    return {
+        function.name
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef) and any(
+            isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("--")
+            for node in ast.walk(function))
+    }
 
 
 def test_mode_validation():
@@ -286,7 +306,7 @@ def test_pipeline_identity_changes_when_pass_order_changes(monkeypatch):
     assert first["sha256"] != second["sha256"]
 
 
-def test_pipeline_identity_uses_compiler_content_not_path_or_basename(monkeypatch, tmp_path):
+def test_pipeline_identity_binds_compiler_kind_and_content(monkeypatch, tmp_path):
     monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
     monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
     monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
@@ -295,7 +315,7 @@ def test_pipeline_identity_uses_compiler_content_not_path_or_basename(monkeypatc
     metadata = _compiler_metadata()
 
     first_path = tmp_path / "first" / "npuc"
-    second_path = tmp_path / "second" / "bishengir-compile"
+    second_path = tmp_path / "second" / "npuc"
     first_path.parent.mkdir()
     second_path.parent.mkdir()
     first_path.write_bytes(b"same compiler content")
@@ -306,12 +326,83 @@ def test_pipeline_identity_uses_compiler_content_not_path_or_basename(monkeypatc
     second = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
     assert first["sha256"] == second["sha256"]
 
-    third_path = tmp_path / "third" / "npuc"
+    third_path = tmp_path / "third" / "bishengir-compile"
     third_path.parent.mkdir()
-    third_path.write_bytes(b"different compiler content")
+    third_path.write_bytes(b"same compiler content")
     monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(third_path), {}))
     third = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
     assert third["sha256"] != first["sha256"]
+    first_options = json.loads(first["relevant_options_json"])
+    third_options = json.loads(third["relevant_options_json"])
+    assert first_options["effective_npu_compiler_kind"] == "npuc"
+    assert third_options["effective_npu_compiler_kind"] == "bishengir-compile"
+    assert first_options["effective_npu_compiler_content_sha256"] == \
+        third_options["effective_npu_compiler_content_sha256"]
+
+
+def test_compiler_kind_changes_linalg_command_with_identical_content(monkeypatch, tmp_path):
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        output = Path(command[command.index("-o") + 1] + ".o")
+        output.write_bytes(b"npubin")
+        return SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+
+    npuc = tmp_path / "npuc"
+    bishengir_compile = tmp_path / "bishengir-compile"
+    npuc.write_bytes(b"same compiler content")
+    bishengir_compile.write_bytes(b"same compiler content")
+    monkeypatch.setattr(ascend_compiler, "_parse_linalg_metadata", lambda linalg, metadata: (linalg, metadata))
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_api_change", lambda: True)
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_is_ascend_sanitizer_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_is_debug_line_info_disabled", lambda: True)
+    monkeypatch.setattr(ascend_compiler, "_enable_print_ub_bits", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_enable_dump_memory_info", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_enable_msdebug", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "get_libdevice", lambda: "/test/libdevice.bc")
+    monkeypatch.setattr(ascend_compiler, "NPUUtils", lambda: SimpleNamespace(get_arch=lambda: "Ascend910B"))
+    monkeypatch.setattr(ascend_compiler.subprocess, "run", run)
+    options = ascend_compiler.NPUOptions(compile_on_910_95=False)
+    metadata = _compiler_metadata(bitcodes=[], auto_tile_and_bind_subblock=True)
+
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(npuc), {}))
+    ascend_compiler.linalg_to_bin_enable_npu_compile_A2_A3("module", dict(metadata), options)
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(bishengir_compile), {}))
+    ascend_compiler.linalg_to_bin_enable_npu_compile_A2_A3("module", dict(metadata), options)
+
+    assert "--enable-triton-kernel-compile=true" not in commands[0]
+    assert "--enable-triton-kernel-compile=true" in commands[1]
+    assert commands[0] != commands[1]
+
+
+def test_compiler_content_fingerprint_rehashes_preserved_stat_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: False)
+    monkeypatch.delenv("TRITON_ENABLE_VF_FUSION", raising=False)
+    compiler = tmp_path / "npuc"
+    compiler.write_bytes(b"AAAA")
+    original_stat = compiler.stat()
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(compiler), {}))
+    first = ascend_compiler._ttir_ub_pipeline_identity("pipeline", _compiler_metadata())
+
+    compiler.write_bytes(b"BBBB")
+    os.utime(compiler, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    rewritten_stat = compiler.stat()
+    assert rewritten_stat.st_ino == original_stat.st_ino
+    assert rewritten_stat.st_size == original_stat.st_size
+    assert rewritten_stat.st_mtime_ns == original_stat.st_mtime_ns
+
+    second = ascend_compiler._ttir_ub_pipeline_identity("pipeline", _compiler_metadata())
+    first_options = json.loads(first["relevant_options_json"])
+    second_options = json.loads(second["relevant_options_json"])
+    assert first_options["effective_npu_compiler_content_sha256"] == hashlib.sha256(b"AAAA").hexdigest()
+    assert second_options["effective_npu_compiler_content_sha256"] == hashlib.sha256(b"BBBB").hexdigest()
+    assert first["sha256"] != second["sha256"]
 
 
 def test_selected_compiler_read_failure_makes_policy_identity_fail_open(monkeypatch, tmp_path):
@@ -412,12 +503,30 @@ module attributes {mix_mode = "aiv", parallel_mode = "mix_simd_simt",
 
 def test_ub_affecting_options_and_forwarded_bisheng_flags_are_closed_goldens():
     assert ascend_compiler.UB_AFFECTING_OPTIONS == EXPECTED_UB_AFFECTING_OPTIONS
+    assert ascend_compiler.FORWARDED_BISHENG_FLAG_SCANNED_HELPERS == EXPECTED_FORWARDED_BISHENG_SCANNED_HELPERS
+    assert _long_flag_helper_names() == (set(EXPECTED_FORWARDED_BISHENG_SCANNED_HELPERS)
+                                         | set(EXPECTED_NON_BISHENG_LONG_FLAG_HELPERS))
     assert _forwarded_bisheng_flag_literals() == set(ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION)
     for category, justification in ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION.values():
         assert category in ("ub-affecting", "non-ub")
         assert justification
     assert ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION["--enable-hivm-cross-core-gss"][0] == \
         "ub-affecting"
+
+
+def test_direct_helper_unknown_forwarded_flag_fails_closure_gate():
+    source = inspect.getsource(ascend_compiler).lstrip("\ufeff")
+    marker = "def _direct_simt_libdevice_compile_options(metadata):\n"
+    assert marker in source
+    mutated = source.replace(marker, marker + '    future_option = "--future-direct-ub=true"\n', 1)
+    unclassified = _forwarded_bisheng_flag_literals(mutated) - set(
+        ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION)
+    assert unclassified == {"--future-direct-ub"}
+
+    new_helper = '\ndef _future_direct_compile_options():\n    return ["--future-helper-ub=true"]\n'
+    mutated_with_helper = source + new_helper
+    known_helpers = (set(EXPECTED_FORWARDED_BISHENG_SCANNED_HELPERS) | set(EXPECTED_NON_BISHENG_LONG_FLAG_HELPERS))
+    assert _long_flag_helper_names(mutated_with_helper) - known_helpers == {"_future_direct_compile_options"}
 
 
 def test_make_ttir_calls_policy_after_canonicalization_and_does_not_run_future_pm(monkeypatch):
