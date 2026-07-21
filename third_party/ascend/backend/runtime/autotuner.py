@@ -405,46 +405,61 @@ class AutoTilingTuner(Autotuner):
     def _batch_bench(self, *args, configs, **kwargs):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
         from triton.runtime.errors import OutOfResources
+        from ..ub_lower_bound import ub_filter_telemetry_session
 
         kernels_call = {config: self._make_kernel_call(*args, config=config, **kwargs) for config in configs}
         run_fns = {}
         exc = None
         exc_stack = ""
 
-        if self.compile_parallel:
-            import psutil
+        with ub_filter_telemetry_session() as stats:
+            if self.compile_parallel:
+                import psutil
 
-            max_workers = min(psutil.cpu_count(logical=False) // 2, len(kernels_call))
-            future_kernels = []
-            try:
-                with (
-                        ThreadPoolExecutor(max_workers=max_workers) as executor,
-                        triton.AsyncCompileMode(executor),
-                ):
-                    for config, fn in kernels_call.items():
-                        future_kernels.append((config, fn(warmup=True)))
-
-                    for config, fut in future_kernels:
-                        try:
-                            if hasattr(fut, "result"):
-                                fut = fut.result()
-                            run_fns[config] = functools.partial(kernels_call[config], warmup=False)
-                        except (CompileTimeAssertionFailure, MLIRCompilationError) as e:
-                            import traceback
-                            exc_stack = traceback.format_exc()
-                            exc = e
-            except Exception as e:
-                # ignore exception from __exit__() of AsyncCompileMode
-                triton.runtime._async_compile.active_mode.set(None)
-        else:
-            for config, fn in kernels_call.items():
+                max_workers = min(psutil.cpu_count(logical=False) // 2, len(kernels_call))
+                future_kernels = []
                 try:
-                    fn(warmup=False)
-                    run_fns[config] = functools.partial(fn, warmup=False)
-                except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
-                    import traceback
-                    exc_stack = traceback.format_exc()
-                    exc = e
+                    with (
+                            ThreadPoolExecutor(max_workers=max_workers) as executor,
+                            triton.AsyncCompileMode(executor),
+                    ):
+                        for config, fn in kernels_call.items():
+                            future_kernels.append((config, fn(warmup=True)))
+
+                        for config, fut in future_kernels:
+                            try:
+                                if hasattr(fut, "result"):
+                                    fut = fut.result()
+                                run_fns[config] = functools.partial(kernels_call[config], warmup=False)
+                            except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
+                                import traceback
+                                exc_stack = traceback.format_exc()
+                                exc = e
+                except Exception:
+                    # Preserve the existing handling for exceptions not
+                    # classified as per-config compilation failures.
+                    pass
+            else:
+                for config, fn in kernels_call.items():
+                    try:
+                        fn(warmup=False)
+                        run_fns[config] = functools.partial(fn, warmup=False)
+                    except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
+                        import traceback
+                        exc_stack = traceback.format_exc()
+                        exc = e
+
+        if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
+            with stats.lock:
+                summary = (
+                    stats.analyzed,
+                    stats.rejected,
+                    stats.deferred,
+                    stats.passed_to_backend,
+                )
+            print("Triton autotuning UB filter: "
+                  f"analyzed={summary[0]}, rejected={summary[1]}, "
+                  f"deferred={summary[2]}, passed_to_backend={summary[3]}")
 
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")

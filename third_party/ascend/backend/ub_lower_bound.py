@@ -19,7 +19,11 @@
 # THE SOFTWARE.
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 
 from triton._C.libtriton import ascend
 from triton.runtime.cache import get_dump_manager
@@ -46,6 +50,52 @@ _RESULT_KEYS = frozenset({
     "contract_version",
 })
 _CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids"})
+
+
+@dataclass
+class UBFilterStats:
+    """Counters for one autotune compilation round.
+
+    ``analyzed`` counts every non-off policy attempt, including attempts that
+    conservatively defer before entering the analyzer binding. With the V1
+    reject/defer decision schema, ``analyzed == rejected + deferred``.
+    ``passed_to_backend`` counts attempts whose mode and decision allow the
+    downstream compiler to run; shadow rejects therefore count as passed.
+    """
+
+    analyzed: int = 0
+    rejected: int = 0
+    deferred: int = 0
+    passed_to_backend: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+
+_active_stats = ContextVar("ascend_ub_filter_stats", default=None)
+
+
+@contextmanager
+def ub_filter_telemetry_session():
+    """Create an isolated telemetry session for one autotune round."""
+    stats = UBFilterStats()
+    token = _active_stats.set(stats)
+    try:
+        yield stats
+    finally:
+        _active_stats.reset(token)
+
+
+def _record_telemetry(mode, result):
+    stats = _active_stats.get()
+    if stats is None:
+        return
+    with stats.lock:
+        stats.analyzed += 1
+        if result["decision"] == "reject":
+            stats.rejected += 1
+        else:
+            stats.deferred += 1
+        if mode != "enforce" or result["decision"] != "reject":
+            stats.passed_to_backend += 1
 
 
 def load_contract_profiles():
@@ -210,6 +260,7 @@ def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
                 except Exception:
                     result = _defer_result(pipeline_fingerprint, "invalid-analysis-result")
 
+    _record_telemetry(mode, result)
     _record_metadata(metadata, mode, result)
     if getattr(opt, "debug", False):
         dump_manager = get_dump_manager(metadata["hash"])
