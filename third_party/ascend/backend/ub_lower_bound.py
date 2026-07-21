@@ -116,6 +116,11 @@ def _pipeline_fingerprint(pipeline_identity):
     return ""
 
 
+def _analysis_compile_mode(compile_mode):
+    """Map backend mode names to the core-kind vocabulary used by MURG."""
+    return "aiv" if compile_mode == "simd" else compile_mode
+
+
 def _defer_result(pipeline_fingerprint, reason):
     return {
         "decision": "defer",
@@ -246,7 +251,7 @@ def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
                     mod,
                     {
                         "arch": opt.arch,
-                        "compile_mode": opt.compile_mode,
+                        "compile_mode": _analysis_compile_mode(opt.compile_mode),
                         "pipeline_identity": pipeline_identity,
                         "pipeline_stages": [],
                         "contract_profile": load_contract_profiles(),

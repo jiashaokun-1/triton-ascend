@@ -1027,6 +1027,30 @@ def test_policy_passes_only_packaged_empty_profile(monkeypatch):
         "profiles": [],
     }
     assert "allow_unvalidated" not in captured
+    assert captured["compile_mode"] == "aiv"
+
+
+def test_non_vector_compile_mode_is_not_reclassified(monkeypatch):
+    captured = {}
+
+    def analyze(_mod, options):
+        captured.update(options)
+        return _analysis_result("defer")
+
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", analyze)
+    apply_ub_lower_bound_policy(object(), {}, Options("shadow", compile_mode="simt_only"), "test-id")
+    assert captured["compile_mode"] == "simt_only"
+
+
+def test_capacity_boundary_is_not_rejected(monkeypatch):
+    result = _analysis_result("defer")
+    result["lower_bound_bytes"] = result["capacity_bytes"]
+    result["certificates"][0]["bytes"] = result["capacity_bytes"]
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_args: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options("enforce"), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == metadata["ub_capacity_bytes"]
 
 
 def test_overflow_exception_pickles_across_process_pool():
