@@ -501,6 +501,70 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, NullModuleDefersAsMalformedIR) {
   EXPECT_TRUE(hasReason(result, "malformed-ir"));
 }
 
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       UnknownOpWithSuccessorDefersBeforeVerifier) {
+  context.allowUnregisteredDialects();
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::ReturnOp returnOp = findOnlyOp<triton::ReturnOp>(*module);
+  OperationState state(returnOp.getLoc(), "test.malformed_unknown");
+  state.addSuccessors(returnOp->getBlock());
+  Operation *unknown = Operation::create(state);
+  returnOp->getBlock()->getOperations().insert(returnOp->getIterator(),
+                                                unknown);
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-op"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ArithmeticOpWithMalformedRegionDefersBeforeVerifier) {
+  context.allowUnregisteredDialects();
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::ReturnOp returnOp = findOnlyOp<triton::ReturnOp>(*module);
+  OperationState state(returnOp.getLoc(), "arith.malformed");
+  Region *region = state.addRegion();
+  auto block = std::make_unique<Block>();
+  OperationState innerState(returnOp.getLoc(), "test.inner");
+  block->push_back(Operation::create(innerState));
+  region->push_back(block.release());
+  Operation *arithmetic = Operation::create(state);
+  returnOp->getBlock()->getOperations().insert(returnOp->getIterator(),
+                                                arithmetic);
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-op-arithmetic"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ReductionWithMissingPropertyDefersBeforeVerifier) {
+  std::string source = replaceOnce(
+      kDirectLoadCopy,
+      "    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>",
+      R"mlir(    %sum = "tt.reduce" (%value) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %add = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %add : f32
+    }) {axis = 0 : i32} : (tensor<65536xf32>) -> f32)mlir");
+  OwningOpRef<ModuleOp> module = parse(source);
+  ASSERT_TRUE(module);
+  triton::ReduceOp reduce = findOnlyOp<triton::ReduceOp>(*module);
+  reduce.getProperties().axis = {};
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-op-reduction"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
 TEST_F(TTIRUBLowerBoundAnalysisTest, ZeroRegionModuleDefersAsMalformedIR) {
   OperationState state(UnknownLoc::get(&context), ModuleOp::getOperationName());
   Operation *rawModule = Operation::create(state);
@@ -654,6 +718,34 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, ZeroRegionFunctionDefersAsMalformedIR) {
   TTIRUBAnalysisResult result = analyzeModule(*module, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       MissingFunctionNameDefersBeforeVerifier) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::FuncOp function = findOnlyOp<triton::FuncOp>(*module);
+  function.getProperties().sym_name = {};
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       MissingFunctionTypeDefersBeforeVerifier) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::FuncOp function = findOnlyOp<triton::FuncOp>(*module);
+  function.getProperties().function_type = {};
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,

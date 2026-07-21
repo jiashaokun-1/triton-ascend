@@ -49,70 +49,127 @@ void addReason(SmallVectorImpl<std::string> &reasons, StringRef reason) {
     reasons.push_back(reason.str());
 }
 
-bool isVerifierSafe(Operation *root) {
+template <typename OpTy> bool hasExactRegisteredType(Operation *operation) {
+  return operation->getName().isRegistered() &&
+         operation->getName().getTypeID() == TypeID::get<OpTy>();
+}
+
+bool hasExactShape(Operation *operation, unsigned numOperands,
+                   unsigned numResults, unsigned numRegions,
+                   unsigned numSuccessors) {
+  return operation->getNumOperands() == numOperands &&
+         operation->getNumResults() == numResults &&
+         operation->getNumRegions() == numRegions &&
+         operation->getNumSuccessors() == numSuccessors;
+}
+
+StringRef classifyUnsupportedOperation(Operation *operation) {
+  StringRef name = operation->getName().getStringRef();
+  if (name == triton::ReduceOp::getOperationName())
+    return "unsupported-op-reduction";
+  if (name.split('.').first == "arith")
+    return "unsupported-op-arithmetic";
+  if (operation->getNumRegions() != 0)
+    return "nested-region";
+  return "unsupported-op";
+}
+
+StringRef getVerifierPreflightFailure(Operation *root) {
+  unsigned functionCount = 0;
   SmallVector<Operation *> worklist{root};
   while (!worklist.empty()) {
     Operation *operation = worklist.pop_back_val();
     StringRef name = operation->getName().getStringRef();
-    if (name == "tt.make_range") {
-      if (operation->getNumOperands() != 0 ||
-          operation->getNumResults() != 1 ||
-          operation->getNumRegions() != 0 ||
-          operation->getNumSuccessors() != 0)
-        return false;
-    } else if (name == "tt.splat") {
-      if (operation->getNumOperands() != 1 ||
-          operation->getNumResults() != 1 ||
-          operation->getNumRegions() != 0 ||
-          operation->getNumSuccessors() != 0)
-        return false;
-    } else if (name == "tt.addptr") {
-      if (operation->getNumOperands() != 2 ||
-          operation->getNumResults() != 1 ||
-          operation->getNumRegions() != 0 ||
-          operation->getNumSuccessors() != 0)
-        return false;
-    } else if (name == "tt.load") {
-      if (!operation->getName().isRegistered() ||
-          operation->getName().getTypeID() != TypeID::get<triton::LoadOp>() ||
-          operation->getNumResults() != 1 ||
-          operation->getNumRegions() != 0 ||
-          operation->getNumSuccessors() != 0)
-        return false;
+    if (name == ModuleOp::getOperationName()) {
+      if (operation != root || !hasExactRegisteredType<ModuleOp>(operation) ||
+          !hasExactShape(operation, 0, 0, 1, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
+      // ModuleOp has no mandatory inherent properties in this MLIR pin.
+    } else if (name == triton::FuncOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::FuncOp>(operation) ||
+          !hasExactShape(operation, 0, 0, 1, 0) ||
+          operation->getParentOp() != root || ++functionCount != 1)
+        return "malformed-ir";
       OpaqueProperties storage = operation->getPropertiesStorage();
       if (!storage)
-        return false;
+        return "malformed-ir";
+      const auto *properties = storage.as<triton::FuncOp::Properties *>();
+      Attribute rawName = properties->sym_name;
+      Attribute rawType = properties->function_type;
+      auto functionTypeAttr = dyn_cast_or_null<TypeAttr>(rawType);
+      if (!isa_and_nonnull<StringAttr>(rawName) || !functionTypeAttr ||
+          !isa<FunctionType>(functionTypeAttr.getValue()))
+        return "malformed-ir";
+    } else if (name == triton::ReturnOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::ReturnOp>(operation) ||
+          !hasExactShape(operation, 0, 0, 0, 0))
+        return "malformed-ir";
+      // ReturnOp uses EmptyProperties and has no mandatory attributes.
+    } else if (name == triton::MakeRangeOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::MakeRangeOp>(operation) ||
+          !hasExactShape(operation, 0, 1, 0, 0))
+        return "malformed-ir";
+      OpaqueProperties storage = operation->getPropertiesStorage();
+      if (!storage)
+        return "malformed-ir";
+      const auto *properties = storage.as<triton::MakeRangeOp::Properties *>();
+      Attribute rawStart = properties->start;
+      Attribute rawEnd = properties->end;
+      if (!isa_and_nonnull<IntegerAttr>(rawStart) ||
+          !isa_and_nonnull<IntegerAttr>(rawEnd))
+        return "malformed-ir";
+    } else if (name == triton::SplatOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::SplatOp>(operation) ||
+          !hasExactShape(operation, 1, 1, 0, 0))
+        return "malformed-ir";
+    } else if (name == triton::AddPtrOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::AddPtrOp>(operation) ||
+          !hasExactShape(operation, 2, 1, 0, 0))
+        return "malformed-ir";
+    } else if (name == triton::LoadOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::LoadOp>(operation) ||
+          operation->getNumResults() != 1 ||
+          operation->getNumRegions() != 0 ||
+          operation->getNumSuccessors() != 0)
+        return "malformed-ir";
+      OpaqueProperties storage = operation->getPropertiesStorage();
+      if (!storage)
+        return "malformed-ir";
       const auto *properties = storage.as<triton::LoadOp::Properties *>();
       if (!properties->boundaryCheck || !properties->cache ||
           !properties->evict || !properties->isVolatile ||
           !detail::hasValidLoadOperandSegments(
               properties->operandSegmentSizes,
               operation->getNumOperands()))
-        return false;
-    } else if (name == "tt.store") {
-      if (!operation->getName().isRegistered() ||
-          operation->getName().getTypeID() != TypeID::get<triton::StoreOp>() ||
+        return "malformed-ir";
+    } else if (name == triton::StoreOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::StoreOp>(operation) ||
           operation->getNumResults() != 0 ||
           operation->getNumRegions() != 0 ||
           operation->getNumSuccessors() != 0)
-        return false;
+        return "malformed-ir";
       OpaqueProperties storage = operation->getPropertiesStorage();
       if (!storage)
-        return false;
+        return "malformed-ir";
       const auto *properties = storage.as<triton::StoreOp::Properties *>();
       if (!properties->boundaryCheck || !properties->cache ||
           !properties->evict)
-        return false;
+        return "malformed-ir";
       // StoreOp has no AttrSizedOperandSegments property in this checkout;
       // its ODS groups are uniquely derived from the total operand count.
       int64_t maskSize = static_cast<int64_t>(operation->getNumOperands()) - 2;
       if (maskSize < 0 || maskSize > 1)
-        return false;
+        return "malformed-ir";
       std::array<int32_t, 3> segments = {
           1, 1, static_cast<int32_t>(maskSize)};
       if (!detail::hasValidStoreOperandSegments(
               segments, operation->getNumOperands()))
-        return false;
+        return "malformed-ir";
+    } else {
+      // Raw names are used only to reject unsupported operations. Never walk
+      // into them or expose their structure/properties to the verifier.
+      return classifyUnsupportedOperation(operation);
     }
 
     for (Region &region : operation->getRegions())
@@ -120,7 +177,7 @@ bool isVerifierSafe(Operation *root) {
         for (Operation &nested : block)
           worklist.push_back(&nested);
   }
-  return true;
+  return functionCount == 1 ? StringRef() : StringRef("malformed-ir");
 }
 
 bool hasKnownPipelineProfile(const TTIRUBAnalysisOptions &options,
@@ -148,8 +205,17 @@ TTIRUBAnalysisResult
 analyzeTTIRUBLowerBound(ModuleOp module, const TTIRUBAnalysisOptions &options,
                         const PipelineContractRegistry &registry) {
   TTIRUBAnalysisResult result;
-  if (!module || !isVerifierSafe(module.getOperation()) ||
-      failed(verify(module.getOperation()))) {
+  if (!module) {
+    addReason(result.unsupportedReasons, "malformed-ir");
+    return result;
+  }
+  StringRef preflightFailure =
+      getVerifierPreflightFailure(module.getOperation());
+  if (!preflightFailure.empty()) {
+    addReason(result.unsupportedReasons, preflightFailure);
+    return result;
+  }
+  if (failed(verify(module.getOperation()))) {
     addReason(result.unsupportedReasons, "malformed-ir");
     return result;
   }
