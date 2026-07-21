@@ -115,6 +115,8 @@ def _normalize_result(result, pipeline_fingerprint, trusted_capacity):
             return invalid()
     elif not _is_int64(capacity_bytes):
         return invalid()
+    elif capacity_bytes != trusted_capacity:
+        return invalid()
     if type(certificates) is not list:
         return invalid()
     normalized_certificates = []
@@ -129,8 +131,8 @@ def _normalize_result(result, pipeline_fingerprint, trusted_capacity):
         return invalid()
     if type(result_fingerprint) is not str or result_fingerprint != pipeline_fingerprint:
         return invalid()
-    if decision == "reject" and (lower_bound_bytes <= capacity_bytes or capacity_bytes != trusted_capacity
-                                 or len(normalized_certificates) != 1 or unsupported_reasons):
+    if decision == "reject" and (lower_bound_bytes <= capacity_bytes or len(normalized_certificates) != 1
+                                 or unsupported_reasons):
         return invalid()
 
     return {

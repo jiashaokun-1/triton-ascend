@@ -239,6 +239,52 @@ def test_shadow_capacity_mismatch_records_canonical_defer(monkeypatch):
     json.dumps(metadata)
 
 
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_known_target_defer_capacity_mismatch_is_canonical_invalid(monkeypatch, mode):
+    result = _analysis_result("defer")
+    result["capacity_bytes"] = 1
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options(mode), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 0
+    assert metadata["ub_capacity_bytes"] is None
+    assert metadata["ub_lower_bound_certificate_count"] == 0
+    assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
+    json.dumps(metadata)
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_unknown_target_defer_fabricated_capacity_is_canonical_invalid(monkeypatch, mode):
+    result = _analysis_result("defer")
+    result["capacity_bytes"] = 1
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options(mode, arch="future-chip"), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 0
+    assert metadata["ub_capacity_bytes"] is None
+    assert metadata["ub_lower_bound_certificate_count"] == 0
+    assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
+    json.dumps(metadata)
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("capacity", [None, 192 * 1024])
+def test_known_target_defer_accepts_none_or_trusted_capacity(monkeypatch, mode, capacity):
+    result = _analysis_result("defer")
+    result["capacity_bytes"] = capacity
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options(mode), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 262144
+    assert metadata["ub_capacity_bytes"] == capacity
+    assert metadata["ub_lower_bound_certificate_count"] == 1
+    assert metadata["ub_lower_bound_unsupported_reasons"] == []
+    json.dumps(metadata)
+
+
 def test_mapping_pipeline_identity_uses_sha256_fingerprint(monkeypatch):
     identity = {"sha256": "mapped-id"}
     result = _analysis_result("defer")
