@@ -166,3 +166,21 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
     assert candidate["profiles"][0]["pipeline_identity"]["sha256"] == "identity"
     assert candidate["profiles"][0]["validated_seeds"] == [0, 1]
     assert candidate["profiles"][0]["retry_validated"] is True
+
+
+@pytest.mark.parametrize(
+    ("violations", "unavailable", "expected"),
+    [([], [], 0), ([{"kind": "comparison"}], [], 1), ([], [{"phase": "analyzer"}], 2)],
+)
+def test_main_exit_status_is_machine_readable(monkeypatch, violations, unavailable, expected):
+    report = {
+        "schema": "ttir-ub-oracle-report-v1",
+        "cases": [],
+        "violations": violations,
+        "unavailable": unavailable,
+        "summary": {"cases": 0, "seeds": [0], "retry_checked": False,
+                    "violations": len(violations), "unavailable": len(unavailable)},
+    }
+    monkeypatch.setattr(oracle, "load_manifest", lambda _path: {"cases": []})
+    monkeypatch.setattr(oracle, "evaluate", lambda *_args, **_kwargs: report)
+    assert oracle.main(["--manifest", "manifest.json", "--suffix-compiler", "compiler", "--seeds", "0"]) == expected
