@@ -46,7 +46,18 @@ class AsyncCompileMode:
         # Context objects cannot be entered concurrently, so every submission
         # needs its own snapshot rather than sharing one context per mode.
         context = copy_context()
-        future = self.executor.submit(context.run, compile_fn)
+
+        def compile_in_worker():
+            # Propagate caller-owned telemetry and other context variables, but
+            # do not make nested JIT calls in the worker resubmit themselves to
+            # the outer mode.
+            token = active_mode.set(None)
+            try:
+                return compile_fn()
+            finally:
+                active_mode.reset(token)
+
+        future = self.executor.submit(context.run, compile_in_worker)
         future._key = key
         self.raw_futures.append(future)
         future_kernel = FutureKernel(finalize_fn, future)

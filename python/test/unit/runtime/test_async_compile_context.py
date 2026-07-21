@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from threading import Barrier
 
-from triton.runtime._async_compile import AsyncCompileMode
+from triton.runtime._async_compile import AsyncCompileMode, active_mode
 
 
 def test_async_compile_propagates_contextvars():
@@ -32,6 +32,20 @@ def test_async_compile_copies_context_for_each_concurrent_submission():
 
             assert first.result() == "first"
             assert second.result() == "second"
+
+
+def test_async_compile_does_not_propagate_active_mode_to_worker():
+    marker = ContextVar("marker", default="missing")
+    marker.set("present")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with AsyncCompileMode(pool) as mode:
+            future = mode.submit(
+                "worker-context",
+                lambda: (marker.get(), active_mode.get()),
+                lambda value: None,
+            )
+            assert future.result() == ("present", None)
 
 
 def test_async_compile_does_not_refinalize_resolved_none_result():
