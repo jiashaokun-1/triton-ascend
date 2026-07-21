@@ -67,7 +67,8 @@ uint64_t relationKey(ResourceId lhs, ResourceId rhs) {
 }
 
 template <typename Id> FailureOr<Id> checkedId(size_t ordinal) {
-  if (ordinal > std::numeric_limits<Id>::max())
+  // The maximum value is reserved as an invalid sentinel and is never issued.
+  if (ordinal >= std::numeric_limits<Id>::max())
     return failure();
   return static_cast<Id>(ordinal);
 }
@@ -77,12 +78,12 @@ template <typename Id> FailureOr<Id> checkedId(size_t ordinal) {
 MandatoryUBResourceGraph::MandatoryUBResourceGraph(StableIdLimits idLimits)
     : idLimits_(idLimits) {}
 
-FailureOr<ResourceId>
+ResourceId
 MandatoryUBResourceGraph::addResource(MandatoryUBResource resource) {
   FailureOr<ResourceId> id = checkedId<ResourceId>(resources_.size());
   if (failed(id) || resources_.size() >= idLimits_.resourceCapacity) {
     malformed_ = true;
-    return failure();
+    return InvalidResourceId;
   }
   resources_.push_back(std::move(resource));
   return *id;
@@ -111,24 +112,24 @@ void MandatoryUBResourceGraph::addMustDistinct(ResourceId lhs, ResourceId rhs) {
   addRelation(mustDistinct_, lhs, rhs);
 }
 
-FailureOr<WitnessId>
+WitnessId
 MandatoryUBResourceGraph::addWitness(CoexistenceWitness witness) {
   FailureOr<WitnessId> witnessId = checkedId<WitnessId>(witnesses_.size());
   if (failed(witnessId) || witnesses_.size() >= idLimits_.witnessCapacity) {
     malformed_ = true;
-    return failure();
+    return InvalidWitnessId;
   }
   for (ResourceId id : witness.resources) {
     if (id >= resources_.size()) {
       malformed_ = true;
-      return failure();
+      return InvalidWitnessId;
     }
   }
   witnesses_.push_back(std::move(witness));
   return *witnessId;
 }
 
-FailureOr<WitnessId> MandatoryUBResourceGraph::addWitness(
+WitnessId MandatoryUBResourceGraph::addWitness(
     std::initializer_list<ResourceId> resources) {
   CoexistenceWitness witness;
   witness.resources.append(resources.begin(), resources.end());

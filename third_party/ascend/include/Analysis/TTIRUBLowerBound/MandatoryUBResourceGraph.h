@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -20,6 +21,11 @@ using llvm::StringRef;
 
 using ResourceId = uint32_t;
 using WitnessId = uint32_t;
+
+inline constexpr ResourceId InvalidResourceId =
+    std::numeric_limits<ResourceId>::max();
+inline constexpr WitnessId InvalidWitnessId =
+    std::numeric_limits<WitnessId>::max();
 
 enum class ValidityState { Valid, Invalid };
 enum class UBAddressSpace { UB };
@@ -55,8 +61,8 @@ struct LowerBoundCertificate {
 };
 
 struct StableIdLimits {
-  uint64_t resourceCapacity = uint64_t{1} << 32;
-  uint64_t witnessCapacity = uint64_t{1} << 32;
+  uint64_t resourceCapacity = InvalidResourceId;
+  uint64_t witnessCapacity = InvalidWitnessId;
 };
 
 class MandatoryUBResourceGraph {
@@ -64,13 +70,12 @@ public:
   MandatoryUBResourceGraph() = default;
   explicit MandatoryUBResourceGraph(StableIdLimits idLimits);
 
-  FailureOr<ResourceId> addResource(MandatoryUBResource resource);
+  ResourceId addResource(MandatoryUBResource resource);
   void addMayAlias(ResourceId lhs, ResourceId rhs);
   void addMustAlias(ResourceId lhs, ResourceId rhs);
   void addMustDistinct(ResourceId lhs, ResourceId rhs);
-  FailureOr<WitnessId> addWitness(CoexistenceWitness witness);
-  FailureOr<WitnessId>
-  addWitness(std::initializer_list<ResourceId> resources);
+  WitnessId addWitness(CoexistenceWitness witness);
+  WitnessId addWitness(std::initializer_list<ResourceId> resources);
   void invalidate(ResourceId id, StringRef reason);
   FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;
   FailureOr<LowerBoundCertificate> solveWitnessLowerBound() const;
