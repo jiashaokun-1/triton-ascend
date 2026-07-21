@@ -1042,6 +1042,18 @@ def test_non_vector_compile_mode_is_not_reclassified(monkeypatch):
     assert captured["compile_mode"] == "simt_only"
 
 
+def test_simd_compile_mode_is_mapped_to_aiv_core_kind(monkeypatch):
+    captured = {}
+
+    def analyze(_mod, options):
+        captured.update(options)
+        return _analysis_result("defer")
+
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", analyze)
+    apply_ub_lower_bound_policy(object(), {}, Options("shadow", compile_mode="simd"), "test-id")
+    assert captured["compile_mode"] == "aiv"
+
+
 def test_capacity_boundary_is_not_rejected(monkeypatch):
     result = _analysis_result("defer")
     result["lower_bound_bytes"] = result["capacity_bytes"]
