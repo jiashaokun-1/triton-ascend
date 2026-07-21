@@ -66,14 +66,26 @@ uint64_t relationKey(ResourceId lhs, ResourceId rhs) {
   return (static_cast<uint64_t>(lhs) << 32) | rhs;
 }
 
+template <typename Id> FailureOr<Id> checkedId(size_t ordinal) {
+  if (ordinal > std::numeric_limits<Id>::max())
+    return failure();
+  return static_cast<Id>(ordinal);
+}
+
 } // namespace
 
-ResourceId
+MandatoryUBResourceGraph::MandatoryUBResourceGraph(StableIdLimits idLimits)
+    : idLimits_(idLimits) {}
+
+FailureOr<ResourceId>
 MandatoryUBResourceGraph::addResource(MandatoryUBResource resource) {
-  assert(resources_.size() <= std::numeric_limits<ResourceId>::max());
-  ResourceId id = static_cast<ResourceId>(resources_.size());
+  FailureOr<ResourceId> id = checkedId<ResourceId>(resources_.size());
+  if (failed(id) || resources_.size() >= idLimits_.resourceCapacity) {
+    malformed_ = true;
+    return failure();
+  }
   resources_.push_back(std::move(resource));
-  return id;
+  return *id;
 }
 
 void MandatoryUBResourceGraph::addRelation(
@@ -99,20 +111,24 @@ void MandatoryUBResourceGraph::addMustDistinct(ResourceId lhs, ResourceId rhs) {
   addRelation(mustDistinct_, lhs, rhs);
 }
 
-WitnessId MandatoryUBResourceGraph::addWitness(CoexistenceWitness witness) {
-  assert(witnesses_.size() <= std::numeric_limits<WitnessId>::max());
+FailureOr<WitnessId>
+MandatoryUBResourceGraph::addWitness(CoexistenceWitness witness) {
+  FailureOr<WitnessId> witnessId = checkedId<WitnessId>(witnesses_.size());
+  if (failed(witnessId) || witnesses_.size() >= idLimits_.witnessCapacity) {
+    malformed_ = true;
+    return failure();
+  }
   for (ResourceId id : witness.resources) {
     if (id >= resources_.size()) {
       malformed_ = true;
-      break;
+      return failure();
     }
   }
-  WitnessId id = static_cast<WitnessId>(witnesses_.size());
   witnesses_.push_back(std::move(witness));
-  return id;
+  return *witnessId;
 }
 
-WitnessId MandatoryUBResourceGraph::addWitness(
+FailureOr<WitnessId> MandatoryUBResourceGraph::addWitness(
     std::initializer_list<ResourceId> resources) {
   CoexistenceWitness witness;
   witness.resources.append(resources.begin(), resources.end());
@@ -135,8 +151,11 @@ MandatoryUBResourceGraph::solveSingletonLowerBound() const {
 
   LowerBoundCertificate result;
   result.kind = "singleton";
-  for (ResourceId id = 0; id < resources_.size(); ++id) {
-    const MandatoryUBResource &resource = resources_[id];
+  for (size_t ordinal = 0; ordinal < resources_.size(); ++ordinal) {
+    FailureOr<ResourceId> id = checkedId<ResourceId>(ordinal);
+    if (failed(id))
+      return failure();
+    const MandatoryUBResource &resource = resources_[ordinal];
     if (resource.validity != ValidityState::Valid)
       continue;
     FailureOr<int64_t> bytes = checkedResourceBytes(resource);
@@ -144,7 +163,7 @@ MandatoryUBResourceGraph::solveSingletonLowerBound() const {
       return failure();
     if (*bytes > result.bytes) {
       result.bytes = *bytes;
-      result.resourceIds.assign({id});
+      result.resourceIds.assign({*id});
     }
   }
   return result;
@@ -184,26 +203,33 @@ MandatoryUBResourceGraph::solveWitnessLowerBound() const {
   SmallVector<int64_t> classBytes(resources_.size(), 0);
   SmallVector<ResourceId> classResource(resources_.size(), 0);
   SmallVector<bool> classHasResource(resources_.size(), false);
-  for (ResourceId id = 0; id < resources_.size(); ++id) {
-    const MandatoryUBResource &resource = resources_[id];
+  for (size_t ordinal = 0; ordinal < resources_.size(); ++ordinal) {
+    FailureOr<ResourceId> id = checkedId<ResourceId>(ordinal);
+    if (failed(id))
+      return failure();
+    const MandatoryUBResource &resource = resources_[ordinal];
     if (resource.validity != ValidityState::Valid)
       continue;
     FailureOr<int64_t> bytes = checkedResourceBytes(resource);
     if (failed(bytes))
       return failure();
-    ResourceId root = aliases.find(id);
+    ResourceId root = aliases.find(*id);
     if (!classHasResource[root] || *bytes > classBytes[root]) {
       classHasResource[root] = true;
       classBytes[root] = *bytes;
-      classResource[root] = id;
+      classResource[root] = *id;
     }
   }
 
   for (const CoexistenceWitness &witness : witnesses_) {
+    if (std::any_of(witness.resources.begin(), witness.resources.end(),
+                    [&](ResourceId id) {
+                      return resources_[id].validity != ValidityState::Valid;
+                    }))
+      continue;
+
     SmallVector<ResourceId> classes;
     for (ResourceId id : witness.resources) {
-      if (resources_[id].validity != ValidityState::Valid)
-        continue;
       ResourceId root = aliases.find(id);
       if (std::find(classes.begin(), classes.end(), root) == classes.end())
         classes.push_back(root);

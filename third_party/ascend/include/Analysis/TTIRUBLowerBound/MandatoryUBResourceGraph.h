@@ -54,14 +54,23 @@ struct LowerBoundCertificate {
   std::string kind;
 };
 
+struct StableIdLimits {
+  uint64_t resourceCapacity = uint64_t{1} << 32;
+  uint64_t witnessCapacity = uint64_t{1} << 32;
+};
+
 class MandatoryUBResourceGraph {
 public:
-  ResourceId addResource(MandatoryUBResource resource);
+  MandatoryUBResourceGraph() = default;
+  explicit MandatoryUBResourceGraph(StableIdLimits idLimits);
+
+  FailureOr<ResourceId> addResource(MandatoryUBResource resource);
   void addMayAlias(ResourceId lhs, ResourceId rhs);
   void addMustAlias(ResourceId lhs, ResourceId rhs);
   void addMustDistinct(ResourceId lhs, ResourceId rhs);
-  WitnessId addWitness(CoexistenceWitness witness);
-  WitnessId addWitness(std::initializer_list<ResourceId> resources);
+  FailureOr<WitnessId> addWitness(CoexistenceWitness witness);
+  FailureOr<WitnessId>
+  addWitness(std::initializer_list<ResourceId> resources);
   void invalidate(ResourceId id, StringRef reason);
   FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;
   FailureOr<LowerBoundCertificate> solveWitnessLowerBound() const;
@@ -78,6 +87,7 @@ private:
   SmallVector<ResourcePair> mayAliases_;
   SmallVector<ResourcePair> mustAliases_;
   SmallVector<ResourcePair> mustDistinct_;
+  StableIdLimits idLimits_;
   bool malformed_ = false;
 };
 
