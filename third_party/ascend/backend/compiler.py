@@ -152,28 +152,130 @@ UB_AFFECTING_OPTIONS = (
     "warp_size",
 )
 TTIR_UB_DIRECT_BISHENG_PIPELINE = "direct-bisheng-ttir"
+TTIR_UB_MODULE_DERIVED_AUTO_TILE = "module-derived-both-outcomes"
+
+# Exact closure over every long option forwarded to BiSheng by the three codegen
+# paths below. A new flag must be classified here before the identity gate can
+# pass; non-UB flags require a concrete reason why they cannot affect UB
+# materialization or allocation.
+FORWARDED_BISHENG_FLAG_CLASSIFICATION = {
+    "--append-bisheng-options": ("ub-affecting", "forwards arbitrary backend lowering options"),
+    "--disable-auto-inject-block-sync": ("ub-affecting", "changes block synchronization lowering"),
+    "--disable-ffts": ("ub-affecting", "changes FFTS scheduling and buffer lifetime"),
+    "--disable-fma": ("ub-affecting", "changes direct SIMT instruction lowering"),
+    "--disable-hfusion-vectorize": ("ub-affecting", "changes vector fusion lowering"),
+    "--disable-size-align-for-cast": ("ub-affecting", "changes cast layout alignment"),
+    "--disable-tightly-coupled-buffer-reuse": ("ub-affecting", "changes buffer reuse"),
+    "--enable-auto-bind-sub-block": ("ub-affecting", "changes module-derived sub-block tiling"),
+    "--enable-auto-blockify-loop": ("ub-affecting", "changes block tiling"),
+    "--enable-auto-multi-buffer": ("ub-affecting", "changes multi-buffer allocation"),
+    "--enable-auto-vectorize-v2": ("ub-affecting", "changes vectorization and fusion"),
+    "--enable-bishengir-simt-optimization": ("ub-affecting", "changes direct SIMT optimization"),
+    "--enable-debug-info": ("non-ub", "emits debug metadata without changing UB planning"),
+    "--enable-drop-unit-dims": ("ub-affecting", "changes tensor layout lowering"),
+    "--enable-flatten": ("ub-affecting", "changes loop and tensor flattening"),
+    "--enable-hfusion-compile": ("ub-affecting", "selects the fusion lowering pipeline"),
+    "--enable-hivm-auto-cv-balance": ("ub-affecting", "changes cube-vector balancing"),
+    "--enable-hivm-compile": ("ub-affecting", "selects HIVM versus direct SIMT lowering"),
+    "--enable-hivm-cross-core-gss": ("ub-affecting", "changes cross-core synchronization solving"),
+    "--enable-hivm-graph-sync-solver": ("ub-affecting", "changes graph synchronization solving"),
+    "--enable-hivm-inject-barrier-all-sync": ("ub-affecting", "changes barrier injection"),
+    "--enable-hivm-inject-block-all-sync": ("ub-affecting", "changes block synchronization injection"),
+    "--enable-hivm-unit-flag-sync": ("ub-affecting", "changes unit-flag synchronization"),
+    "--enable-memory-display": ("non-ub", "reports allocated memory without changing allocation"),
+    "--enable-mixed-cv": ("ub-affecting", "changes mixed cube-vector lowering"),
+    "--enable-ms-debug": ("non-ub", "enables compiler diagnostics without changing UB planning"),
+    "--enable-preload": ("ub-affecting", "changes preload buffers and lifetime"),
+    "--enable-print-memory-allocated-size": ("non-ub", "reports allocation size without changing allocation"),
+    "--enable-sanitizer": ("non-ub", "adds checking diagnostics after UB planning"),
+    "--enable-simd-simt-mix-compile": ("ub-affecting", "changes mixed SIMD-SIMT lowering"),
+    "--enable-simt-reorder-instruction": ("ub-affecting", "changes direct SIMT scheduling"),
+    "--enable-triton-ir-compile": ("ub-affecting", "selects the direct TTIR frontend"),
+    "--enable-triton-kernel-compile": ("ub-affecting", "selects the Linalg kernel frontend"),
+    "--enable-ubuf-saving": ("ub-affecting", "changes UB-saving transformations"),
+    "--enable-vf-fusion": ("ub-affecting", "changes vector fusion"),
+    "--enable-vf-merge-level": ("ub-affecting", "changes vector fusion merge level"),
+    "--hfusion-enable-multiple-consumer-fusion": ("ub-affecting", "changes multi-consumer fusion"),
+    "--hfusion-max-fused-elementwise-ops": ("ub-affecting", "bounds fused elementwise allocation"),
+    "--hfusion-max-fused-ops-in-auto-vectorize-v2": ("ub-affecting", "bounds vectorized fusion"),
+    "--limit-auto-multi-buffer-of-local-buffer": ("ub-affecting", "limits local multi-buffering"),
+    "--limit-auto-multi-buffer-only-for-local-buffer": ("ub-affecting", "changes multi-buffer scope"),
+    "--link-aicore-bitcode": ("non-ub", "links device code after UB planning"),
+    "--num-warps": ("ub-affecting", "changes parallel lowering width"),
+    "--pure-simt": ("ub-affecting", "selects pure SIMT lowering"),
+    "--reg-based": ("ub-affecting", "selects register-based HIVM lowering"),
+    "--set-workspace-multibuffer": ("ub-affecting", "changes workspace multi-buffering"),
+    "--shared-mem-dynamic-size": ("ub-affecting", "changes dynamic shared-memory allocation"),
+    "--simt-stack-limit": ("ub-affecting", "changes SIMT stack allocation"),
+    "--target": ("ub-affecting", "selects target-specific lowering and allocation"),
+    "--threads-per-warp": ("ub-affecting", "changes parallel lowering width"),
+    "--tile-mix-cube-loop": ("ub-affecting", "changes mixed cube-loop tiling"),
+    "--tile-mix-vector-loop": ("ub-affecting", "changes mixed vector-loop tiling"),
+}
 
 
 def _canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _ub_affecting_identity_options(metadata):
+@functools.lru_cache(maxsize=32)
+def _cached_npu_compiler_content_fingerprint(path, device, inode, size, mtime_ns):
+    del device, inode, size, mtime_ns
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as compiler:
+        for chunk in iter(lambda: compiler.read(1024 * 1024), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def _npu_compiler_content_fingerprint(path):
+    resolved = Path(path).expanduser().resolve(strict=True)
+    if not resolved.is_file():
+        raise OSError(f"selected NPU compiler is not a regular file: {resolved}")
+    stat = resolved.stat()
+    return _cached_npu_compiler_content_fingerprint(
+        str(resolved),
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+
+
+def _direct_simt_libdevice_compile_options(metadata):
+    enabled = triton_enable_libdevice_simt()
+    bisheng_options = metadata.get("bisheng_options")
+    forwarded = enabled and bisheng_options is not None
+    compile_options = [f"--append-bisheng-options={bisheng_options}"] if forwarded else []
+    return enabled, forwarded, compile_options
+
+
+def _ub_affecting_identity_options(metadata, *, direct_simt=False):
     options = {name: metadata.get(name) for name in UB_AFFECTING_OPTIONS}
+    options["auto_tile_and_bind_subblock"] = TTIR_UB_MODULE_DERIVED_AUTO_TILE
     auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
     env_vf = os.getenv("TRITON_ENABLE_VF_FUSION")
     npu_compiler_path, _ = _get_npucompiler_path()
+    if direct_simt:
+        libdevice_enabled, libdevice_forwarded, _ = _direct_simt_libdevice_compile_options(metadata)
+    else:
+        libdevice_enabled = None
+        libdevice_forwarded = None
     options.update({
         "effective_auto_map_parallel_blocks":
         auto_map_parallel_blocks,
         "effective_bishengir_reg_based":
         (_check_bishengir_is_regbased() if not metadata.get("compile_on_910_95", False) else None),
         "effective_disable_ffts": (force_disable_ffts() if metadata.get("compile_on_910_95", False) else None),
-        "effective_npu_compiler":
-        Path(npu_compiler_path).name,
+        "effective_npu_compiler_content_sha256":
+        _npu_compiler_content_fingerprint(npu_compiler_path),
         "effective_enable_vf_fusion":
         ((env_vf.lower() in ("true", "1", "yes") if env_vf is not None else metadata.get("enable_vf_fusion", False))
          if metadata.get("compile_on_910_95", False) else None),
+        "effective_libdevice_simt":
+        libdevice_enabled,
+        "effective_libdevice_bisheng_options_forwarded":
+        libdevice_forwarded,
     })
     return options
 
@@ -182,7 +284,7 @@ def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict) -> dict:
     target_arch = metadata["target"].arch
     triton_version = metadata["triton_version"]
     cann_version_hash = get_cann_version_file_hash()
-    options = _ub_affecting_identity_options(metadata)
+    options = _ub_affecting_identity_options(metadata, direct_simt=(pipeline == TTIR_UB_DIRECT_BISHENG_PIPELINE))
     payload = {
         "cann_version_hash": cann_version_hash,
         "open_source_pipeline": pipeline,
@@ -1131,11 +1233,8 @@ def ttir_to_npubin(mod, metadata, opt):
                 _compile_option_list += ["--enable-simt-reorder-instruction=true"]
             if opt.disable_fma:
                 _compile_option_list += [f"--disable-fma"]
-            enable_libdevice_simt = triton_enable_libdevice_simt()
-            if (enable_libdevice_simt):
-                bisheng_options = metadata["bisheng_options"]
-                if bisheng_options is not None:
-                    _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
+            _, _, libdevice_compile_options = _direct_simt_libdevice_compile_options(metadata)
+            _compile_option_list += libdevice_compile_options
 
             # Enable SIMT auto-blockify if user opted in, or if the env var is
             # set and the user didn't explicitly opt out (matches the SIMD path

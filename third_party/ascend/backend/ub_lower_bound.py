@@ -30,6 +30,12 @@ _PROFILE_PATH = Path(__file__).with_name("ub_contract_profiles.json")
 _INT64_MAX = (1 << 63) - 1
 _INVALID_RESOURCE_ID = (1 << 32) - 1
 _CONTRACT_VERSION = "ttir-ub-lb-v1"
+_IDENTITY_CONTRACT = {
+    "auto_tile_and_bind_subblock": {
+        "identity_value": "module-derived-both-outcomes",
+        "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+    },
+}
 _RESULT_KEYS = frozenset({
     "decision",
     "lower_bound_bytes",
@@ -44,7 +50,8 @@ _CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids"})
 
 def load_contract_profiles():
     profile = json.loads(_PROFILE_PATH.read_text(encoding="utf-8"))
-    if profile.get("schema") != "ttir-ub-lb-profile-v1" or not isinstance(profile.get("profiles"), list):
+    if (profile.get("schema") != "ttir-ub-lb-profile-v1" or profile.get("identity_contract") != _IDENTITY_CONTRACT
+            or not isinstance(profile.get("profiles"), list)):
         raise ValueError("invalid packaged TTIR UB contract profile")
     return profile
 

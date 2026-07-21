@@ -24,6 +24,7 @@ import ast
 import hashlib
 import inspect
 import json
+from pathlib import Path
 import pickle
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -188,50 +189,6 @@ EXPECTED_UB_AFFECTING_OPTIONS = (
     "warp_size",
 )
 
-EXPECTED_UB_AFFECTING_BISHENG_FLAGS = {
-    "--append-bisheng-options",
-    "--disable-auto-inject-block-sync",
-    "--disable-ffts",
-    "--disable-fma",
-    "--disable-hfusion-vectorize",
-    "--disable-size-align-for-cast",
-    "--disable-tightly-coupled-buffer-reuse",
-    "--enable-auto-bind-sub-block",
-    "--enable-auto-blockify-loop",
-    "--enable-auto-multi-buffer",
-    "--enable-auto-vectorize-v2",
-    "--enable-bishengir-simt-optimization",
-    "--enable-drop-unit-dims",
-    "--enable-flatten",
-    "--enable-hivm-auto-cv-balance",
-    "--enable-hivm-graph-sync-solver",
-    "--enable-hivm-inject-barrier-all-sync",
-    "--enable-hivm-inject-block-all-sync",
-    "--enable-hivm-unit-flag-sync",
-    "--enable-hfusion-compile",
-    "--enable-mixed-cv",
-    "--enable-preload",
-    "--enable-simd-simt-mix-compile",
-    "--enable-simt-reorder-instruction",
-    "--enable-ubuf-saving",
-    "--enable-vf-fusion",
-    "--enable-vf-merge-level",
-    "--hfusion-enable-multiple-consumer-fusion",
-    "--hfusion-max-fused-elementwise-ops",
-    "--hfusion-max-fused-ops-in-auto-vectorize-v2",
-    "--limit-auto-multi-buffer-of-local-buffer",
-    "--limit-auto-multi-buffer-only-for-local-buffer",
-    "--num-warps",
-    "--pure-simt",
-    "--reg-based",
-    "--set-workspace-multibuffer",
-    "--shared-mem-dynamic-size",
-    "--simt-stack-limit",
-    "--threads-per-warp",
-    "--tile-mix-cube-loop",
-    "--tile-mix-vector-loop",
-}
-
 
 def _identity_runtime(monkeypatch):
     monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
@@ -239,44 +196,23 @@ def _identity_runtime(monkeypatch):
     monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
     monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: False)
     monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: ("/test/bishengir-compile", {}))
+    monkeypatch.setattr(
+        ascend_compiler,
+        "_npu_compiler_content_fingerprint",
+        lambda _path: "test-compiler-content-sha256",
+        raising=False,
+    )
     monkeypatch.delenv("TRITON_ENABLE_VF_FUSION", raising=False)
 
 
-def _ub_affecting_bisheng_flag_literals():
+def _forwarded_bisheng_flag_literals():
     source = inspect.getsource(ascend_compiler).lstrip("\ufeff")
     tree = ast.parse(source)
     function_names = {
+        "get_common_bishengir_compile_options",
         "linalg_to_bin_enable_npu_compile_910_95",
         "linalg_to_bin_enable_npu_compile_A2_A3",
         "ttir_to_npubin",
-    }
-    keywords = (
-        "blockify",
-        "buffer",
-        "bind-sub-block",
-        "cv",
-        "flatten",
-        "fused",
-        "fusion",
-        "preload",
-        "simt",
-        "size-align",
-        "sync",
-        "tile",
-        "ubuf",
-        "unit-dims",
-        "vectorize",
-        "vf-",
-        "workspace",
-    )
-    always_relevant = {
-        "--append-bisheng-options",
-        "--disable-ffts",
-        "--disable-fma",
-        "--num-warps",
-        "--reg-based",
-        "--shared-mem-dynamic-size",
-        "--threads-per-warp",
     }
     flags = set()
     for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
@@ -288,8 +224,7 @@ def _ub_affecting_bisheng_flag_literals():
             if not node.value.startswith("--"):
                 continue
             flag = node.value.split("=", 1)[0]
-            if flag in always_relevant or any(keyword in flag for keyword in keywords):
-                flags.add(flag)
+            flags.add(flag)
     return flags
 
 
@@ -351,13 +286,57 @@ def test_pipeline_identity_changes_when_pass_order_changes(monkeypatch):
     assert first["sha256"] != second["sha256"]
 
 
-def test_pipeline_identity_changes_when_bisheng_compiler_kind_changes(monkeypatch):
-    _identity_runtime(monkeypatch)
+def test_pipeline_identity_uses_compiler_content_not_path_or_basename(monkeypatch, tmp_path):
+    monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: False)
+    monkeypatch.delenv("TRITON_ENABLE_VF_FUSION", raising=False)
     metadata = _compiler_metadata()
+
+    first_path = tmp_path / "first" / "npuc"
+    second_path = tmp_path / "second" / "bishengir-compile"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    first_path.write_bytes(b"same compiler content")
+    second_path.write_bytes(b"same compiler content")
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(first_path), {}))
     first = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
-    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: ("/test/npu-compiler", {}))
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(second_path), {}))
     second = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
-    assert first["sha256"] != second["sha256"]
+    assert first["sha256"] == second["sha256"]
+
+    third_path = tmp_path / "third" / "npuc"
+    third_path.parent.mkdir()
+    third_path.write_bytes(b"different compiler content")
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(third_path), {}))
+    third = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
+    assert third["sha256"] != first["sha256"]
+
+
+def test_selected_compiler_read_failure_makes_policy_identity_fail_open(monkeypatch, tmp_path):
+    canonical_pm = MagicMock()
+    future_pm = MagicMock()
+    future_pm.get_pipeline_str.return_value = "pipeline"
+    monkeypatch.setattr(ascend_compiler.ir, "pass_manager", lambda _context: canonical_pm)
+    monkeypatch.setattr(ascend_compiler, "passes", MagicMock())
+    monkeypatch.setattr(ascend_compiler, "_build_ttir_to_linalg_pass_manager", lambda *_args, **_kwargs: future_pm)
+    monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: False)
+    missing = tmp_path / "missing" / "npuc"
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: (str(missing), {}))
+    captured = []
+    monkeypatch.setattr(
+        ascend_compiler,
+        "apply_ub_lower_bound_policy",
+        lambda _mod, _metadata, _options, identity: captured.append(identity),
+    )
+    options = ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow", compile_on_910_95=False)
+    module = SimpleNamespace(context=object(), __str__=lambda: "module")
+    ascend_compiler.make_ttir(module, _compiler_metadata(), options)
+    assert captured == [""]
 
 
 def test_pipeline_identity_changes_for_effective_environment_lowering_switches(monkeypatch):
@@ -382,7 +361,10 @@ def test_pipeline_identity_changes_for_effective_environment_lowering_switches(m
     assert len({baseline, disable_ffts, vf_fusion}) == 3
 
 
-@pytest.mark.parametrize("option_name", EXPECTED_UB_AFFECTING_OPTIONS)
+@pytest.mark.parametrize(
+    "option_name",
+    (name for name in EXPECTED_UB_AFFECTING_OPTIONS if name != "auto_tile_and_bind_subblock"),
+)
 def test_pipeline_identity_changes_for_every_ub_affecting_option(monkeypatch, option_name):
     _identity_runtime(monkeypatch)
     metadata = _compiler_metadata()
@@ -393,9 +375,49 @@ def test_pipeline_identity_changes_for_every_ub_affecting_option(monkeypatch, op
     assert before != after, option_name
 
 
+def test_module_derived_auto_tile_placeholder_does_not_change_identity(monkeypatch):
+    _identity_runtime(monkeypatch)
+    enabled = _compiler_metadata(auto_tile_and_bind_subblock=True)
+    disabled = _compiler_metadata(auto_tile_and_bind_subblock=False)
+    enabled_identity = ascend_compiler._ttir_ub_pipeline_identity("pipeline", enabled)
+    disabled_identity = ascend_compiler._ttir_ub_pipeline_identity("pipeline", disabled)
+    enabled_options = json.loads(enabled_identity["relevant_options_json"])
+    disabled_options = json.loads(disabled_identity["relevant_options_json"])
+    assert enabled_options["auto_tile_and_bind_subblock"] == "module-derived-both-outcomes"
+    assert disabled_options["auto_tile_and_bind_subblock"] == "module-derived-both-outcomes"
+    assert enabled_identity["sha256"] == disabled_identity["sha256"]
+
+
+def test_generated_disable_auto_tile_attr_cannot_claim_enabled_only_profile(monkeypatch):
+    _identity_runtime(monkeypatch)
+    linalg = '''
+module attributes {mix_mode = "aiv", parallel_mode = "mix_simd_simt",
+                   hivm.disable_auto_tile_and_bind_subblock} {
+  func.func @kernel() { return }
+}
+'''
+    metadata = _compiler_metadata(auto_tile_and_bind_subblock=True)
+    _, parsed_metadata = ascend_compiler._parse_linalg_metadata(linalg, metadata)
+    assert parsed_metadata["auto_tile_and_bind_subblock"] is False
+
+    identity = ascend_compiler._ttir_ub_pipeline_identity("pipeline", parsed_metadata)
+    identity_options = json.loads(identity["relevant_options_json"])
+    contract = load_contract_profiles()["identity_contract"]["auto_tile_and_bind_subblock"]
+    assert identity_options["auto_tile_and_bind_subblock"] == contract["identity_value"]
+    assert contract == {
+        "identity_value": "module-derived-both-outcomes",
+        "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+    }
+
+
 def test_ub_affecting_options_and_forwarded_bisheng_flags_are_closed_goldens():
     assert ascend_compiler.UB_AFFECTING_OPTIONS == EXPECTED_UB_AFFECTING_OPTIONS
-    assert _ub_affecting_bisheng_flag_literals() == EXPECTED_UB_AFFECTING_BISHENG_FLAGS
+    assert _forwarded_bisheng_flag_literals() == set(ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION)
+    for category, justification in ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION.values():
+        assert category in ("ub-affecting", "non-ub")
+        assert justification
+    assert ascend_compiler.FORWARDED_BISHENG_FLAG_CLASSIFICATION["--enable-hivm-cross-core-gss"][0] == \
+        "ub-affecting"
 
 
 def test_make_ttir_calls_policy_after_canonicalization_and_does_not_run_future_pm(monkeypatch):
@@ -510,6 +532,46 @@ def test_make_ttir_simt_identity_uses_real_direct_pipeline_without_future_pm(mon
     module = SimpleNamespace(context=object(), __str__=lambda: "module")
     ascend_compiler.make_ttir(module, _compiler_metadata(compile_on_910_95=True), options)
     assert captured == [ascend_compiler.TTIR_UB_DIRECT_BISHENG_PIPELINE]
+
+
+def test_direct_simt_libdevice_toggle_changes_command_and_identity(monkeypatch):
+    _identity_runtime(monkeypatch)
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        output = Path(command[command.index("-o") + 1] + ".o")
+        output.write_bytes(b"npubin")
+        return SimpleNamespace(stderr=b"")
+
+    monkeypatch.setattr(ascend_compiler.subprocess, "run", run)
+    metadata = _compiler_metadata(bisheng_options="-mllvm -test-libdevice-option")
+    options = ascend_compiler.NPUOptions(compile_on_910_95=True, compile_mode="simt_only")
+
+    monkeypatch.setenv("TRITON_ENABLE_LIBDEVICE_SIMT", "0")
+    disabled_identity = ascend_compiler._ttir_ub_pipeline_identity(
+        ascend_compiler.TTIR_UB_DIRECT_BISHENG_PIPELINE,
+        metadata,
+    )
+    ascend_compiler.ttir_to_npubin(DIRECT_LOAD_COPY, dict(metadata), options)
+
+    monkeypatch.setenv("TRITON_ENABLE_LIBDEVICE_SIMT", "1")
+    enabled_identity = ascend_compiler._ttir_ub_pipeline_identity(
+        ascend_compiler.TTIR_UB_DIRECT_BISHENG_PIPELINE,
+        metadata,
+    )
+    ascend_compiler.ttir_to_npubin(DIRECT_LOAD_COPY, dict(metadata), options)
+
+    append_flag = "--append-bisheng-options=-mllvm -test-libdevice-option"
+    assert append_flag not in commands[0]
+    assert append_flag in commands[1]
+    assert disabled_identity["sha256"] != enabled_identity["sha256"]
+    disabled_options = json.loads(disabled_identity["relevant_options_json"])
+    enabled_options = json.loads(enabled_identity["relevant_options_json"])
+    assert disabled_options["effective_libdevice_simt"] is False
+    assert disabled_options["effective_libdevice_bisheng_options_forwarded"] is False
+    assert enabled_options["effective_libdevice_simt"] is True
+    assert enabled_options["effective_libdevice_bisheng_options_forwarded"] is True
 
 
 def test_debug_policy_dump_uses_dump_manager_and_contains_full_result(monkeypatch):
@@ -847,6 +909,12 @@ def test_policy_passes_only_packaged_empty_profile(monkeypatch):
     apply_ub_lower_bound_policy(object(), {}, Options("shadow"), "test-id")
     assert captured["contract_profile"] == {
         "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": {
+            "auto_tile_and_bind_subblock": {
+                "identity_value": "module-derived-both-outcomes",
+                "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+            },
+        },
         "profiles": [],
     }
     assert "allow_unvalidated" not in captured
@@ -865,6 +933,12 @@ def test_overflow_exception_pickles_across_process_pool():
 def test_packaged_contract_profiles_start_empty():
     assert load_contract_profiles() == {
         "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": {
+            "auto_tile_and_bind_subblock": {
+                "identity_value": "module-derived-both-outcomes",
+                "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+            },
+        },
         "profiles": [],
     }
 

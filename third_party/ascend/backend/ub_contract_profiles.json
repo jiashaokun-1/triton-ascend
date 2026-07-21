@@ -1,4 +1,10 @@
 {
   "schema": "ttir-ub-lb-profile-v1",
+  "identity_contract": {
+    "auto_tile_and_bind_subblock": {
+      "identity_value": "module-derived-both-outcomes",
+      "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes"
+    }
+  },
   "profiles": []
 }
