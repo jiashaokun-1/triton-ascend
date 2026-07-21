@@ -144,7 +144,7 @@ struct MandatoryUBResource {
 };
 ```
 
-`minPayloadBytes` 首版不向上补 alignment。若 raw payload 已超过物理容量即可安全拒绝；
+`minPayloadBytes` 首版不向上补 alignment。若 raw payload 已超过物理容量即可确定拒绝；
 alignment 和 multi-buffer 只会增加真实使用量，暂时不计不会破坏下界。
 
 ### 5.3 图关系
