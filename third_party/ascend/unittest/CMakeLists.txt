@@ -29,5 +29,5 @@ add_lit_testsuites(TRITON-LIT-TESTS ${CMAKE_CURRENT_SOURCE_DIR} DEPENDS ${TRITON
 add_triton_ut(
   NAME TestAscendTTIRUBLowerBound
   SRCS TTIRUBLowerBoundTest.cpp
-  LIBS TTIRUBLowerBound TritonIR MLIRIR MLIRSupport
+  LIBS TTIRUBLowerBound TritonIR MLIRArithDialect MLIRIR MLIRParser MLIRSupport
 )
