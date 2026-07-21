@@ -47,6 +47,7 @@ module {
 """
 
 INT64_MAX = (1 << 63) - 1
+UINT32_MAX = (1 << 32) - 1
 
 
 class ExplosiveEquality:
@@ -98,6 +99,7 @@ def test_off_does_not_call_analyzer(monkeypatch):
         raise AssertionError("off mode called the analyzer")
 
     monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", unexpected_call)
+    monkeypatch.setattr(ascend.analysis, "get_ub_capacity_bytes", unexpected_call)
     metadata = {"hash": "abc"}
     apply_ub_lower_bound_policy(object(), metadata, Options("off"), "test-id")
     assert metadata == {"hash": "abc"}
@@ -142,9 +144,11 @@ def test_enforce_raises_only_proven_reject(monkeypatch):
         (("capacity_bytes", ), -1),
         (("capacity_bytes", ), False),
         (("capacity_bytes", ), INT64_MAX + 1),
+        (("capacity_bytes", ), 1),
         (("certificates", ), None),
         (("certificates", ), [None]),
         (("certificates", ), [object()]),
+        (("certificates", ), _analysis_result()["certificates"] * 2),
         (("certificates", 0, "kind"), None),
         (("certificates", 0, "kind"), "pairwise"),
         (("certificates", 0, "kind"), ExplosiveEquality()),
@@ -157,6 +161,9 @@ def test_enforce_raises_only_proven_reject(monkeypatch):
         (("certificates", 0, "resource_ids"), [True]),
         (("certificates", 0, "resource_ids"), [-1]),
         (("certificates", 0, "resource_ids"), [INT64_MAX + 1]),
+        (("certificates", 0, "resource_ids"), [UINT32_MAX]),
+        (("certificates", 0, "resource_ids"), [1 << 32]),
+        (("certificates", 0, "resource_ids"), [0, 1]),
         (("certificates", 0, "resource_ids"), [object()]),
         (("certificates", 0, "extra"), object()),
         (("unsupported_reasons", ), None),
@@ -164,6 +171,8 @@ def test_enforce_raises_only_proven_reject(monkeypatch):
         (("unsupported_reasons", ), [object()]),
         (("contract_version", ), None),
         (("contract_version", ), object()),
+        (("contract_version", ), ""),
+        (("contract_version", ), "ttir-ub-lb-v2"),
         (("pipeline_identity", ), None),
         (("pipeline_identity", ), object()),
         (("pipeline_identity", ), "other-id"),
@@ -180,6 +189,53 @@ def test_invalid_analysis_schema_fails_open_with_json_metadata(monkeypatch, path
     assert metadata["ub_lower_bound_certificate_count"] == 0
     assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
     assert metadata["ub_lower_bound_pipeline_identity"] == "test-id"
+    json.dumps(metadata)
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_unknown_target_cannot_use_fabricated_analyzer_capacity(monkeypatch, mode):
+    result = _analysis_result()
+    result["capacity_bytes"] = 1
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options(mode, arch="future-chip"), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 0
+    assert metadata["ub_capacity_bytes"] is None
+    assert metadata["ub_lower_bound_certificate_count"] == 0
+    assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
+    json.dumps(metadata)
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_capacity_lookup_exception_fails_open(monkeypatch, mode):
+
+    def fail(_arch):
+        raise RuntimeError("capacity lookup failed")
+
+    monkeypatch.setattr(ascend.analysis, "get_ub_capacity_bytes", fail)
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: _analysis_result())
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options(mode), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 0
+    assert metadata["ub_capacity_bytes"] is None
+    assert metadata["ub_lower_bound_certificate_count"] == 0
+    assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
+    json.dumps(metadata)
+
+
+def test_shadow_capacity_mismatch_records_canonical_defer(monkeypatch):
+    result = _analysis_result()
+    result["capacity_bytes"] = 1
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options("shadow"), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 0
+    assert metadata["ub_capacity_bytes"] is None
+    assert metadata["ub_lower_bound_certificate_count"] == 0
+    assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
     json.dumps(metadata)
 
 

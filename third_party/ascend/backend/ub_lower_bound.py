@@ -27,6 +27,8 @@ from .errors import UBLowerBoundOverflow
 
 _PROFILE_PATH = Path(__file__).with_name("ub_contract_profiles.json")
 _INT64_MAX = (1 << 63) - 1
+_INVALID_RESOURCE_ID = (1 << 32) - 1
+_CONTRACT_VERSION = "ttir-ub-lb-v1"
 _RESULT_KEYS = frozenset({
     "decision",
     "lower_bound_bytes",
@@ -64,7 +66,7 @@ def _defer_result(pipeline_fingerprint, reason):
         "certificates": [],
         "unsupported_reasons": [reason],
         "pipeline_identity": pipeline_fingerprint,
-        "contract_version": "ttir-ub-lb-v1",
+        "contract_version": _CONTRACT_VERSION,
     }
 
 
@@ -80,8 +82,10 @@ def _normalize_certificate(certificate, lower_bound_bytes):
     if not _is_int64(certificate.get("bytes")) or certificate["bytes"] != lower_bound_bytes:
         return None
     resource_ids = certificate.get("resource_ids")
-    if type(resource_ids) is not list or not resource_ids or not all(
-            _is_int64(resource_id) for resource_id in resource_ids):
+    if type(resource_ids) is not list or len(resource_ids) != 1:
+        return None
+    resource_id = resource_ids[0]
+    if type(resource_id) is not int or not 0 <= resource_id < _INVALID_RESOURCE_ID:
         return None
     return {
         "kind": certificate["kind"],
@@ -90,7 +94,7 @@ def _normalize_certificate(certificate, lower_bound_bytes):
     }
 
 
-def _normalize_result(result, pipeline_fingerprint):
+def _normalize_result(result, pipeline_fingerprint, trusted_capacity):
     invalid = lambda: _defer_result(pipeline_fingerprint, "invalid-analysis-result")
     if type(result) is not dict or set(result) != _RESULT_KEYS:
         return invalid()
@@ -121,12 +125,12 @@ def _normalize_result(result, pipeline_fingerprint):
         normalized_certificates.append(normalized_certificate)
     if type(unsupported_reasons) is not list or not all(type(reason) is str for reason in unsupported_reasons):
         return invalid()
-    if type(contract_version) is not str:
+    if type(contract_version) is not str or contract_version != _CONTRACT_VERSION:
         return invalid()
     if type(result_fingerprint) is not str or result_fingerprint != pipeline_fingerprint:
         return invalid()
-    if decision == "reject" and (lower_bound_bytes <= capacity_bytes or not normalized_certificates
-                                 or unsupported_reasons):
+    if decision == "reject" and (lower_bound_bytes <= capacity_bytes or capacity_bytes != trusted_capacity
+                                 or len(normalized_certificates) != 1 or unsupported_reasons):
         return invalid()
 
     return {
@@ -171,23 +175,30 @@ def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
         result = _defer_result("", "invalid-analysis-result")
     else:
         try:
-            raw_result = ascend.analysis.ttir_ub_lower_bound(
-                mod,
-                {
-                    "arch": opt.arch,
-                    "compile_mode": opt.compile_mode,
-                    "pipeline_identity": pipeline_identity,
-                    "pipeline_stages": [],
-                    "contract_profile": load_contract_profiles(),
-                },
-            )
-        except Exception as error:
-            result = _defer_result(pipeline_fingerprint, _exception_reason(error))
+            trusted_capacity = ascend.analysis.get_ub_capacity_bytes(opt.arch)
+        except Exception:
+            trusted_capacity = None
+        if not _is_int64(trusted_capacity):
+            result = _defer_result(pipeline_fingerprint, "invalid-analysis-result")
         else:
             try:
-                result = _normalize_result(raw_result, pipeline_fingerprint)
-            except Exception:
-                result = _defer_result(pipeline_fingerprint, "invalid-analysis-result")
+                raw_result = ascend.analysis.ttir_ub_lower_bound(
+                    mod,
+                    {
+                        "arch": opt.arch,
+                        "compile_mode": opt.compile_mode,
+                        "pipeline_identity": pipeline_identity,
+                        "pipeline_stages": [],
+                        "contract_profile": load_contract_profiles(),
+                    },
+                )
+            except Exception as error:
+                result = _defer_result(pipeline_fingerprint, _exception_reason(error))
+            else:
+                try:
+                    result = _normalize_result(raw_result, pipeline_fingerprint, trusted_capacity)
+                except Exception:
+                    result = _defer_result(pipeline_fingerprint, "invalid-analysis-result")
 
     _record_metadata(metadata, mode, result)
     if mode == "enforce" and result["decision"] == "reject":
