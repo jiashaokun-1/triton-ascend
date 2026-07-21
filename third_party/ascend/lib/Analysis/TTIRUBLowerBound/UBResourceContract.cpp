@@ -56,6 +56,16 @@ void PipelineContractRegistry::addForTesting(
   contracts.push_back(std::move(contract));
 }
 
+bool PipelineContractRegistry::hasExactlyOneMatchingContract(
+    const PipelineStageContext &context, StringRef expectedId,
+    StringRef expectedVersion) const {
+  if (contracts.size() != 1 || !contracts.front())
+    return false;
+  const UBResourceContract &contract = *contracts.front();
+  return contract.matches(context) && contract.id() == expectedId &&
+         contract.version() == expectedVersion;
+}
+
 LogicalResult PipelineContractRegistry::applyOrInvalidateAll(
     MandatoryUBResourceGraph &graph,
     const PipelineStageContext &context) const {

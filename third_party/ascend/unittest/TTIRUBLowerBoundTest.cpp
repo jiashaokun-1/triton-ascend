@@ -2,6 +2,8 @@
 #include "Analysis/TTIRUBLowerBound/TTIRUBLowerBound.h"
 #include "Analysis/TTIRUBLowerBound/UBResourceContract.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Parser/Parser.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -17,11 +19,14 @@ namespace {
 class FixedDispositionContract final : public UBResourceContract {
 public:
   FixedDispositionContract(StringRef stageName,
-                           ContractDisposition disposition)
-      : stageName(stageName.str()), disposition(disposition) {}
+                           ContractDisposition disposition,
+                           StringRef contractId = "fixed-disposition",
+                           StringRef contractVersion = "1")
+      : stageName(stageName.str()), disposition(disposition),
+        contractId(contractId.str()), contractVersion(contractVersion.str()) {}
 
-  StringRef id() const override { return "fixed-disposition"; }
-  StringRef version() const override { return "1"; }
+  StringRef id() const override { return contractId; }
+  StringRef version() const override { return contractVersion; }
   bool matches(const PipelineStageContext &context) const override {
     return context.stageName == stageName;
   }
@@ -33,6 +38,8 @@ public:
 private:
   std::string stageName;
   ContractDisposition disposition;
+  std::string contractId;
+  std::string contractVersion;
 };
 
 constexpr StringLiteral kDirectLoadCopy = R"mlir(
@@ -72,7 +79,8 @@ std::string replaceAll(StringRef source, StringRef from, StringRef to) {
 class TTIRUBLowerBoundAnalysisTest : public ::testing::Test {
 protected:
   TTIRUBLowerBoundAnalysisTest() {
-    context.loadDialect<arith::ArithDialect, triton::TritonDialect>();
+    context.loadDialect<arith::ArithDialect, scf::SCFDialect,
+                        triton::TritonDialect>();
     registry.addForTesting(std::make_unique<FixedDispositionContract>(
         "preserve", ContractDisposition::Preserve));
   }
@@ -106,6 +114,11 @@ protected:
     return analyzeTTIRUBLowerBound(*module, analysisOptions, registry);
   }
 
+  TTIRUBAnalysisResult analyzeModule(
+      ModuleOp module, TTIRUBAnalysisOptions analysisOptions) {
+    return analyzeTTIRUBLowerBound(module, analysisOptions, registry);
+  }
+
   static bool hasReason(const TTIRUBAnalysisResult &result, StringRef reason) {
     return llvm::any_of(result.unsupportedReasons, [&](const std::string &item) {
       return item == reason;
@@ -115,6 +128,35 @@ protected:
   MLIRContext context;
   PipelineContractRegistry registry;
 };
+
+template <typename OpTy> OpTy findOnlyOp(ModuleOp module) {
+  OpTy result;
+  module.walk([&](OpTy op) { result = op; });
+  EXPECT_TRUE(result);
+  return result;
+}
+
+Operation *replaceWithMalformedOperation(Operation *original,
+                                         TypeRange resultTypes,
+                                         bool addRegion = false,
+                                         Block *successor = nullptr) {
+  OperationState state(original->getLoc(), original->getName().getStringRef());
+  state.addOperands(original->getOperands());
+  state.addTypes(resultTypes);
+  if (addRegion)
+    state.addRegion();
+  if (successor)
+    state.addSuccessors(successor);
+  Operation *replacement = Operation::create(state);
+  original->getBlock()->getOperations().insert(original->getIterator(),
+                                                replacement);
+  for (auto [oldResult, newResult] :
+       llvm::zip(original->getResults(), replacement->getResults().take_front(
+                                             original->getNumResults())))
+    oldResult.replaceAllUsesWith(newResult);
+  original->erase();
+  return replacement;
+}
 
 TEST(MandatoryUBResourceGraph, SingletonUsesLargestMandatoryResource) {
   MandatoryUBResourceGraph graph;
@@ -326,17 +368,16 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, MaskedLoadDefersWithNamedReason) {
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest, DynamicShapeDefersWithNamedReason) {
-  OwningOpRef<ModuleOp> module = parse();
-  ASSERT_TRUE(module);
-  triton::LoadOp load;
-  module->walk([&](triton::LoadOp op) { load = op; });
-  ASSERT_TRUE(load);
-  auto originalType = cast<RankedTensorType>(load.getType());
-  load.getResult().setType(RankedTensorType::get(
-      {ShapedType::kDynamic}, originalType.getElementType()));
+  constexpr StringLiteral source = R"mlir(
+module {
+  tt.func public @copy(%src: tensor<?x!tt.ptr<f32>>) {
+    %value = tt.load %src : tensor<?x!tt.ptr<f32>>
+    tt.return
+  }
+}
+)mlir";
 
-  TTIRUBAnalysisResult result =
-      analyzeTTIRUBLowerBound(*module, options(), registry);
+  TTIRUBAnalysisResult result = analyze(source, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "dynamic-shape"));
 }
@@ -365,22 +406,15 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest, NestedRegionDefersWithNamedReason) {
-  OwningOpRef<ModuleOp> module = parse();
-  ASSERT_TRUE(module);
-  triton::LoadOp load;
-  module->walk([&](triton::LoadOp op) { load = op; });
-  ASSERT_TRUE(load);
+  std::string source = replaceOnce(
+      kDirectLoadCopy,
+      "    %value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>",
+      R"mlir(    %value = scf.execute_region -> tensor<65536xf32> {
+      %nested = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>
+      scf.yield %nested : tensor<65536xf32>
+    })mlir");
 
-  OperationState nestedState(load.getLoc(), "test.nested");
-  nestedState.addRegion();
-  Operation *nested = Operation::create(nestedState);
-  load->getBlock()->getOperations().insert(load->getIterator(), nested);
-  nested->getRegion(0).push_back(new Block());
-  load->moveBefore(&nested->getRegion(0).front(),
-                   nested->getRegion(0).front().end());
-
-  TTIRUBAnalysisResult result =
-      analyzeTTIRUBLowerBound(*module, options(), registry);
+  TTIRUBAnalysisResult result = analyze(source, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "nested-region"));
 }
@@ -427,6 +461,273 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, CapacityEqualityDoesNotReject) {
   EXPECT_EQ(result.lowerBoundBytes, 192 * 1024);
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(result.unsupportedReasons.empty());
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, NullModuleDefersAsMalformedIR) {
+  TTIRUBAnalysisResult result = analyzeModule(ModuleOp(), options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ZeroRegionModuleDefersAsMalformedIR) {
+  OperationState state(UnknownLoc::get(&context), ModuleOp::getOperationName());
+  Operation *rawModule = Operation::create(state);
+  ModuleOp malformedModule = cast<ModuleOp>(rawModule);
+
+  TTIRUBAnalysisResult result = analyzeModule(malformedModule, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  rawModule->destroy();
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, MissingRangeAttrsDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::MakeRangeOp range = findOnlyOp<triton::MakeRangeOp>(*module);
+  replaceWithMalformedOperation(range, range->getResultTypes());
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, CorruptLoadSegmentsDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
+  load.getProperties().operandSegmentSizes = {0, 1, 0};
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       MissingLoadDefaultPropertyDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
+  load.getProperties().cache = {};
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       MissingStoreDefaultPropertyDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::StoreOp store = findOnlyOp<triton::StoreOp>(*module);
+  store.getProperties().cache = {};
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ZeroRegionFunctionDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::FuncOp function = findOnlyOp<triton::FuncOp>(*module);
+  OperationState state(function.getLoc(), triton::FuncOp::getOperationName());
+  Operation *malformedFunction = Operation::create(state);
+  function->getBlock()->getOperations().insert(function->getIterator(),
+                                                malformedFunction);
+  function.erase();
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       FunctionSignatureBodyMismatchDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::FuncOp function = findOnlyOp<triton::FuncOp>(*module);
+  function.setFunctionType(FunctionType::get(&context, {}, {}));
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraMatchedResultDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::AddPtrOp addPtr = findOnlyOp<triton::AddPtrOp>(*module);
+  SmallVector<Type> resultTypes(addPtr->getResultTypes());
+  resultTypes.push_back(addPtr.getType());
+  replaceWithMalformedOperation(addPtr, resultTypes);
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraMatchedRegionDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::AddPtrOp addPtr = findOnlyOp<triton::AddPtrOp>(*module);
+  replaceWithMalformedOperation(addPtr, addPtr->getResultTypes(), true);
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraMatchedSuccessorDefersAsMalformedIR) {
+  MLIRContext malformedContext;
+  malformedContext.allowUnregisteredDialects();
+  Location location = UnknownLoc::get(&malformedContext);
+  OwningOpRef<ModuleOp> module = ModuleOp::create(location);
+  Block &body = module->getBodyRegion().front();
+
+  OperationState sourceState(location, "test.source");
+  Type i32 = IntegerType::get(&malformedContext, 32);
+  sourceState.addTypes({i32, i32});
+  Operation *source = Operation::create(sourceState);
+  body.push_back(source);
+
+  OperationState addPtrState(location, "tt.addptr");
+  addPtrState.addOperands(source->getResults());
+  addPtrState.addTypes(i32);
+  addPtrState.addSuccessors(&body);
+  body.push_back(Operation::create(addPtrState));
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, MultipleReturnsDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::ReturnOp returnOp = findOnlyOp<triton::ReturnOp>(*module);
+  Operation *duplicate = returnOp->clone();
+  returnOp->getBlock()->getOperations().insert(returnOp->getIterator(),
+                                                duplicate);
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, InvalidSSAPlacementDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::SplatOp splat = findOnlyOp<triton::SplatOp>(*module);
+  triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
+  splat->moveAfter(load);
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       RegistryExposesExactSyntheticContractProfile) {
+  EXPECT_TRUE(registry.hasExactlyOneMatchingContract(
+      {.stageName = "preserve"}, "fixed-disposition", "1"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, OmittedStageDefersAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages.clear();
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, DuplicateStageDefersAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages.push_back({.stageName = "preserve"});
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, AdditionalStageDefersAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages.push_back({.stageName = "unknown"});
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ReorderedStagesDeferAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages.clear();
+  analysisOptions.stages.push_back({.stageName = "unknown"});
+  analysisOptions.stages.push_back({.stageName = "preserve"});
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, UnknownStageDefersAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages.front().stageName = "unknown";
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, StageOptionsDeferAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages.front().options["tile"] = "2";
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ContractIdMismatchDefersAsUnknownProfile) {
+  PipelineContractRegistry mismatchedRegistry;
+  mismatchedRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "preserve", ContractDisposition::Preserve, "other", "1"));
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  TTIRUBAnalysisResult result =
+      analyzeTTIRUBLowerBound(*module, options(), mismatchedRegistry);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ContractVersionMismatchDefersAsUnknownProfile) {
+  PipelineContractRegistry mismatchedRegistry;
+  mismatchedRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "preserve", ContractDisposition::Preserve, "fixed-disposition", "2"));
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  TTIRUBAnalysisResult result =
+      analyzeTTIRUBLowerBound(*module, options(), mismatchedRegistry);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       DuplicateContractsDeferAsUnknownProfile) {
+  PipelineContractRegistry duplicateRegistry;
+  duplicateRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "preserve", ContractDisposition::Preserve));
+  duplicateRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "preserve", ContractDisposition::Preserve));
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  TTIRUBAnalysisResult result =
+      analyzeTTIRUBLowerBound(*module, options(), duplicateRegistry);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, TargetMismatchDefersAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.pipelineIdentity.targetArch = "Ascend950";
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
 }
 
 } // namespace

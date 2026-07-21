@@ -63,10 +63,13 @@ struct ContiguousPointerChain {
   triton::AddPtrOp addPtr;
 };
 
+bool isDirectlyInEntryBlock(Operation *operation, triton::FuncOp function);
+
 FailureOr<ContiguousPointerChain>
-matchContiguousPointer(Value pointer, Block &entryBlock, int64_t numElements,
-                       Type elementType,
+matchContiguousPointer(Value pointer, triton::FuncOp function,
+                       int64_t numElements, Type elementType,
                        SmallVectorImpl<std::string> &reasons) {
+  Block &entryBlock = function.getBody().front();
   auto pointerTensorType = dyn_cast<RankedTensorType>(pointer.getType());
   auto tensorPointerType =
       pointerTensorType
@@ -120,6 +123,16 @@ matchContiguousPointer(Value pointer, Block &entryBlock, int64_t numElements,
     addReason(reasons, "non-contiguous-pointer");
     return failure();
   }
+  if (!isDirectlyInEntryBlock(range, function) ||
+      !isDirectlyInEntryBlock(splat, function) ||
+      !isDirectlyInEntryBlock(addPtr, function) ||
+      range->getNumRegions() != 0 || range->getNumSuccessors() != 0 ||
+      splat->getNumRegions() != 0 || splat->getNumSuccessors() != 0 ||
+      addPtr->getNumRegions() != 0 || addPtr->getNumSuccessors() != 0 ||
+      !range->isBeforeInBlock(addPtr) || !splat->isBeforeInBlock(addPtr)) {
+    addReason(reasons, "invalid-chain-placement");
+    return failure();
+  }
 
   return ContiguousPointerChain{range, splat, addPtr};
 }
@@ -157,7 +170,11 @@ LogicalResult rejectUnsupportedOperations(
     }
     if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp,
             triton::LoadOp, triton::StoreOp>(operation)) {
-      if (matched.contains(operation))
+      triton::FuncOp function = operation->getParentOfType<triton::FuncOp>();
+      if (matched.contains(operation) && function &&
+          isDirectlyInEntryBlock(operation, function) &&
+          operation->getNumRegions() == 0 &&
+          operation->getNumSuccessors() == 0)
         return WalkResult::advance();
       addReason(reasons, "unmatched-operation");
       return WalkResult::interrupt();
@@ -183,7 +200,8 @@ LogicalResult materializeLoad(triton::LoadOp load,
   triton::FuncOp function = load->getParentOfType<triton::FuncOp>();
   if (!function || function->getNumRegions() != 1 ||
       !function.getBody().hasOneBlock() ||
-      !isDirectlyInEntryBlock(load, function))
+      !isDirectlyInEntryBlock(load, function) ||
+      load->getNumRegions() != 0 || load->getNumSuccessors() != 0)
     return defer(reasons, "nested-region");
   if (load->getNumOperands() != 1)
     return defer(reasons, "masked-load");
@@ -201,11 +219,12 @@ LogicalResult materializeLoad(triton::LoadOp load,
     return failure();
 
   FailureOr<ContiguousPointerChain> sourceChain = matchContiguousPointer(
-      load.getPtr(), function.getBody().front(), resultType.getNumElements(),
+      load.getPtr(), function, resultType.getNumElements(),
       resultType.getElementType(), reasons);
   if (failed(sourceChain))
     return failure();
-  if (!sourceChain->addPtr.getResult().hasOneUse())
+  if (!sourceChain->addPtr.getResult().hasOneUse() ||
+      !sourceChain->addPtr->isBeforeInBlock(load))
     return defer(reasons, "load-pointer-has-extra-use");
 
   if (load.getResult().use_empty())
@@ -222,7 +241,9 @@ LogicalResult materializeLoad(triton::LoadOp load,
   if (store.getValue() != load.getResult() ||
       store.getValue().getType() != resultType)
     return defer(reasons, "load-not-reaching-store");
-  if (!isDirectlyInEntryBlock(store, function))
+  if (!isDirectlyInEntryBlock(store, function) ||
+      store->getNumRegions() != 0 || store->getNumSuccessors() != 0 ||
+      !load->isBeforeInBlock(store))
     return defer(reasons, "nested-region");
   if (store->getNumOperands() != 2)
     return defer(reasons, "masked-store");
@@ -232,11 +253,12 @@ LogicalResult materializeLoad(triton::LoadOp load,
     return defer(reasons, "unsupported-store-semantics");
 
   FailureOr<ContiguousPointerChain> destinationChain = matchContiguousPointer(
-      store.getPtr(), function.getBody().front(), resultType.getNumElements(),
+      store.getPtr(), function, resultType.getNumElements(),
       resultType.getElementType(), reasons);
   if (failed(destinationChain))
     return failure();
   if (!destinationChain->addPtr.getResult().hasOneUse() ||
+      !destinationChain->addPtr->isBeforeInBlock(store) ||
       sourceChain->range != destinationChain->range ||
       std::distance(sourceChain->range.getResult().use_begin(),
                     sourceChain->range.getResult().use_end()) != 2)
@@ -273,6 +295,16 @@ LogicalResult materializeDirectTensorLoads(
   if (functions.size() != 1 || functions.front()->getNumRegions() != 1 ||
       !functions.front().isPublic() ||
       !functions.front().getBody().hasOneBlock())
+    return defer(unsupportedReasons, "unsupported-module-shape");
+  Block &entryBlock = functions.front().getBody().front();
+  if (entryBlock.empty())
+    return defer(unsupportedReasons, "unsupported-module-shape");
+  auto returnOp = dyn_cast<triton::ReturnOp>(&entryBlock.back());
+  if (!returnOp || returnOp->getNumOperands() != 0 ||
+      returnOp->getNumRegions() != 0 || returnOp->getNumSuccessors() != 0 ||
+      llvm::count_if(entryBlock, [](Operation &operation) {
+        return isa<triton::ReturnOp>(operation);
+      }) != 1)
     return defer(unsupportedReasons, "unsupported-module-shape");
 
   SmallVector<triton::LoadOp> loads;

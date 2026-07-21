@@ -45,6 +45,9 @@ public:
 class PipelineContractRegistry {
 public:
   void addForTesting(std::unique_ptr<UBResourceContract> contract);
+  bool hasExactlyOneMatchingContract(const PipelineStageContext &context,
+                                     StringRef expectedId,
+                                     StringRef expectedVersion) const;
   LogicalResult
   applyOrInvalidateAll(MandatoryUBResourceGraph &graph,
                        const PipelineStageContext &context) const;
