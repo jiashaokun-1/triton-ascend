@@ -46,6 +46,14 @@ module {
 }
 """
 
+INT64_MAX = (1 << 63) - 1
+
+
+class ExplosiveEquality:
+
+    def __eq__(self, _other):
+        raise RuntimeError("must not escape normalization")
+
 
 @dataclass
 class Options:
@@ -73,6 +81,15 @@ def _analysis_result(decision="reject"):
 
 def _pickle_round_trip(value):
     return pickle.loads(pickle.dumps(value))
+
+
+def _result_with(path, value):
+    result = _analysis_result()
+    container = result
+    for key in path[:-1]:
+        container = container[key]
+    container[path[-1]] = value
+    return result
 
 
 def test_off_does_not_call_analyzer(monkeypatch):
@@ -111,6 +128,95 @@ def test_enforce_raises_only_proven_reject(monkeypatch):
     assert error.value.limit == 196608
     assert error.value.certificate == _analysis_result()["certificates"][0]
     assert error.value.pipeline_identity == "test-id"
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("decision", ), None),
+        (("decision", ), "unknown"),
+        (("lower_bound_bytes", ), -1),
+        (("lower_bound_bytes", ), True),
+        (("lower_bound_bytes", ), INT64_MAX + 1),
+        (("capacity_bytes", ), None),
+        (("capacity_bytes", ), -1),
+        (("capacity_bytes", ), False),
+        (("capacity_bytes", ), INT64_MAX + 1),
+        (("certificates", ), None),
+        (("certificates", ), [None]),
+        (("certificates", ), [object()]),
+        (("certificates", 0, "kind"), None),
+        (("certificates", 0, "kind"), "pairwise"),
+        (("certificates", 0, "kind"), ExplosiveEquality()),
+        (("certificates", 0, "bytes"), -1),
+        (("certificates", 0, "bytes"), True),
+        (("certificates", 0, "bytes"), INT64_MAX + 1),
+        (("certificates", 0, "bytes"), 262143),
+        (("certificates", 0, "resource_ids"), None),
+        (("certificates", 0, "resource_ids"), []),
+        (("certificates", 0, "resource_ids"), [True]),
+        (("certificates", 0, "resource_ids"), [-1]),
+        (("certificates", 0, "resource_ids"), [INT64_MAX + 1]),
+        (("certificates", 0, "resource_ids"), [object()]),
+        (("certificates", 0, "extra"), object()),
+        (("unsupported_reasons", ), None),
+        (("unsupported_reasons", ), [None]),
+        (("unsupported_reasons", ), [object()]),
+        (("contract_version", ), None),
+        (("contract_version", ), object()),
+        (("pipeline_identity", ), None),
+        (("pipeline_identity", ), object()),
+        (("pipeline_identity", ), "other-id"),
+        (("extra", ), object()),
+    ],
+)
+def test_invalid_analysis_schema_fails_open_with_json_metadata(monkeypatch, path, value):
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: _result_with(path, value))
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options("enforce"), "test-id")
+    assert metadata["ub_lower_bound_decision"] == "defer"
+    assert metadata["ub_lower_bound_bytes"] == 0
+    assert metadata["ub_capacity_bytes"] is None
+    assert metadata["ub_lower_bound_certificate_count"] == 0
+    assert metadata["ub_lower_bound_unsupported_reasons"] == ["invalid-analysis-result"]
+    assert metadata["ub_lower_bound_pipeline_identity"] == "test-id"
+    json.dumps(metadata)
+
+
+def test_mapping_pipeline_identity_uses_sha256_fingerprint(monkeypatch):
+    identity = {"sha256": "mapped-id"}
+    result = _analysis_result("defer")
+    result["pipeline_identity"] = "mapped-id"
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: result)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options("shadow"), identity)
+    assert metadata["ub_lower_bound_pipeline_identity"] == "mapped-id"
+    json.dumps(metadata)
+
+
+@pytest.mark.parametrize("identity", [None, object(), {}, {"sha256": None}, {"sha256": object()}])
+def test_bad_caller_identity_is_string_on_exception_path(monkeypatch, identity):
+
+    def fail(*_args):
+        raise RuntimeError("bad")
+
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", fail)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options("enforce"), identity)
+    assert metadata["ub_lower_bound_pipeline_identity"] == ""
+    json.dumps(metadata)
+
+
+def test_mapping_identity_exception_path_uses_sha256_string(monkeypatch):
+
+    def fail(*_args):
+        raise RuntimeError("bad")
+
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", fail)
+    metadata = {}
+    apply_ub_lower_bound_policy(object(), metadata, Options("enforce"), {"sha256": "mapped-id"})
+    assert metadata["ub_lower_bound_pipeline_identity"] == "mapped-id"
+    json.dumps(metadata)
 
 
 @pytest.mark.parametrize("decision", ["defer", "unknown"])
@@ -172,8 +278,25 @@ def test_packaged_contract_profiles_start_empty():
     ("arch", "expected"),
     [
         ("Ascend910B", 192 * 1024),
+        ("Ascend910_93", 192 * 1024),
         ("Ascend910B1", 192 * 1024),
+        ("Ascend910B2", 192 * 1024),
+        ("Ascend910B3", 192 * 1024),
+        ("Ascend910B4", 192 * 1024),
         ("Ascend910_9362", 192 * 1024),
+        ("Ascend910_9372", 192 * 1024),
+        ("Ascend910_9381", 192 * 1024),
+        ("Ascend910_9382", 192 * 1024),
+        ("Ascend910_9391", 192 * 1024),
+        ("Ascend910_9392", 192 * 1024),
+        ("Ascend310B1", 248 * 1024),
+        ("Ascend310B2", 248 * 1024),
+        ("Ascend310B3", 248 * 1024),
+        ("Ascend310B4", 248 * 1024),
+        ("Ascend910_95", 256 * 1024),
+        ("Ascend910_9579", 256 * 1024),
+        ("Ascend910_9581", 256 * 1024),
+        ("Ascend910_9589", 256 * 1024),
         ("Ascend910_9599", 256 * 1024),
         ("Ascend950", 256 * 1024),
     ],
@@ -182,8 +305,21 @@ def test_binding_capacity_source(arch, expected):
     assert ascend.analysis.get_ub_capacity_bytes(arch) == expected
 
 
-def test_binding_capacity_unknown_is_none():
-    assert ascend.analysis.get_ub_capacity_bytes("future-chip") is None
+@pytest.mark.parametrize(
+    "arch",
+    [
+        "future-chip",
+        "Ascend910B-future",
+        "Ascend910BLAH",
+        "Ascend910_93future",
+        "Ascend910_95future",
+        "Ascend950Future",
+        "Ascend310B",
+        "Ascend310B5",
+    ],
+)
+def test_binding_capacity_unknown_is_none(arch):
+    assert ascend.analysis.get_ub_capacity_bytes(arch) is None
 
 
 def test_binding_result_is_json_serializable():
@@ -261,7 +397,12 @@ def _fake_active_driver(arch):
 
 @pytest.mark.parametrize(
     ("arch", "expected_ub", "expected_rf"),
-    [("Ascend910B1", 192, None), ("Ascend910_9362", 192, None), ("Ascend910_9599", 256, 128)],
+    [
+        ("Ascend910B1", 192, None),
+        ("Ascend910_9362", 192, None),
+        ("Ascend310B1", 248, None),
+        ("Ascend910_9599", 256, 128),
+    ],
 )
 def test_runtime_capacity_uses_binding_and_keeps_rf_separate(monkeypatch, arch, expected_ub, expected_rf):
     from triton.runtime.driver import driver

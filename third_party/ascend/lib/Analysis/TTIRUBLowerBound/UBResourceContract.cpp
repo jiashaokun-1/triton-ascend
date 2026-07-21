@@ -102,13 +102,29 @@ std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
 }
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {
-  if (targetArch.starts_with("Ascend910B") ||
-      targetArch.starts_with("Ascend910_93"))
-    return 192 * 1024;
-  if (targetArch.starts_with("Ascend910_95") ||
-      targetArch.starts_with("Ascend950"))
-    return 256 * 1024;
-  return std::nullopt;
+  static const llvm::StringMap<int64_t> capacities = {
+      {"Ascend910B", 192 * 1024},
+      {"Ascend910_93", 192 * 1024},
+      {"Ascend910B1", 192 * 1024},
+      {"Ascend910B2", 192 * 1024},
+      {"Ascend910B3", 192 * 1024},
+      {"Ascend910B4", 192 * 1024},
+      {"Ascend910_9362", 192 * 1024}, {"Ascend910_9372", 192 * 1024},
+      {"Ascend910_9381", 192 * 1024}, {"Ascend910_9382", 192 * 1024},
+      {"Ascend910_9391", 192 * 1024}, {"Ascend910_9392", 192 * 1024},
+      {"Ascend310B1", 248 * 1024},
+      {"Ascend310B2", 248 * 1024},
+      {"Ascend310B3", 248 * 1024},
+      {"Ascend310B4", 248 * 1024},
+      {"Ascend910_95", 256 * 1024},
+      {"Ascend950", 256 * 1024},
+      {"Ascend910_9579", 256 * 1024}, {"Ascend910_9581", 256 * 1024},
+      {"Ascend910_9589", 256 * 1024}, {"Ascend910_9599", 256 * 1024},
+  };
+  const auto capacity = capacities.find(targetArch);
+  if (capacity == capacities.end())
+    return std::nullopt;
+  return capacity->second;
 }
 
 } // namespace mlir::triton::ascend::ub

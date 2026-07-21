@@ -26,6 +26,17 @@ from triton._C.libtriton import ascend
 from .errors import UBLowerBoundOverflow
 
 _PROFILE_PATH = Path(__file__).with_name("ub_contract_profiles.json")
+_INT64_MAX = (1 << 63) - 1
+_RESULT_KEYS = frozenset({
+    "decision",
+    "lower_bound_bytes",
+    "capacity_bytes",
+    "certificates",
+    "unsupported_reasons",
+    "pipeline_identity",
+    "contract_version",
+})
+_CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids"})
 
 
 def load_contract_profiles():
@@ -35,45 +46,106 @@ def load_contract_profiles():
     return profile
 
 
-def _defer_result(pipeline_identity, reason):
+def _pipeline_fingerprint(pipeline_identity):
+    if type(pipeline_identity) is str and pipeline_identity:
+        return pipeline_identity
+    if type(pipeline_identity) is dict:
+        fingerprint = pipeline_identity.get("sha256")
+        if type(fingerprint) is str and fingerprint:
+            return fingerprint
+    return ""
+
+
+def _defer_result(pipeline_fingerprint, reason):
     return {
         "decision": "defer",
         "lower_bound_bytes": 0,
         "capacity_bytes": None,
         "certificates": [],
         "unsupported_reasons": [reason],
-        "pipeline_identity": pipeline_identity,
+        "pipeline_identity": pipeline_fingerprint,
         "contract_version": "ttir-ub-lb-v1",
     }
 
 
-def _normalize_result(result, pipeline_identity):
-    if not isinstance(result, dict):
-        return _defer_result(pipeline_identity, "invalid-analysis-result")
+def _is_int64(value):
+    return type(value) is int and 0 <= value <= _INT64_MAX
 
-    normalized = {
-        "decision": "defer",
-        "lower_bound_bytes": result.get("lower_bound_bytes", 0),
-        "capacity_bytes": result.get("capacity_bytes"),
-        "certificates": result.get("certificates", []),
-        "unsupported_reasons": result.get("unsupported_reasons", []),
-        "pipeline_identity": result.get("pipeline_identity", pipeline_identity),
-        "contract_version": result.get("contract_version", "ttir-ub-lb-v1"),
+
+def _normalize_certificate(certificate, lower_bound_bytes):
+    if type(certificate) is not dict or set(certificate) != _CERTIFICATE_KEYS:
+        return None
+    if type(certificate.get("kind")) is not str or certificate["kind"] != "singleton":
+        return None
+    if not _is_int64(certificate.get("bytes")) or certificate["bytes"] != lower_bound_bytes:
+        return None
+    resource_ids = certificate.get("resource_ids")
+    if type(resource_ids) is not list or not resource_ids or not all(
+            _is_int64(resource_id) for resource_id in resource_ids):
+        return None
+    return {
+        "kind": certificate["kind"],
+        "bytes": certificate["bytes"],
+        "resource_ids": list(resource_ids),
     }
-    if not isinstance(normalized["lower_bound_bytes"], int) or isinstance(normalized["lower_bound_bytes"], bool):
-        return _defer_result(pipeline_identity, "invalid-analysis-result")
-    if normalized["capacity_bytes"] is not None and (not isinstance(normalized["capacity_bytes"], int)
-                                                     or isinstance(normalized["capacity_bytes"], bool)):
-        return _defer_result(pipeline_identity, "invalid-analysis-result")
-    if not isinstance(normalized["certificates"], list) or not isinstance(normalized["unsupported_reasons"], list):
-        return _defer_result(pipeline_identity, "invalid-analysis-result")
 
-    proven_reject = (result.get("decision") == "reject" and normalized["capacity_bytes"] is not None
-                     and normalized["lower_bound_bytes"] > normalized["capacity_bytes"]
-                     and bool(normalized["certificates"]) and not normalized["unsupported_reasons"])
-    if proven_reject:
-        normalized["decision"] = "reject"
-    return normalized
+
+def _normalize_result(result, pipeline_fingerprint):
+    invalid = lambda: _defer_result(pipeline_fingerprint, "invalid-analysis-result")
+    if type(result) is not dict or set(result) != _RESULT_KEYS:
+        return invalid()
+
+    decision = result["decision"]
+    lower_bound_bytes = result["lower_bound_bytes"]
+    capacity_bytes = result["capacity_bytes"]
+    certificates = result["certificates"]
+    unsupported_reasons = result["unsupported_reasons"]
+    contract_version = result["contract_version"]
+    result_fingerprint = result["pipeline_identity"]
+    if type(decision) is not str or decision not in ("defer", "reject"):
+        return invalid()
+    if not _is_int64(lower_bound_bytes):
+        return invalid()
+    if capacity_bytes is None:
+        if decision != "defer":
+            return invalid()
+    elif not _is_int64(capacity_bytes):
+        return invalid()
+    if type(certificates) is not list:
+        return invalid()
+    normalized_certificates = []
+    for certificate in certificates:
+        normalized_certificate = _normalize_certificate(certificate, lower_bound_bytes)
+        if normalized_certificate is None:
+            return invalid()
+        normalized_certificates.append(normalized_certificate)
+    if type(unsupported_reasons) is not list or not all(type(reason) is str for reason in unsupported_reasons):
+        return invalid()
+    if type(contract_version) is not str:
+        return invalid()
+    if type(result_fingerprint) is not str or result_fingerprint != pipeline_fingerprint:
+        return invalid()
+    if decision == "reject" and (lower_bound_bytes <= capacity_bytes or not normalized_certificates
+                                 or unsupported_reasons):
+        return invalid()
+
+    return {
+        "decision": decision,
+        "lower_bound_bytes": lower_bound_bytes,
+        "capacity_bytes": capacity_bytes,
+        "certificates": normalized_certificates,
+        "unsupported_reasons": list(unsupported_reasons),
+        "pipeline_identity": result_fingerprint,
+        "contract_version": contract_version,
+    }
+
+
+def _exception_reason(error):
+    try:
+        message = str(error)
+    except Exception:
+        message = type(error).__name__
+    return f"internal-error: {message}"
 
 
 def _record_metadata(metadata, mode, result):
@@ -94,20 +166,28 @@ def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
     if mode == "off":
         return
 
-    try:
-        result = ascend.analysis.ttir_ub_lower_bound(
-            mod,
-            {
-                "arch": opt.arch,
-                "compile_mode": opt.compile_mode,
-                "pipeline_identity": pipeline_identity,
-                "pipeline_stages": [],
-                "contract_profile": load_contract_profiles(),
-            },
-        )
-        result = _normalize_result(result, pipeline_identity)
-    except Exception as error:
-        result = _defer_result(pipeline_identity, f"internal-error: {error}")
+    pipeline_fingerprint = _pipeline_fingerprint(pipeline_identity)
+    if not pipeline_fingerprint:
+        result = _defer_result("", "invalid-analysis-result")
+    else:
+        try:
+            raw_result = ascend.analysis.ttir_ub_lower_bound(
+                mod,
+                {
+                    "arch": opt.arch,
+                    "compile_mode": opt.compile_mode,
+                    "pipeline_identity": pipeline_identity,
+                    "pipeline_stages": [],
+                    "contract_profile": load_contract_profiles(),
+                },
+            )
+        except Exception as error:
+            result = _defer_result(pipeline_fingerprint, _exception_reason(error))
+        else:
+            try:
+                result = _normalize_result(raw_result, pipeline_fingerprint)
+            except Exception:
+                result = _defer_result(pipeline_fingerprint, "invalid-analysis-result")
 
     _record_metadata(metadata, mode, result)
     if mode == "enforce" and result["decision"] == "reject":

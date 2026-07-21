@@ -352,10 +352,33 @@ TEST(UBResourceContract, InternalErrorReturnsFailure) {
 }
 
 TEST(UBResourceContract, CapacityHasNoUnknownDefault) {
-  EXPECT_EQ(*getUBCapacityBytes("Ascend910B"), 192 * 1024);
-  EXPECT_EQ(*getUBCapacityBytes("Ascend910_95"), 256 * 1024);
-  EXPECT_EQ(*getUBCapacityBytes("Ascend950"), 256 * 1024);
-  EXPECT_FALSE(getUBCapacityBytes("future-chip").has_value());
+  auto expectCapacity = [](StringRef arch, int64_t expected) {
+    std::optional<int64_t> capacity = getUBCapacityBytes(arch);
+    ASSERT_TRUE(capacity.has_value()) << arch.str();
+    EXPECT_EQ(*capacity, expected) << arch.str();
+  };
+
+  for (const char *arch : {"Ascend910B", "Ascend910_93", "Ascend910B1",
+                           "Ascend910B2", "Ascend910B3", "Ascend910B4",
+                           "Ascend910_9362", "Ascend910_9372",
+                           "Ascend910_9381", "Ascend910_9382",
+                           "Ascend910_9391", "Ascend910_9392"})
+    expectCapacity(arch, 192 * 1024);
+
+  for (const char *arch : {"Ascend310B1", "Ascend310B2", "Ascend310B3",
+                           "Ascend310B4"})
+    expectCapacity(arch, 248 * 1024);
+
+  for (const char *arch : {"Ascend910_95", "Ascend950", "Ascend910_9579",
+                           "Ascend910_9581", "Ascend910_9589",
+                           "Ascend910_9599"})
+    expectCapacity(arch, 256 * 1024);
+
+  for (const char *arch : {"future-chip", "Ascend910B-future",
+                           "Ascend910BLAH", "Ascend910_93future",
+                           "Ascend910_95future", "Ascend950Future",
+                           "Ascend310B", "Ascend310B5"})
+    EXPECT_FALSE(getUBCapacityBytes(arch).has_value()) << arch;
 }
 
 TEST(VerifierSafety, ShortLoadSegmentVectorIsRejected) {
