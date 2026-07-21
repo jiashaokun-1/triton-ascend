@@ -102,9 +102,11 @@ std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
 }
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {
-  if (targetArch == "Ascend910B")
+  if (targetArch.starts_with("Ascend910B") ||
+      targetArch.starts_with("Ascend910_93"))
     return 192 * 1024;
-  if (targetArch == "Ascend910_95" || targetArch == "Ascend950")
+  if (targetArch.starts_with("Ascend910_95") ||
+      targetArch.starts_with("Ascend950"))
     return 256 * 1024;
   return std::nullopt;
 }

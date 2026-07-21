@@ -31,9 +31,11 @@ add_subdirectory(lib)
 
 add_triton_plugin(TritonAscend
   ${CMAKE_CURRENT_SOURCE_DIR}/triton_ascend.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/ttir_ub_lower_bound_bindings.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ascend_ir.cc
   LINK_LIBS
   TritonToLinalg
+  TTIRUBLowerBound
   BiShengIRScopeDialect
   BiShengIRHIVMDialect
 )

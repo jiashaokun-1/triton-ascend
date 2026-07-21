@@ -424,9 +424,13 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
 
 // Forward declaration for ascend_ir bindings (defined in ascend_ir.cc)
 void init_ascend_ir(py::module &&m);
+namespace mlir::triton::ascend::ub {
+void initTTIRUBLowerBoundBindings(py::module_ &m);
+}
 
 void init_triton_ascend(py::module &&m) {
   auto passes = m.def_submodule("passes");
+  auto analysis = m.def_submodule("analysis");
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -436,6 +440,7 @@ void init_triton_ascend(py::module &&m) {
   });
 
   init_triton_ascend_passes_ttir(passes.def_submodule("ttir"));
+  mlir::triton::ascend::ub::initTTIRUBLowerBoundBindings(analysis);
   init_triton_ascend_ir(m.def_submodule("ascend_ir"));
 
   // Initialize ascend IR bindings (ascendnpu_ir_builder, scope/hivm dialects)
