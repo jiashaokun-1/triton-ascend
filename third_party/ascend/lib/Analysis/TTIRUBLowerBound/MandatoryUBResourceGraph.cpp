@@ -145,6 +145,18 @@ void MandatoryUBResourceGraph::invalidate(ResourceId id, StringRef reason) {
   resources_[id].invalidReason = reason.str();
 }
 
+LogicalResult MandatoryUBResourceGraph::lowerResourcePayload(
+    ResourceId id, int64_t minPayloadBytes, StringRef contractId) {
+  if (id >= resources_.size() || minPayloadBytes < 0 ||
+      minPayloadBytes > resources_[id].minPayloadBytes) {
+    malformed_ = true;
+    return failure();
+  }
+  resources_[id].minPayloadBytes = minPayloadBytes;
+  resources_[id].contractTrace.push_back(contractId.str());
+  return success();
+}
+
 FailureOr<LowerBoundCertificate>
 MandatoryUBResourceGraph::solveSingletonLowerBound() const {
   if (malformed_)

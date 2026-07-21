@@ -1,4 +1,5 @@
 #include "Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h"
+#include "Analysis/TTIRUBLowerBound/UBResourceContract.h"
 
 #include "gtest/gtest.h"
 
@@ -6,6 +7,27 @@
 
 namespace mlir::triton::ascend::ub {
 namespace {
+
+class FixedDispositionContract final : public UBResourceContract {
+public:
+  FixedDispositionContract(StringRef stageName,
+                           ContractDisposition disposition)
+      : stageName(stageName.str()), disposition(disposition) {}
+
+  StringRef id() const override { return "fixed-disposition"; }
+  StringRef version() const override { return "1"; }
+  bool matches(const PipelineStageContext &context) const override {
+    return context.stageName == stageName;
+  }
+  ContractDisposition apply(MandatoryUBResourceGraph &,
+                            const PipelineStageContext &) const override {
+    return disposition;
+  }
+
+private:
+  std::string stageName;
+  ContractDisposition disposition;
+};
 
 TEST(MandatoryUBResourceGraph, SingletonUsesLargestMandatoryResource) {
   MandatoryUBResourceGraph graph;
@@ -120,6 +142,75 @@ TEST(MandatoryUBResourceGraph, FixedInsertionApiSupportsPlannedCallSites) {
 
   EXPECT_NE(id, InvalidResourceId);
   EXPECT_NE(witness, InvalidWitnessId);
+}
+
+TEST(UBResourceContract, UnknownStageInvalidatesResources) {
+  MandatoryUBResourceGraph graph;
+  graph.addResource({"load0", 262144, 1});
+  PipelineContractRegistry registry;
+  EXPECT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "unknown-pass"})));
+  EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 0);
+}
+
+TEST(UBResourceContract, MismatchedContractInvalidatesResources) {
+  MandatoryUBResourceGraph graph;
+  graph.addResource({"load0", 262144, 1});
+  PipelineContractRegistry registry;
+  registry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "known-pass", ContractDisposition::Preserve));
+  EXPECT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "other-pass"})));
+  EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 0);
+}
+
+TEST(UBResourceContract, PreserveKeepsResourcesValid) {
+  MandatoryUBResourceGraph graph;
+  graph.addResource({"load0", 262144, 1});
+  PipelineContractRegistry registry;
+  registry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "preserve", ContractDisposition::Preserve));
+  EXPECT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "preserve"})));
+  EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 262144);
+}
+
+TEST(UBResourceContract, TransformCanOnlyLowerToProvenMinimum) {
+  MandatoryUBResourceGraph graph;
+  auto id = graph.addResource({"load0", 262144, 1});
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeFixedTileContract("tile", 2));
+  EXPECT_TRUE(
+      succeeded(registry.applyOrInvalidateAll(graph, {.stageName = "tile"})));
+  EXPECT_EQ(graph.resources()[id].minPayloadBytes, 131072);
+}
+
+TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
+  MandatoryUBResourceGraph graph;
+  graph.addResource({"load0", 262144, 1});
+  PipelineContractRegistry registry;
+  registry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "invalidate", ContractDisposition::Invalidate));
+  EXPECT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "invalidate"})));
+  EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 0);
+}
+
+TEST(UBResourceContract, InternalErrorReturnsFailure) {
+  MandatoryUBResourceGraph graph;
+  graph.addResource({"load0", 262144, 1});
+  PipelineContractRegistry registry;
+  registry.addForTesting(std::make_unique<FixedDispositionContract>(
+      "broken", ContractDisposition::InternalError));
+  EXPECT_TRUE(failed(
+      registry.applyOrInvalidateAll(graph, {.stageName = "broken"})));
+}
+
+TEST(UBResourceContract, CapacityHasNoUnknownDefault) {
+  EXPECT_EQ(*getUBCapacityBytes("Ascend910B"), 192 * 1024);
+  EXPECT_EQ(*getUBCapacityBytes("Ascend910_95"), 256 * 1024);
+  EXPECT_EQ(*getUBCapacityBytes("Ascend950"), 256 * 1024);
+  EXPECT_FALSE(getUBCapacityBytes("future-chip").has_value());
 }
 
 } // namespace

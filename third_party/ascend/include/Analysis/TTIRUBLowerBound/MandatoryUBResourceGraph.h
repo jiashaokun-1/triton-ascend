@@ -77,6 +77,8 @@ public:
   WitnessId addWitness(CoexistenceWitness witness);
   WitnessId addWitness(std::initializer_list<ResourceId> resources);
   void invalidate(ResourceId id, StringRef reason);
+  LogicalResult lowerResourcePayload(ResourceId id, int64_t minPayloadBytes,
+                                     StringRef contractId);
   FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;
   FailureOr<LowerBoundCertificate> solveWitnessLowerBound() const;
   ArrayRef<MandatoryUBResource> resources() const;
