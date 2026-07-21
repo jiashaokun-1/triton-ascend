@@ -28,6 +28,8 @@ _CASE_KEYS = frozenset({
 })
 _PEAK_RE = re.compile(r"^PLANMEM_PEAK\t(-?\d+)\t(\d+)\t(\d+)$", re.MULTILINE)
 _REQUIRED_RE = re.compile(r"^PLANMEM_REQUIRED\t(-?\d+)\t(\d+)\t(\d+)$", re.MULTILINE)
+_COMPLETE_RE = re.compile(r"^PLANMEM_UB_ORACLE_COMPLETE\t(-?\d+)$", re.MULTILINE)
+_PLAN_ATTEMPT_RE = re.compile(r"^PLANMEM_PLAN_ATTEMPT\t[^\t]+\t(-?\d+)\t(success|failure)$", re.MULTILINE)
 _OVERFLOW_RE = re.compile(
     r"\b(UB|L1|L0A|L0B|L0C) overflow, requires (\d+) bits while (\d+) bits available!"
 )
@@ -66,6 +68,15 @@ def parse_planmemory_required(text: str, attempt: int, scope: str = UB_SCOPE) ->
 def parse_overflow_scope(text: str) -> str | None:
     match = _OVERFLOW_RE.search(text)
     return match.group(1) if match else None
+
+
+def parse_completed_attempt(text: str) -> int:
+    if not _COMPLETE_RE.search(text):
+        raise OracleUnavailable("missing PlanMemory completion marker")
+    attempts = [int(value) for value, status in _PLAN_ATTEMPT_RE.findall(text) if status == "success"]
+    if not attempts:
+        raise OracleUnavailable("missing successful PlanMemory attempt")
+    return attempts[-1]
 
 
 def classify_failure(text: str, attempt: int = 0) -> dict:
@@ -187,12 +198,13 @@ def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: fl
     else:
         if "PLANMEM_RUN_RESULT\tsuccess" not in combined:
             raise OracleUnavailable("successful process omitted the PlanMemory completion marker")
+        completed_attempt = parse_completed_attempt(combined)
         result = {
             "status": "success",
             "overflow_scope": None,
             "required_bits": None,
             "available_bits": None,
-            "actual_peak_bits": parse_planmemory_peak(combined, attempt=0, scope=UB_SCOPE),
+            "actual_peak_bits": parse_planmemory_peak(combined, attempt=completed_attempt, scope=UB_SCOPE),
         }
     result.update({"seed": seed, "returncode": completed.returncode})
     return result

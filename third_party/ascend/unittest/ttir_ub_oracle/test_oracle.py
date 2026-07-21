@@ -16,6 +16,8 @@ SUCCESS = """
 PLANMEM_PEAK\t0\t2\t4194304
 PLANMEM_PEAK\t0\t6\t1048576
 PLANMEM_PEAK\t0\t6\t1572864
+PLANMEM_PLAN_ATTEMPT\tcopy\t0\tsuccess
+PLANMEM_UB_ORACLE_COMPLETE\t0
 PLANMEM_RUN_RESULT\tsuccess
 """
 UB_RESULT = """
@@ -28,10 +30,25 @@ L1_RESULT = "L1 overflow, requires 5000000 bits while 4194304 bits available!"
 
 def test_planmemory_parsers_are_scope_and_attempt_specific():
     assert oracle.parse_planmemory_peak(SUCCESS, attempt=0, scope="6") == 1572864
+    assert oracle.parse_completed_attempt(SUCCESS) == 0
     with pytest.raises(oracle.OracleUnavailable):
         oracle.parse_planmemory_peak(SUCCESS, attempt=1, scope="6")
     assert oracle.parse_overflow_scope(UB_RESULT) == "UB"
     assert oracle.parse_overflow_scope(L1_RESULT) == "L1"
+
+
+def test_completed_attempt_selects_last_retry_result():
+    text = """
+PLANMEM_PEAK\t0\t6\t100
+PLANMEM_PLAN_ATTEMPT\tcopy\t0\tfailure
+PLANMEM_PEAK\t4\t6\t200
+PLANMEM_PLAN_ATTEMPT\tcopy\t4\tsuccess
+PLANMEM_UB_ORACLE_COMPLETE\t-1
+PLANMEM_RUN_RESULT\tsuccess
+"""
+    attempt = oracle.parse_completed_attempt(text)
+    assert attempt == 4
+    assert oracle.parse_planmemory_peak(text, attempt, "6") == 200
 
 
 def test_failure_classification_keeps_memory_scopes_distinct():
