@@ -1,4 +1,5 @@
 add_subdirectory(AutoBlockify)
+add_subdirectory(Analysis/TTIRUBLowerBound)
 add_subdirectory(Dialect)
 add_subdirectory(TritonToAnnotation)
 add_subdirectory(TritonToHFusion)
