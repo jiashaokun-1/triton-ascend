@@ -1,10 +1,42 @@
 #include "Analysis/TTIRUBLowerBound/TTIRUBLowerBound.h"
+#include "Analysis/TTIRUBLowerBound/VerifierSafety.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/Verifier.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include <array>
+
 namespace mlir::triton::ascend::ub {
+
+namespace detail {
+
+bool hasValidLoadOperandSegments(ArrayRef<int32_t> segments,
+                                 unsigned numOperands) {
+  if (segments.size() != 3 ||
+      llvm::any_of(segments, [](int32_t size) { return size < 0; }))
+    return false;
+  if (segments[0] != 1 || segments[1] > 1 || segments[2] > 1 ||
+      (segments[2] != 0 && segments[1] == 0))
+    return false;
+  int64_t total = static_cast<int64_t>(segments[0]) + segments[1] +
+                  segments[2];
+  return total == numOperands;
+}
+
+bool hasValidStoreOperandSegments(ArrayRef<int32_t> segments,
+                                  unsigned numOperands) {
+  if (segments.size() != 3 ||
+      llvm::any_of(segments, [](int32_t size) { return size < 0; }))
+    return false;
+  if (segments[0] != 1 || segments[1] != 1 || segments[2] > 1)
+    return false;
+  int64_t total = static_cast<int64_t>(segments[0]) + segments[1] +
+                  segments[2];
+  return total == numOperands;
+}
+
+} // namespace detail
 
 LogicalResult materializeDirectTensorLoads(
     ModuleOp module, MandatoryUBResourceGraph &graph,
@@ -41,8 +73,8 @@ bool isVerifierSafe(Operation *root) {
           operation->getNumSuccessors() != 0)
         return false;
     } else if (name == "tt.load") {
-      if (operation->getNumOperands() < 1 ||
-          operation->getNumOperands() > 3 ||
+      if (!operation->getName().isRegistered() ||
+          operation->getName().getTypeID() != TypeID::get<triton::LoadOp>() ||
           operation->getNumResults() != 1 ||
           operation->getNumRegions() != 0 ||
           operation->getNumSuccessors() != 0)
@@ -52,11 +84,14 @@ bool isVerifierSafe(Operation *root) {
         return false;
       const auto *properties = storage.as<triton::LoadOp::Properties *>();
       if (!properties->boundaryCheck || !properties->cache ||
-          !properties->evict || !properties->isVolatile)
+          !properties->evict || !properties->isVolatile ||
+          !detail::hasValidLoadOperandSegments(
+              properties->operandSegmentSizes,
+              operation->getNumOperands()))
         return false;
     } else if (name == "tt.store") {
-      if (operation->getNumOperands() < 2 ||
-          operation->getNumOperands() > 3 ||
+      if (!operation->getName().isRegistered() ||
+          operation->getName().getTypeID() != TypeID::get<triton::StoreOp>() ||
           operation->getNumResults() != 0 ||
           operation->getNumRegions() != 0 ||
           operation->getNumSuccessors() != 0)
@@ -67,6 +102,16 @@ bool isVerifierSafe(Operation *root) {
       const auto *properties = storage.as<triton::StoreOp::Properties *>();
       if (!properties->boundaryCheck || !properties->cache ||
           !properties->evict)
+        return false;
+      // StoreOp has no AttrSizedOperandSegments property in this checkout;
+      // its ODS groups are uniquely derived from the total operand count.
+      int64_t maskSize = static_cast<int64_t>(operation->getNumOperands()) - 2;
+      if (maskSize < 0 || maskSize > 1)
+        return false;
+      std::array<int32_t, 3> segments = {
+          1, 1, static_cast<int32_t>(maskSize)};
+      if (!detail::hasValidStoreOperandSegments(
+              segments, operation->getNumOperands()))
         return false;
     }
 

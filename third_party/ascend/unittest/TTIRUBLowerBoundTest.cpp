@@ -1,9 +1,11 @@
 #include "Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h"
 #include "Analysis/TTIRUBLowerBound/TTIRUBLowerBound.h"
 #include "Analysis/TTIRUBLowerBound/UBResourceContract.h"
+#include "Analysis/TTIRUBLowerBound/VerifierSafety.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Parser/Parser.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -12,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace mlir::triton::ascend::ub {
 namespace {
@@ -117,6 +120,19 @@ protected:
   TTIRUBAnalysisResult analyzeModule(
       ModuleOp module, TTIRUBAnalysisOptions analysisOptions) {
     return analyzeTTIRUBLowerBound(module, analysisOptions, registry);
+  }
+
+  std::pair<TTIRUBAnalysisResult, unsigned>
+  analyzeModuleCapturingDiagnostics(ModuleOp module,
+                                    TTIRUBAnalysisOptions analysisOptions) {
+    unsigned diagnosticCount = 0;
+    TTIRUBAnalysisResult result;
+    {
+      ScopedDiagnosticHandler handler(
+          &context, [&](Diagnostic &) { ++diagnosticCount; });
+      result = analyzeTTIRUBLowerBound(module, analysisOptions, registry);
+    }
+    return {std::move(result), diagnosticCount};
   }
 
   static bool hasReason(const TTIRUBAnalysisResult &result, StringRef reason) {
@@ -342,6 +358,22 @@ TEST(UBResourceContract, CapacityHasNoUnknownDefault) {
   EXPECT_FALSE(getUBCapacityBytes("future-chip").has_value());
 }
 
+TEST(VerifierSafety, ShortLoadSegmentVectorIsRejected) {
+  EXPECT_FALSE(detail::hasValidLoadOperandSegments({1, 0}, 1));
+}
+
+TEST(VerifierSafety, LongLoadSegmentVectorIsRejected) {
+  EXPECT_FALSE(detail::hasValidLoadOperandSegments({1, 0, 0, 0}, 1));
+}
+
+TEST(VerifierSafety, ShortStoreSegmentVectorIsRejected) {
+  EXPECT_FALSE(detail::hasValidStoreOperandSegments({1, 1}, 2));
+}
+
+TEST(VerifierSafety, LongStoreSegmentVectorIsRejected) {
+  EXPECT_FALSE(detail::hasValidStoreOperandSegments({1, 1, 0, 0}, 2));
+}
+
 TEST_F(TTIRUBLowerBoundAnalysisTest, DirectLoadOverflowIsRejected) {
   TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, options());
 
@@ -497,9 +529,92 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, CorruptLoadSegmentsDefersAsMalformedIR) {
   triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
   load.getProperties().operandSegmentSizes = {0, 1, 0};
 
-  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       NegativeLoadSegmentDefersBeforeVerifier) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
+  load.getProperties().operandSegmentSizes = {-1, 2, 0};
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoadSegmentSumMismatchDefersBeforeVerifier) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
+  load.getProperties().operandSegmentSizes = {1, 1, 0};
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoadOtherWithoutMaskDefersBeforeVerifier) {
+  std::string source = replaceOnce(
+      kDirectLoadCopy, "%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>",
+      "%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>, "
+      "%mask: tensor<65536xi1>, %other: tensor<65536xf32>");
+  source = replaceOnce(
+      source,
+      "%value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>",
+      "%value = tt.load %src_ptrs, %mask, %other : "
+      "tensor<65536x!tt.ptr<f32>>");
+  OwningOpRef<ModuleOp> module = parse(source);
+  ASSERT_TRUE(module);
+  triton::LoadOp load = findOnlyOp<triton::LoadOp>(*module);
+  load->eraseOperand(1);
+  load.getProperties().operandSegmentSizes = {1, 0, 1};
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ShortStoreOperandGroupsDeferBeforeVerifier) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::StoreOp store = findOnlyOp<triton::StoreOp>(*module);
+  store->eraseOperand(1);
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LongStoreOperandGroupsDeferBeforeVerifier) {
+  OwningOpRef<ModuleOp> module = parse();
+  ASSERT_TRUE(module);
+  triton::StoreOp store = findOnlyOp<triton::StoreOp>(*module);
+  Value value = store.getValue();
+  store->insertOperands(store->getNumOperands(), {value, value});
+
+  auto [result, diagnosticCount] =
+      analyzeModuleCapturingDiagnostics(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+  EXPECT_EQ(diagnosticCount, 0u);
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,
