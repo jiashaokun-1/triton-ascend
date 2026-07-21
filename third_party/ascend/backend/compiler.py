@@ -22,6 +22,7 @@ import ctypes
 import functools
 import hashlib
 import glob
+import json
 import os
 import re
 import shlex
@@ -59,6 +60,7 @@ from triton.backends.ascend.utils import (
     get_cann_version_file_hash,
 )
 from triton.backends.ascend.driver import (NPUUtils)
+from triton.backends.ascend.ub_lower_bound import apply_ub_lower_bound_policy
 from triton.backends.compiler import (
     BaseBackend,
     GPUTarget,
@@ -85,6 +87,166 @@ def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, s
     return (src_path, dst_path)
 
 
+# Every per-config option that can change TTIR-to-Linalg materialization or a
+# later BiSheng tiling, fusion, CV, inplace, multi-buffer, buffer-reuse, or
+# workspace decision. Keep this tuple closed: the compiler identity tests also
+# inventory the corresponding forwarded BiSheng flags so a new option cannot
+# silently bypass contract-profile review.
+UB_AFFECTING_OPTIONS = (
+    "add_auto_scheduling",
+    "auto_blockify_size",
+    "auto_tile_and_bind_subblock",
+    "auto_vectorize_v2_max_fused_ops_num",
+    "bisheng_options",
+    "compile_mode",
+    "compile_on_910_95",
+    "disable_auto_inject_block_sync",
+    "disable_fma",
+    "disable_size_align_for_cast",
+    "disable_tightly_coupled_buffer_reuse",
+    "enable_auto_bind_sub_block",
+    "enable_auto_blockify",
+    "enable_auto_vectorize_v2",
+    "enable_bishengir_simt_optimization",
+    "enable_cce_vf_auto_sync",
+    "enable_cce_vf_remove_membar",
+    "enable_drop_unit_dims",
+    "enable_dynamic_cv_pipeline",
+    "enable_flatten",
+    "enable_hivm_auto_cv_balance",
+    "enable_mask_fallback_conversion",
+    "enable_mixed_cv",
+    "enable_nd2nz_on_vector",
+    "enable_preload",
+    "enable_select_analysis",
+    "enable_simt_reorder_instruction",
+    "enable_sync_block_lock",
+    "enable_ubuf_saving",
+    "enable_vf_fusion",
+    "force_simt_only",
+    "force_simt_template",
+    "hfusion_enable_multiple_consumer_fusion",
+    "inject_barrier_all",
+    "inject_block_all",
+    "inter_cache_num",
+    "intra_cache_num",
+    "ir_override",
+    "limit_auto_multi_buffer_of_local_buffer",
+    "limit_auto_multi_buffer_only_for_local_buffer",
+    "load_cache_num",
+    "mix_mode",
+    "multibuffer",
+    "num_stages",
+    "num_warps",
+    "optimize_dynamic_offset",
+    "prevec_max_fused_ops_num",
+    "set_workspace_multibuffer",
+    "shared_mem_dynamic_size",
+    "simt_stack_limit",
+    "sync_solver",
+    "tile_mix_cube_loop",
+    "tile_mix_vector_loop",
+    "unit_flag",
+    "use_bytecode",
+    "vf_merge_level",
+    "warp_size",
+)
+TTIR_UB_DIRECT_BISHENG_PIPELINE = "direct-bisheng-ttir"
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _ub_affecting_identity_options(metadata):
+    options = {name: metadata.get(name) for name in UB_AFFECTING_OPTIONS}
+    auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
+    env_vf = os.getenv("TRITON_ENABLE_VF_FUSION")
+    npu_compiler_path, _ = _get_npucompiler_path()
+    options.update({
+        "effective_auto_map_parallel_blocks":
+        auto_map_parallel_blocks,
+        "effective_bishengir_reg_based":
+        (_check_bishengir_is_regbased() if not metadata.get("compile_on_910_95", False) else None),
+        "effective_disable_ffts": (force_disable_ffts() if metadata.get("compile_on_910_95", False) else None),
+        "effective_npu_compiler":
+        Path(npu_compiler_path).name,
+        "effective_enable_vf_fusion":
+        ((env_vf.lower() in ("true", "1", "yes") if env_vf is not None else metadata.get("enable_vf_fusion", False))
+         if metadata.get("compile_on_910_95", False) else None),
+    })
+    return options
+
+
+def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict) -> dict:
+    target_arch = metadata["target"].arch
+    triton_version = metadata["triton_version"]
+    cann_version_hash = get_cann_version_file_hash()
+    options = _ub_affecting_identity_options(metadata)
+    payload = {
+        "cann_version_hash": cann_version_hash,
+        "open_source_pipeline": pipeline,
+        "relevant_options": options,
+        "target_arch": target_arch,
+        "triton_version": triton_version,
+    }
+    encoded = _canonical_json(payload)
+    return {
+        "open_source_pipeline": pipeline,
+        "relevant_options_json": _canonical_json(options),
+        "target_arch": target_arch,
+        "triton_version": triton_version,
+        "cann_version_hash": cann_version_hash,
+        "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
+
+
+def _build_ttir_to_linalg_pass_manager(mod, metadata, opt, *, named_ops=False):
+    enable_nd2nz_on_vector = metadata["enable_nd2nz_on_vector"]
+    enable_select_analysis = metadata["enable_select_analysis"]
+    compile_on_910_95 = metadata["compile_on_910_95"]
+    compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
+    enable_sync_block_lock = metadata["enable_sync_block_lock"]
+    enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
+    optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
+    auto_blockify_size = metadata["auto_blockify_size"]
+    if not _is_auto_map_parallel_blocks_enabled():
+        auto_blockify_size = 1
+    pm = ir.pass_manager(mod.context)
+    pm.enable_debug()
+    ascend.passes.ttir.add_auto_blockify(pm, auto_blockify_size)
+    if metadata["add_auto_scheduling"]:
+        ascend.passes.ttir.add_dag_sync(pm)
+        ascend.passes.ttir.add_dag_scope(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_canonicalizer(pm)
+        ascend.passes.ttir.add_dag_ssbuffer(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_canonicalizer(pm)
+
+    ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode, enable_sync_block_lock)
+    ascend.passes.ttir.add_triton_to_annotation(pm)
+    ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
+    ascend.passes.ttir.add_triton_to_hivm(pm)
+    ascend.passes.ttir.add_triton_to_hfusion(pm)
+    ascend.passes.ttir.add_triton_to_llvm(pm)
+    ascend.passes.ttir.add_bubble_up_operation(pm)
+    ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+    ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
+                                            compile_on_910_95, compile_mode)
+    if metadata["enable_dynamic_cv_pipeline"]:
+        ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+    return pm
+
+
+def _set_ttir_to_linalg_buffer_counts(metadata):
+    for kind, name in enumerate(("intra_cache_num", "inter_cache_num", "load_cache_num")):
+        value = metadata.get(name)
+        if value is not None:
+            ascend.passes.ttir.set_buffer_count(kind, value)
+
+
 def make_ttir(mod, metadata, opt):
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
@@ -105,6 +267,18 @@ def make_ttir(mod, metadata, opt):
         print(f"Dumping intermediate results to {dump_manager.cache_dir}")
         dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
 
+    if getattr(opt, "ub_lower_bound_mode", "off") != "off":
+        try:
+            if getattr(opt, "force_simt_only", False):
+                pipeline = TTIR_UB_DIRECT_BISHENG_PIPELINE
+            else:
+                future_pm = _build_ttir_to_linalg_pass_manager(mod, metadata, opt, named_ops=True)
+                pipeline = future_pm.get_pipeline_str()
+            pipeline_identity = _ttir_ub_pipeline_identity(pipeline, metadata)
+        except Exception:
+            pipeline_identity = ""
+        apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity)
+
     return mod
 
 
@@ -118,54 +292,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         Path(src_path).write_text(ttir_code)
         triton_adapter_opt_path = _get_triton_adapter_opt_path()
 
-        enable_nd2nz_on_vector = metadata["enable_nd2nz_on_vector"]
-        enable_select_analysis = metadata["enable_select_analysis"]
-        compile_on_910_95 = metadata["compile_on_910_95"]
-        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
-        enable_sync_block_lock = metadata["enable_sync_block_lock"]
-        enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
-        optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
-        auto_blockify_size = metadata["auto_blockify_size"]
-        if not _is_auto_map_parallel_blocks_enabled():
-            auto_blockify_size = 1
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-        ascend.passes.ttir.add_auto_blockify(pm, auto_blockify_size)
-        if (metadata["add_auto_scheduling"]):
-            ascend.passes.ttir.add_dag_sync(pm)
-            ascend.passes.ttir.add_dag_scope(pm)
-            passes.common.add_cse(pm)
-            passes.common.add_canonicalizer(pm)
-            ascend.passes.ttir.add_dag_ssbuffer(pm)
-            passes.common.add_cse(pm)
-            passes.common.add_canonicalizer(pm)
-
-        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
-        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode,
-                                                               enable_sync_block_lock)
-        ascend.passes.ttir.add_triton_to_annotation(pm)
-        ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
-        ascend.passes.ttir.add_triton_to_hivm(pm)
-        ascend.passes.ttir.add_triton_to_hfusion(pm)
-        ascend.passes.ttir.add_triton_to_llvm(pm)
-        ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
-        ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
-                                                compile_on_910_95, compile_mode)
-        if metadata["enable_dynamic_cv_pipeline"]:
-            ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
-
-        _val = metadata.get("intra_cache_num")
-        if _val is not None:
-            ascend.passes.ttir.set_buffer_count(0, _val)
-
-        _val = metadata.get("inter_cache_num")
-        if _val is not None:
-            ascend.passes.ttir.set_buffer_count(1, _val)
-
-        _val = metadata.get("load_cache_num")
-        if _val is not None:
-            ascend.passes.ttir.set_buffer_count(2, _val)
+        pm = _build_ttir_to_linalg_pass_manager(mod, metadata, opt, named_ops=named_ops)
+        _set_ttir_to_linalg_buffer_counts(metadata)
 
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
@@ -794,6 +922,7 @@ def get_libdevice():
 
 
 VALID_COMPILE_MODES = ("simd", "simd_simt", "simt_template", "unstructured_in_simt", "simt_only")
+VALID_UB_LOWER_BOUND_MODES = ("off", "shadow", "enforce")
 
 
 def _validate_compile_mode(compile_mode):
@@ -806,6 +935,7 @@ def _validate_compile_mode(compile_mode):
 @dataclass(frozen=True)
 class NPUOptions:
     debug: bool = False
+    ub_lower_bound_mode: str = "off"
     sanitize_overflow: bool = True
     llvm_version: int = 15
     kernel_name: str = "triton_"
@@ -909,6 +1039,11 @@ class NPUOptions:
     disable_fma: bool = False
 
     def __post_init__(self):
+        if self.ub_lower_bound_mode not in VALID_UB_LOWER_BOUND_MODES:
+            valid_modes = ", ".join(VALID_UB_LOWER_BOUND_MODES)
+            raise ValueError(
+                f"Invalid ub_lower_bound_mode={self.ub_lower_bound_mode!r}. Expected one of: {valid_modes}.")
+
         # Backward compatibility: force_simt_template / force_simt_only overrides compile_mode
         if self.force_simt_template:
             warnings.warn(

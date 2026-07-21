@@ -323,6 +323,8 @@ def compile(src, target=None, options=None, _env_vars=None):
     for ext, compile_ir in list(stages.items())[first_stage:]:
         try:
             next_module = compile_ir(module, metadata)
+        except OutOfResources:
+            raise
         except Exception as e:
             if (ext == "ttadapter"):
                 stage_name = "ConvertTritonIRToLinalgIR"

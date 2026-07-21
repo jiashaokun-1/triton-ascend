@@ -20,16 +20,23 @@
 
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+import ast
+import hashlib
+import inspect
 import json
 import pickle
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from triton._C.libtriton import ascend, ir
+from triton.backends.ascend import compiler as ascend_compiler
 from triton.backends.ascend.errors import UBLowerBoundOverflow
+from triton.backends.ascend import ub_lower_bound
 from triton.backends.ascend.ub_lower_bound import apply_ub_lower_bound_policy, load_contract_profiles
 from triton.backends.ascend.runtime import utils as runtime_utils
+from triton.compiler import compiler as core_compiler
 
 DIRECT_LOAD_COPY = """
 module {
@@ -61,6 +68,7 @@ class Options:
     ub_lower_bound_mode: str
     arch: str = "Ascend910B"
     compile_mode: str = "aiv"
+    debug: bool = False
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -91,6 +99,491 @@ def _result_with(path, value):
         container = container[key]
     container[path[-1]] = value
     return result
+
+
+def _compiler_metadata(**updates):
+    options = ascend_compiler.NPUOptions(compile_on_910_95=False)
+    metadata = dict(options.__dict__)
+    metadata.update({
+        "hash": "compiler-test-hash",
+        "target": SimpleNamespace(arch="Ascend910B"),
+        "triton_version": "test-triton-version",
+    })
+    metadata.update(updates)
+    return metadata
+
+
+EXPECTED_TTIR_TO_LINALG_PIPELINE = (
+    "any(auto-blockify{auto-blockify-size=1},"
+    "triton-to-structured{enable-mask-fallback-conversion=false optimize-dynamic-offset=false},"
+    "discrete-mask-access-conversion{compile-mode=simd compile-on-910-95=false "
+    "enable-sync-block-lock=false force-simt-template=false},"
+    "triton-to-annotation,"
+    "triton-to-unstructure{compile-mode=simd compile-on-910-95=false "
+    "force-scalarize-mode=false force-simt-template=false},"
+    "triton-to-hivm,triton-to-hfusion,triton-to-llvm,"
+    "bubble-up-operation{enable-aggressive-mode=true},"
+    "triton-to-structured{enable-mask-fallback-conversion=false optimize-dynamic-offset=false},"
+    "triton-to-linalg{compile-mode=simd compile-on-910-95=false "
+    "enable-nd2nz-on-vector=false enable-select-analysis=true force-simt-template=false "
+    "global-kernel=false named-ops=false})")
+
+EXPECTED_UB_AFFECTING_OPTIONS = (
+    "add_auto_scheduling",
+    "auto_blockify_size",
+    "auto_tile_and_bind_subblock",
+    "auto_vectorize_v2_max_fused_ops_num",
+    "bisheng_options",
+    "compile_mode",
+    "compile_on_910_95",
+    "disable_auto_inject_block_sync",
+    "disable_fma",
+    "disable_size_align_for_cast",
+    "disable_tightly_coupled_buffer_reuse",
+    "enable_auto_bind_sub_block",
+    "enable_auto_blockify",
+    "enable_auto_vectorize_v2",
+    "enable_bishengir_simt_optimization",
+    "enable_cce_vf_auto_sync",
+    "enable_cce_vf_remove_membar",
+    "enable_drop_unit_dims",
+    "enable_dynamic_cv_pipeline",
+    "enable_flatten",
+    "enable_hivm_auto_cv_balance",
+    "enable_mask_fallback_conversion",
+    "enable_mixed_cv",
+    "enable_nd2nz_on_vector",
+    "enable_preload",
+    "enable_select_analysis",
+    "enable_simt_reorder_instruction",
+    "enable_sync_block_lock",
+    "enable_ubuf_saving",
+    "enable_vf_fusion",
+    "force_simt_only",
+    "force_simt_template",
+    "hfusion_enable_multiple_consumer_fusion",
+    "inject_barrier_all",
+    "inject_block_all",
+    "inter_cache_num",
+    "intra_cache_num",
+    "ir_override",
+    "limit_auto_multi_buffer_of_local_buffer",
+    "limit_auto_multi_buffer_only_for_local_buffer",
+    "load_cache_num",
+    "mix_mode",
+    "multibuffer",
+    "num_stages",
+    "num_warps",
+    "optimize_dynamic_offset",
+    "prevec_max_fused_ops_num",
+    "set_workspace_multibuffer",
+    "shared_mem_dynamic_size",
+    "simt_stack_limit",
+    "sync_solver",
+    "tile_mix_cube_loop",
+    "tile_mix_vector_loop",
+    "unit_flag",
+    "use_bytecode",
+    "vf_merge_level",
+    "warp_size",
+)
+
+EXPECTED_UB_AFFECTING_BISHENG_FLAGS = {
+    "--append-bisheng-options",
+    "--disable-auto-inject-block-sync",
+    "--disable-ffts",
+    "--disable-fma",
+    "--disable-hfusion-vectorize",
+    "--disable-size-align-for-cast",
+    "--disable-tightly-coupled-buffer-reuse",
+    "--enable-auto-bind-sub-block",
+    "--enable-auto-blockify-loop",
+    "--enable-auto-multi-buffer",
+    "--enable-auto-vectorize-v2",
+    "--enable-bishengir-simt-optimization",
+    "--enable-drop-unit-dims",
+    "--enable-flatten",
+    "--enable-hivm-auto-cv-balance",
+    "--enable-hivm-graph-sync-solver",
+    "--enable-hivm-inject-barrier-all-sync",
+    "--enable-hivm-inject-block-all-sync",
+    "--enable-hivm-unit-flag-sync",
+    "--enable-hfusion-compile",
+    "--enable-mixed-cv",
+    "--enable-preload",
+    "--enable-simd-simt-mix-compile",
+    "--enable-simt-reorder-instruction",
+    "--enable-ubuf-saving",
+    "--enable-vf-fusion",
+    "--enable-vf-merge-level",
+    "--hfusion-enable-multiple-consumer-fusion",
+    "--hfusion-max-fused-elementwise-ops",
+    "--hfusion-max-fused-ops-in-auto-vectorize-v2",
+    "--limit-auto-multi-buffer-of-local-buffer",
+    "--limit-auto-multi-buffer-only-for-local-buffer",
+    "--num-warps",
+    "--pure-simt",
+    "--reg-based",
+    "--set-workspace-multibuffer",
+    "--shared-mem-dynamic-size",
+    "--simt-stack-limit",
+    "--threads-per-warp",
+    "--tile-mix-cube-loop",
+    "--tile-mix-vector-loop",
+}
+
+
+def _identity_runtime(monkeypatch):
+    monkeypatch.setattr(ascend_compiler, "get_cann_version_file_hash", lambda: "test-cann-hash")
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: ("/test/bishengir-compile", {}))
+    monkeypatch.delenv("TRITON_ENABLE_VF_FUSION", raising=False)
+
+
+def _ub_affecting_bisheng_flag_literals():
+    source = inspect.getsource(ascend_compiler).lstrip("\ufeff")
+    tree = ast.parse(source)
+    function_names = {
+        "linalg_to_bin_enable_npu_compile_910_95",
+        "linalg_to_bin_enable_npu_compile_A2_A3",
+        "ttir_to_npubin",
+    }
+    keywords = (
+        "blockify",
+        "buffer",
+        "bind-sub-block",
+        "cv",
+        "flatten",
+        "fused",
+        "fusion",
+        "preload",
+        "simt",
+        "size-align",
+        "sync",
+        "tile",
+        "ubuf",
+        "unit-dims",
+        "vectorize",
+        "vf-",
+        "workspace",
+    )
+    always_relevant = {
+        "--append-bisheng-options",
+        "--disable-ffts",
+        "--disable-fma",
+        "--num-warps",
+        "--reg-based",
+        "--shared-mem-dynamic-size",
+        "--threads-per-warp",
+    }
+    flags = set()
+    for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        if function.name not in function_names:
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if not node.value.startswith("--"):
+                continue
+            flag = node.value.split("=", 1)[0]
+            if flag in always_relevant or any(keyword in flag for keyword in keywords):
+                flags.add(flag)
+    return flags
+
+
+def test_mode_validation():
+    assert ascend_compiler.NPUOptions().ub_lower_bound_mode == "off"
+    assert ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow").ub_lower_bound_mode == "shadow"
+    assert ascend_compiler.NPUOptions(ub_lower_bound_mode="enforce").ub_lower_bound_mode == "enforce"
+    with pytest.raises(ValueError, match="ub_lower_bound_mode"):
+        ascend_compiler.NPUOptions(ub_lower_bound_mode="probabilistic")
+
+
+def test_ttir_to_linalg_builder_preserves_default_pipeline_byte_for_byte(monkeypatch):
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = SimpleNamespace(context=context)
+    metadata = _compiler_metadata()
+    options = ascend_compiler.NPUOptions(compile_on_910_95=False)
+    pm = ascend_compiler._build_ttir_to_linalg_pass_manager(module, metadata, options, named_ops=False)
+    assert pm.get_pipeline_str() == EXPECTED_TTIR_TO_LINALG_PIPELINE
+
+
+def test_pipeline_identity_is_canonical_json_and_contains_complete_payload(monkeypatch):
+    _identity_runtime(monkeypatch)
+    metadata = _compiler_metadata(multibuffer=False)
+    identity = ascend_compiler._ttir_ub_pipeline_identity("pass-a,pass-b", metadata)
+    options = json.loads(identity["relevant_options_json"])
+    assert identity.keys() == {
+        "open_source_pipeline",
+        "relevant_options_json",
+        "target_arch",
+        "triton_version",
+        "cann_version_hash",
+        "sha256",
+    }
+    assert identity["open_source_pipeline"] == "pass-a,pass-b"
+    assert identity["target_arch"] == "Ascend910B"
+    assert identity["triton_version"] == "test-triton-version"
+    assert identity["cann_version_hash"] == "test-cann-hash"
+    assert options["multibuffer"] is False
+    assert identity["relevant_options_json"] == json.dumps(options, sort_keys=True, separators=(",", ":"))
+    payload = {
+        "cann_version_hash": "test-cann-hash",
+        "open_source_pipeline": "pass-a,pass-b",
+        "relevant_options": options,
+        "target_arch": "Ascend910B",
+        "triton_version": "test-triton-version",
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    assert identity["sha256"] == hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def test_pipeline_identity_changes_when_pass_order_changes(monkeypatch):
+    _identity_runtime(monkeypatch)
+    metadata = _compiler_metadata()
+    first = ascend_compiler._ttir_ub_pipeline_identity("pass-a,pass-b", metadata)
+    second = ascend_compiler._ttir_ub_pipeline_identity("pass-b,pass-a", metadata)
+    assert first["sha256"] != second["sha256"]
+
+
+def test_pipeline_identity_changes_when_bisheng_compiler_kind_changes(monkeypatch):
+    _identity_runtime(monkeypatch)
+    metadata = _compiler_metadata()
+    first = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
+    monkeypatch.setattr(ascend_compiler, "_get_npucompiler_path", lambda: ("/test/npu-compiler", {}))
+    second = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
+    assert first["sha256"] != second["sha256"]
+
+
+def test_pipeline_identity_changes_for_effective_environment_lowering_switches(monkeypatch):
+    _identity_runtime(monkeypatch)
+    a2_metadata = _compiler_metadata()
+    baseline = ascend_compiler._ttir_ub_pipeline_identity("pipeline", a2_metadata)["sha256"]
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: True)
+    auto_blockify = ascend_compiler._ttir_ub_pipeline_identity("pipeline", a2_metadata)["sha256"]
+    monkeypatch.setattr(ascend_compiler, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(ascend_compiler, "_check_bishengir_is_regbased", lambda: True)
+    reg_based = ascend_compiler._ttir_ub_pipeline_identity("pipeline", a2_metadata)["sha256"]
+    assert len({baseline, auto_blockify, reg_based}) == 3
+
+    _identity_runtime(monkeypatch)
+    a5_metadata = _compiler_metadata(compile_on_910_95=True)
+    baseline = ascend_compiler._ttir_ub_pipeline_identity("pipeline", a5_metadata)["sha256"]
+    monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: True)
+    disable_ffts = ascend_compiler._ttir_ub_pipeline_identity("pipeline", a5_metadata)["sha256"]
+    monkeypatch.setattr(ascend_compiler, "force_disable_ffts", lambda: False)
+    monkeypatch.setenv("TRITON_ENABLE_VF_FUSION", "1")
+    vf_fusion = ascend_compiler._ttir_ub_pipeline_identity("pipeline", a5_metadata)["sha256"]
+    assert len({baseline, disable_ffts, vf_fusion}) == 3
+
+
+@pytest.mark.parametrize("option_name", EXPECTED_UB_AFFECTING_OPTIONS)
+def test_pipeline_identity_changes_for_every_ub_affecting_option(monkeypatch, option_name):
+    _identity_runtime(monkeypatch)
+    metadata = _compiler_metadata()
+    before = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)["sha256"]
+    current = metadata.get(option_name)
+    metadata[option_name] = "identity-test-value" if current is None else None
+    after = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)["sha256"]
+    assert before != after, option_name
+
+
+def test_ub_affecting_options_and_forwarded_bisheng_flags_are_closed_goldens():
+    assert ascend_compiler.UB_AFFECTING_OPTIONS == EXPECTED_UB_AFFECTING_OPTIONS
+    assert _ub_affecting_bisheng_flag_literals() == EXPECTED_UB_AFFECTING_BISHENG_FLAGS
+
+
+def test_make_ttir_calls_policy_after_canonicalization_and_does_not_run_future_pm(monkeypatch):
+    calls = []
+    canonical_pm = MagicMock()
+    canonical_pm.run.side_effect = lambda _mod: calls.append("canonical-pm-run")
+    future_pm = MagicMock()
+    future_pm.get_pipeline_str.side_effect = lambda: calls.append("future-pipeline-string") or "pipeline"
+    future_pm.run.side_effect = AssertionError("future pass manager must not run during make_ttir")
+    monkeypatch.setattr(ascend_compiler.ir, "pass_manager", lambda _context: canonical_pm)
+    monkeypatch.setattr(ascend_compiler, "passes", MagicMock())
+    monkeypatch.setattr(
+        ascend_compiler,
+        "_build_ttir_to_linalg_pass_manager",
+        lambda *_args, **_kwargs: future_pm,
+        raising=False,
+    )
+    _identity_runtime(monkeypatch)
+
+    def policy(_mod, _metadata, _options, identity):
+        calls.append("policy")
+        assert identity["open_source_pipeline"] == "pipeline"
+
+    monkeypatch.setattr(ascend_compiler, "apply_ub_lower_bound_policy", policy, raising=False)
+    options = ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow", compile_on_910_95=False)
+    module = SimpleNamespace(context=object(), __str__=lambda: "module")
+    ascend_compiler.make_ttir(module, _compiler_metadata(), options)
+    assert calls == ["canonical-pm-run", "future-pipeline-string", "policy"]
+
+
+def test_make_ttir_off_preserves_old_behavior_without_identity_or_policy(monkeypatch):
+    canonical_pm = MagicMock()
+    monkeypatch.setattr(ascend_compiler.ir, "pass_manager", lambda _context: canonical_pm)
+    monkeypatch.setattr(ascend_compiler, "passes", MagicMock())
+    monkeypatch.setattr(
+        ascend_compiler,
+        "_build_ttir_to_linalg_pass_manager",
+        lambda *_args, **_kwargs: pytest.fail("off mode built the future pipeline"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ascend_compiler,
+        "apply_ub_lower_bound_policy",
+        lambda *_args, **_kwargs: pytest.fail("off mode called the policy"),
+        raising=False,
+    )
+    options = ascend_compiler.NPUOptions(compile_on_910_95=False)
+    module = SimpleNamespace(context=object(), __str__=lambda: "module")
+    assert ascend_compiler.make_ttir(module, _compiler_metadata(), options) is module
+    canonical_pm.run.assert_called_once_with(module)
+
+
+def test_make_ttir_options_without_mode_preserve_old_off_behavior(monkeypatch):
+    canonical_pm = MagicMock()
+    monkeypatch.setattr(ascend_compiler.ir, "pass_manager", lambda _context: canonical_pm)
+    monkeypatch.setattr(ascend_compiler, "passes", MagicMock())
+    monkeypatch.setattr(
+        ascend_compiler,
+        "_build_ttir_to_linalg_pass_manager",
+        lambda *_args, **_kwargs: pytest.fail("legacy options built the future pipeline"),
+    )
+    module = SimpleNamespace(context=object(), __str__=lambda: "module")
+    options = SimpleNamespace(debug=False)
+    assert ascend_compiler.make_ttir(module, _compiler_metadata(), options) is module
+
+
+def test_make_ttir_identity_error_fails_open_to_policy(monkeypatch):
+    canonical_pm = MagicMock()
+    future_pm = MagicMock()
+    future_pm.get_pipeline_str.return_value = "pipeline"
+    monkeypatch.setattr(ascend_compiler.ir, "pass_manager", lambda _context: canonical_pm)
+    monkeypatch.setattr(ascend_compiler, "passes", MagicMock())
+    monkeypatch.setattr(ascend_compiler, "_build_ttir_to_linalg_pass_manager", lambda *_args, **_kwargs: future_pm)
+
+    def identity_error(*_args):
+        raise RuntimeError("identity unavailable")
+
+    captured = []
+    monkeypatch.setattr(ascend_compiler, "_ttir_ub_pipeline_identity", identity_error)
+    monkeypatch.setattr(
+        ascend_compiler,
+        "apply_ub_lower_bound_policy",
+        lambda _mod, _metadata, _options, identity: captured.append(identity),
+    )
+    options = ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow", compile_on_910_95=False)
+    module = SimpleNamespace(context=object(), __str__=lambda: "module")
+    ascend_compiler.make_ttir(module, _compiler_metadata(), options)
+    assert captured == [""]
+
+
+def test_make_ttir_simt_identity_uses_real_direct_pipeline_without_future_pm(monkeypatch):
+    canonical_pm = MagicMock()
+    monkeypatch.setattr(ascend_compiler.ir, "pass_manager", lambda _context: canonical_pm)
+    monkeypatch.setattr(ascend_compiler, "passes", MagicMock())
+    monkeypatch.setattr(
+        ascend_compiler,
+        "_build_ttir_to_linalg_pass_manager",
+        lambda *_args, **_kwargs: pytest.fail("direct SIMT path built an unused TTIR-to-Linalg pipeline"),
+    )
+    captured = []
+    monkeypatch.setattr(
+        ascend_compiler,
+        "_ttir_ub_pipeline_identity",
+        lambda pipeline, _metadata: captured.append(pipeline) or {"sha256": "direct-id"},
+    )
+    monkeypatch.setattr(ascend_compiler, "apply_ub_lower_bound_policy", lambda *_args: None)
+    options = ascend_compiler.NPUOptions(
+        ub_lower_bound_mode="shadow",
+        compile_on_910_95=True,
+        compile_mode="simt_only",
+    )
+    module = SimpleNamespace(context=object(), __str__=lambda: "module")
+    ascend_compiler.make_ttir(module, _compiler_metadata(compile_on_910_95=True), options)
+    assert captured == [ascend_compiler.TTIR_UB_DIRECT_BISHENG_PIPELINE]
+
+
+def test_debug_policy_dump_uses_dump_manager_and_contains_full_result(monkeypatch):
+    result = _analysis_result("defer")
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_args: result)
+    dump_manager = MagicMock()
+    monkeypatch.setattr(ub_lower_bound, "get_dump_manager", lambda _hash: dump_manager, raising=False)
+    metadata = {"hash": "debug-hash"}
+    apply_ub_lower_bound_policy(object(), metadata, Options("shadow", debug=True), "test-id")
+    dump_manager.put.assert_called_once()
+    content, filename = dump_manager.put.call_args.args[:2]
+    assert filename == "kernel.ttir.ub-lower-bound.json"
+    assert dump_manager.put.call_args.kwargs == {"binary": False}
+    assert json.loads(content) == result
+
+
+def test_core_compiler_preserves_ub_lower_bound_overflow(monkeypatch):
+    error = UBLowerBoundOverflow(262144, 196608, {"kind": "singleton"}, "test-id")
+
+    class FakeBackend:
+
+        def parse_options(self, _options):
+            return SimpleNamespace()
+
+        def add_stages(self, stages, _options, _language):
+            stages["ttir"] = lambda _module, _metadata: (_ for _ in ()).throw(error)
+
+        def load_dialects(self, _context):
+            pass
+
+        def get_codegen_implementation(self, _options):
+            return {}
+
+        def get_module_map(self):
+            return {}
+
+    class FakeCacheManager:
+
+        def get_group(self, _filename):
+            return None
+
+        def put(self, _value, filename, *args, **kwargs):
+            return f"/tmp/{filename}"
+
+    source = object.__new__(core_compiler.ASTSource)
+    source.name = "ub_overflow"
+    source.ext = "ttir"
+    source.language = core_compiler.Language.TRITON
+    source.hash = lambda: "source-hash"
+    source.parse_options = lambda: {}
+    source.make_ir = lambda *_args, **_kwargs: object()
+
+    fake_ir = SimpleNamespace(context=lambda: object(), load_dialects=lambda _context: None)
+    fake_dialect = SimpleNamespace(load_dialects=lambda _context: None)
+    monkeypatch.setattr(core_compiler, "make_backend", lambda _target: FakeBackend())
+    monkeypatch.setattr(core_compiler, "get_cache_key", lambda *_args, **_kwargs: "cache-key")
+    monkeypatch.setattr(core_compiler, "get_cache_manager", lambda _hash: FakeCacheManager())
+    monkeypatch.setattr(core_compiler, "ir", fake_ir)
+    monkeypatch.setattr(core_compiler, "buffer_ir", fake_dialect)
+    monkeypatch.setattr(core_compiler, "ascend_ir", fake_dialect)
+    monkeypatch.setattr(core_compiler.knobs.compilation, "listener", None)
+    monkeypatch.setattr(core_compiler.knobs.compilation, "override", False)
+    monkeypatch.setattr(core_compiler.knobs.compilation, "dump_ir", False)
+    monkeypatch.setattr(core_compiler.knobs.compilation, "store_binary_only", False)
+    monkeypatch.setattr(core_compiler.knobs.compilation, "always_compile", True)
+    monkeypatch.setattr(core_compiler.knobs.compilation, "use_ir_loc", None)
+    target = core_compiler.GPUTarget("npu", "Ascend910B", 32)
+    with pytest.raises(UBLowerBoundOverflow) as raised:
+        core_compiler.compile(source, target=target, _env_vars={})
+    assert raised.value is error
+    assert raised.value.required == 262144
+    assert raised.value.limit == 196608
+    assert raised.value.certificate == {"kind": "singleton"}
+    assert raised.value.pipeline_identity == "test-id"
 
 
 def test_off_does_not_call_analyzer(monkeypatch):

@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 from triton._C.libtriton import ascend
+from triton.runtime.cache import get_dump_manager
 
 from .errors import UBLowerBoundOverflow
 
@@ -203,6 +204,13 @@ def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
                     result = _defer_result(pipeline_fingerprint, "invalid-analysis-result")
 
     _record_metadata(metadata, mode, result)
+    if getattr(opt, "debug", False):
+        dump_manager = get_dump_manager(metadata["hash"])
+        dump_manager.put(
+            json.dumps(result, sort_keys=True, separators=(",", ":")),
+            "kernel.ttir.ub-lower-bound.json",
+            binary=False,
+        )
     if mode == "enforce" and result["decision"] == "reject":
         raise UBLowerBoundOverflow(
             result["lower_bound_bytes"],
