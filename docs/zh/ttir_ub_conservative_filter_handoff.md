@@ -1,0 +1,717 @@
+# TTIR UB 保守过滤器开发交接
+
+## 1. 文档目的
+
+本文面向后续开发、评审和验证人员，说明 TTIR UB 保守过滤器的业务目标、整体方案、
+核心数据结构、端到端代码流程、当前实现范围、验证状态、已知边界以及下一阶段工作。
+
+当前开发基线：
+
+- 仓库：`triton-ascend`
+- 分支：`codex/ttir-ub-conservative-filter`
+- 本次交接基线提交：`fcb3ffa98240e02569eb947ef8e9cd2e0a2084e0`
+- 设计文档：`docs/superpowers/specs/2026-07-21-ttir-ub-conservative-filter-design.md`
+- 实施计划：`docs/superpowers/plans/2026-07-21-ttir-ub-conservative-filter-implementation.md`
+- 用户说明：`docs/zh/ttir_ub_conservative_filter.md`
+
+## 2. 背景与目标
+
+### 2.1 要解决的问题
+
+autotune 会产生多组 tile、block、multi-buffer、pipeline depth 等配置。传统流程需要把
+每个配置继续编译到 HIVM，并运行 PlanMemory 后，才能知道 UB 是否溢出。对于明显超过
+UB 容量的配置，这部分完整编译成本是浪费。
+
+本功能希望在 canonical TTIR 阶段建立一个计算成本较低的 UB 下界：
+
+```text
+若能够证明 MandatoryUB(config) > UBCapacity(target)
+    则提前过滤该 config
+否则
+    继续走原有完整编译流程
+```
+
+它不是预测模型，也不尝试提前算出完整 UB peak。它只证明“至少需要多少 UB”。
+
+### 2.2 正确性方向
+
+过滤器采用单向、保守判定：
+
+- `reject`：已经形成可检查的证明，说明必需 UB 下界严格大于容量；
+- `defer`：当前规则不能证明，应继续真实编译；
+- 不提供“fit”结论；
+- `lower_bound == capacity` 不能过滤，只有 `lower_bound > capacity` 才能过滤；
+- 未支持的 operation、shape、target、pipeline 或 contract 一律 `defer`。
+
+因此正确性目标是避免错删真实可编译配置。漏掉一部分可过滤配置只影响收益，不影响
+正确性。
+
+### 2.3 为什么称为早期下界模型
+
+这里的“模型”不是机器学习模型，而是对后续编译行为的解析规则和资源传递合同：
+
+```text
+TTIR 语义
+  → 提取必然产生的 UB 资源
+  → 按真实 lowering 阶段传递这些资源
+  → 求一个有证明的 UB 下界
+  → 与硬件容量比较
+```
+
+真实编译计算完整 buffer、alias、生存期、offset 和 peak；本模型只保留足以证明下界的
+信息，所以执行成本应显著低于完整编译。
+
+## 3. 整体架构
+
+### 3.1 端到端流程
+
+```text
+Triton config
+    │
+    ▼
+canonical TTIR
+    │
+    ├─ mode=off ───────────────────────────────→ 原有后端编译
+    │
+    ▼
+构造精确 PipelineIdentity
+    │
+    ▼
+严格 TTIR matcher
+    │
+    ▼
+Mandatory UB Resource Graph（MURG）
+    │
+    ▼
+逐阶段应用 UBResourceContract
+    │
+    ▼
+求 LowerBoundCertificate
+    │
+    ▼
+与 target UB capacity 比较
+    │
+    ├─ defer ──────────────────────────────────→ 原有后端编译
+    ├─ reject + shadow ─────────────────────────→ 记录结果并继续编译
+    └─ reject + enforce ─→ UBLowerBoundOverflow → autotune 丢弃该 config
+```
+
+### 3.2 四个核心层次
+
+1. **语义识别层**：只识别能够严格证明的 TTIR 形态。
+2. **资源图层**：用 MURG 表示必需 UB 资源及资源间关系。
+3. **pipeline 合同层**：用 `UBResourceContract` 描述真实 pass 对资源下界的影响。
+4. **策略与 autotune 层**：规范化结果、记录 telemetry，并在 enforce 模式过滤配置。
+
+### 3.3 设计原则
+
+- 证明与具体 SSA 名称解耦，资源使用稳定整数 ID。
+- pipeline identity 和 contract version 是证书的一部分。
+- matcher 先完整检查 applicability，再产生资源。
+- 任何整数溢出、结构不完整或身份不匹配都使本次分析 `defer`。
+- Python 不信任 binding 返回值，会再次检查 schema、类型、容量和证书一致性。
+- 生产 profile 只能由真实 PlanMemory oracle 验证后人工加入，工具不自动修改 profile。
+
+## 4. Mandatory UB Resource Graph（MURG）
+
+### 4.1 作用
+
+MURG 是早期模型的中间表示。它不保存完整 TTIR，也不直接模拟 PlanMemory，而是保存
+形成下界证明所需的最小信息。
+
+主要入口：
+
+- `third_party/ascend/include/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h`
+- `third_party/ascend/lib/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.cpp`
+
+### 4.2 MandatoryUBResource
+
+每个资源包含：
+
+- `minPayloadBytes`：单个实例必需的最小 payload；
+- `minInstances`：必需实例数，为 multi-buffer 扩展预留；
+- `addressSpace`：当前只建模 UB；
+- `kind`：当前支持 `GMToUBLoad`；
+- `birth` / `lastRequiredUse`：为后续生存期与共存证明预留；
+- `validity` / `invalidReason`：合同无法继续证明时失效；
+- `contractTrace`：资源由哪些 matcher/contract 得到；
+- `origin` / `debugName`：诊断信息。
+
+### 4.3 资源关系
+
+MURG 已定义：
+
+- `mayAlias`：可能共享物理存储，不能简单求和；
+- `mustAlias`：确定是同一物理资源；
+- `mustDistinct`：确定不能共享；
+- `CoexistenceWitness`：证明一组资源必须同时存在，可用于求和下界。
+
+当前生产分析只调用 `solveSingletonLowerBound()`，即取最大单资源下界。图层还实现了
+`solveWitnessLowerBound()`，但尚未接入生产决策。后续支持双输入 elementwise 或明确
+共存 scratch 时，才能在充分证明 distinct 和 overlap 后使用 witness。
+
+### 4.4 算术和 ID 约束
+
+- 大小使用 `int64_t`，乘法和累加需要显式检查溢出；
+- `ResourceId` 和 `WitnessId` 使用稳定的 `uint32_t`；
+- ID 耗尽、关系引用非法 ID、资源状态异常都会使图不可用于证明；
+- graph API 只能把资源下界降低到已证明的新下界，不能凭估计提高数值。
+
+## 5. UBResourceContract
+
+### 5.1 为什么需要 contract
+
+从 TTIR 看到的 tensor 不一定以原尺寸进入最终 UB。例如 tiling 可能把一个大 tensor
+拆成小 tile，canonicalization 可能消除资源，multi-buffer 可能增加实例数。只在 TTIR
+入口计算 `num_elements × element_bytes`，然后直接与 UB 容量比较，会把可编译配置错删。
+
+因此必须对所有可能改变该证明的真实 pipeline 阶段建立传递合同。
+
+入口文件：
+
+- `third_party/ascend/include/Analysis/TTIRUBLowerBound/UBResourceContract.h`
+- `third_party/ascend/lib/Analysis/TTIRUBLowerBound/UBResourceContract.cpp`
+
+### 5.2 合同结果
+
+`UBResourceContract::apply()` 返回：
+
+- `Preserve`：该阶段不改变资源下界；
+- `Transform`：按已证明的规则转换资源，例如降低为最小 tile payload；
+- `Invalidate`：该阶段可能破坏证明，资源失效并最终 `defer`；
+- `InternalError`：合同自身状态错误，整个分析 `defer`。
+
+### 5.3 匹配规则
+
+合同通过 `PipelineStageContext` 匹配：
+
+- `stageName` 必须精确匹配；
+- 影响传递函数的 options 必须进入匹配；
+- 同一阶段不能有多个匹配合同；
+- 未匹配阶段不能默认 Preserve，而是使资源失效；
+- contract ID 和 version 必须进入 profile 和证书审计。
+
+### 5.4 当前实现状态
+
+目前 C++ registry 中只有测试用 fixed-tile/fixed-disposition 合同。生产 registry 为空。
+这意味着合同抽象、失败策略和测试能力已经建立，但尚未安装真实 pipeline 的生产合同。
+
+## 6. TTIR matcher 与当前建模范围
+
+### 6.1 代码入口
+
+- `third_party/ascend/lib/Analysis/TTIRUBLowerBound/DirectTensorLoadMaterialization.cpp`
+- `third_party/ascend/lib/Analysis/TTIRUBLowerBound/VerifierSafety.h`
+- `third_party/ascend/lib/Analysis/TTIRUBLowerBound/TTIRUBLowerBound.cpp`
+
+### 6.2 当前支持的形态
+
+V1 matcher 只接受严格的 direct copy：
+
+```text
+public tt.func，且模块内只有一个函数
+  → 单 block、无嵌套 region
+  → tt.make_range [0, N)
+  → tt.splat GM pointer
+  → tt.addptr
+  → 无 mask、无 boundary check 的 tt.load
+  → load 结果只有一个 use
+  → 无 mask 的 tt.store
+  → tt.return
+```
+
+还要求：
+
+- tensor 为一维静态 shape；
+- element type 为 8/16/32/64 位整数或浮点；
+- source/destination pointer chain 连续且无额外 use；
+- load 和 store 位于入口 block，且顺序正确；
+- load 的 tensor 形状、元素类型和 store 完全一致；
+- 所有函数参数都只能被已匹配链使用；
+- 模块中不能混入 matcher 未覆盖的 operation。
+
+对该形态产生一个 `GMToUBLoad` 资源：
+
+```text
+minPayloadBytes = N × bytes(element_type)
+minInstances = 1
+contractTrace = ["ttir-direct-load-v1"]
+```
+
+### 6.3 当前主动 defer 的主要形态
+
+- dynamic shape、非一维 tensor、sub-byte 或未支持 element type；
+- masked load/store、boundary check、特殊 cache/eviction 语义；
+- reduction、dot、atomic、算术链、loop、condition、nested region；
+- pointer chain 不连续或有额外 use；
+- load 没有到达 store，或者一个 load 有多个 use；
+- 多函数模块、不完整函数结构、未知 operation；
+- 非 AIV 路径；
+- 未知 target、pipeline identity 或 stage contract。
+
+这些限制是刻意的。增加覆盖时应先建立传递合同和真实 oracle，再放宽 matcher。
+
+## 7. PipelineIdentity 与 profile
+
+### 7.1 Identity 内容
+
+生成入口位于 `third_party/ascend/backend/compiler.py`：
+
+- canonicalized TTIR 后构造未来 TTIR→Linalg pipeline 字符串；
+- 记录 pass 顺序；
+- 收集影响 UB 的编译选项和环境开关；
+- 记录 target arch、Triton version 和 CANN version hash；
+- 记录实际选择的 compiler 类型及 compiler 文件内容 SHA256；
+- `auto_tile_and_bind_subblock` 使用 module-derived identity 规则；
+- 对 canonical JSON 求 SHA256，作为证书 fingerprint。
+
+身份中 pass 调序、UB 相关选项变化、compiler 类型或内容变化，都会产生不同 fingerprint。
+
+### 7.2 Profile 文件
+
+文件：`third_party/ascend/backend/ub_contract_profiles.json`
+
+当前状态：
+
+```text
+schema = ttir-ub-lb-profile-v1
+profiles = []
+```
+
+生产 profile 为空是当前最重要的运行边界。没有 profile 时分析器返回
+`unknown-pipeline-profile`，不会形成 `reject`。
+
+### 7.3 Binding 当前边界
+
+文件：`third_party/ascend/ttir_ub_lower_bound_bindings.cc`
+
+当前 binding 会：
+
+- 解析并检查 arch、compile mode、pipeline identity 和 stage schema；
+- 检查 packaged profile 的顶层结构；
+- 调用 C++ analyzer；
+- 把结果序列化为 Python dict。
+
+但当前 binding **不会把 profile 内容加载为生产 `PipelineContractRegistry`**，而是显式创建
+空 registry。调用方也固定传入空 `pipeline_stages`。因此即使人工向 JSON 增加候选项，
+现有代码也不能直接启用生产拒绝。这是下一阶段 P0，不应通过绕过 identity 检查解决。
+
+## 8. Python policy 与运行模式
+
+### 8.1 Policy 入口
+
+文件：`third_party/ascend/backend/ub_lower_bound.py`
+
+主要职责：
+
+- `load_contract_profiles()`：加载并检查 packaged profile；
+- `_pipeline_fingerprint()`：只接受有效字符串或 identity SHA256；
+- `_normalize_result()`：重新验证 binding 返回值；
+- `_record_metadata()`：写入紧凑 metadata；
+- `apply_ub_lower_bound_policy()`：执行 off/shadow/enforce 行为；
+- `ub_filter_telemetry_session()`：记录一次 autotune round 的统计。
+
+后端 `simd` compile mode 会映射为 MURG 使用的 `aiv` core kind；其他模式保持原值，
+由 C++ analyzer 决定是否 defer。
+
+### 8.2 三种模式
+
+| 模式 | 是否调用分析器 | reject 时行为 |
+| --- | --- | --- |
+| `off` | 否 | 保持原有编译流程 |
+| `shadow` | 是 | 记录结果并继续编译 |
+| `enforce` | 是 | 抛出 `UBLowerBoundOverflow` |
+
+默认值是 `off`。紧急回退只需关闭该选项，不需要修改 TTIR 或清理编译缓存中的 IR。
+
+### 8.3 Python 二次校验
+
+Python 只接受精确 schema：
+
+- decision 只能是 `defer` 或 `reject`；
+- byte 数必须是非负 `int64`，不能是 bool；
+- target capacity 必须等于 C++ capacity registry 的可信值；
+- reject 必须满足 `lower_bound > capacity`；
+- reject 必须只有一个合法 singleton certificate；
+- certificate bytes 必须等于 lower bound；
+- pipeline fingerprint 和 contract version 必须精确一致；
+- reject 不能同时携带 unsupported reason。
+
+任何异常返回统一规范化为 `defer`，避免错误结果进入过滤策略。
+
+### 8.4 Metadata 与 debug dump
+
+普通 metadata 记录：
+
+- `ub_lower_bound_mode`
+- `ub_lower_bound_decision`
+- `ub_lower_bound_bytes`
+- `ub_capacity_bytes`
+- `ub_lower_bound_contract_version`
+- `ub_lower_bound_pipeline_identity`
+- `ub_lower_bound_certificate_count`
+- `ub_lower_bound_unsupported_reasons`
+
+开启 compiler debug 后，完整结果写入：
+
+```text
+kernel.ttir.ub-lower-bound.json
+```
+
+完整图和证书不进入普通 metadata，避免缓存和日志膨胀。
+
+## 9. Autotune 与异步编译集成
+
+### 9.1 过滤路径
+
+`UBLowerBoundOverflow` 被视为资源不足类结果，与真实后端报告的资源不足配置一样，从本轮
+候选中删除，其他 config 继续 benchmark。
+
+主要文件：
+
+- `third_party/ascend/backend/runtime/autotuner.py`
+- `python/triton/runtime/_async_compile.py`
+- `third_party/ascend/backend/errors.py`
+
+### 9.2 串行与并行
+
+实现同时覆盖：
+
+- 串行 compile/benchmark；
+- `AsyncCompileMode` 并行编译；
+- 已完成 future；
+- worker ContextVar 传播；
+- worker 内清除 `active_mode`，避免嵌套提交回同一 executor；
+- 已被调用方观察的 future exception 不在 context exit 时重复抛出；
+- 未被观察的普通 exception 仍在 context exit 时报告。
+
+### 9.3 Telemetry
+
+每轮统计：
+
+- `analyzed`
+- `rejected`
+- `deferred`
+- `passed_to_backend`
+
+在 `TRITON_PRINT_AUTOTUNING=1` 时输出一行 round summary，不逐 config 输出完整证书。
+
+## 10. 真实 PlanMemory oracle
+
+### 10.1 目标
+
+单元测试只能证明模型内部一致，不能替代真实 compiler 对照。oracle 同时运行：
+
+```text
+canonical TTIR ─→ lower-bound analyzer ─→ LB / certificate
+        └───────→ TTIR→HIVM→PlanMemory ─→ actual peak / overflow
+```
+
+必须满足：
+
+```text
+LB_bits <= ActualUBPeak_bits
+```
+
+如果 analyzer 给出 reject，则每个 seed 的真实结果必须是 UB capacity failure，不能是 L1
+或其他编译失败。
+
+### 10.2 工具与 fixture
+
+- 工具：`third_party/ascend/tools/ttir_ub_oracle.py`
+- 测试：`third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py`
+- manifest：`third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json`
+- TTIR fixture：`direct_copy.ttir.mlir`
+- before-CVPipelining fixture：`direct_copy.before_cvpipelining.mlir`
+
+工具能力：
+
+- 严格 manifest schema 和 fixture 路径检查；
+- manifest 不能注入 pipeline identity；
+- 调用真实 `bishengir-cvpipeline-suffix-compile`；
+- 支持固定 seed 列表和 retry seed `-1`；
+- 通过完成标记关联真实 PlanMemory attempt ID；
+- 区分 UB、L1 等 memory scope；
+- 解析 `PLANMEM_PEAK` 和 `PLANMEM_REQUIRED`；
+- 输出机器可读 report；
+- violation 返回码 1，oracle unavailable 返回码 2，完整通过返回码 0；
+- 只在完整、零违规且存在非空证书时生成 profile candidate；
+- 永远不自动编辑 packaged profile。
+
+### 10.3 单位
+
+- analyzer 和 capacity registry 使用 bytes；
+- PlanMemory 机器输出使用 bits；
+- oracle 比较前执行 `lower_bound_bytes × 8`，不能混用单位。
+
+### 10.4 当前验证结果
+
+- PlanMemory parser/profile gate 单测：20 项通过；
+- 独立运行真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
+- 21 次均成功解析，fixture UB peak 均为 `32768 bits`；
+- standalone PlanMemory 运行：violations 0，unavailable 0；
+- 当前主机没有 CANN identity 环境，完整 identity-bound analyzer + PlanMemory 联合认证未完成；
+- 因此没有生成或安装生产 profile。
+
+## 11. 测试与质量状态
+
+本次基线已执行：
+
+- UB Python 聚焦测试：233 项通过；
+- oracle 最终测试：20 项通过；
+- 普通 C++ GTest：65 项通过；
+- ASan/UBSan C++ GTest：65 项通过；
+- 其余可在无 NPU 环境运行的 autotune 测试：39 项通过，3 项跳过；
+- analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
+  - p50 `0.002542 ms`
+  - p95 `0.003334 ms`
+- `git diff --check` 通过；
+- 本次所有提交均带 `Signed-off-by`。
+
+环境限制：
+
+- 4 个既有 autotune 文件依赖 `torch_npu`，本机无法收集；
+- 本机没有 CANN identity 环境和 NPU 硬件；
+- p95 数据是空生产 profile 的快速 defer 路径，不代表未来完整 matcher/contract 的最终开销；
+- `.build-ttir-ub/` 是预存未跟踪构建目录，不纳入提交。
+
+## 12. 当前已经实现的能力
+
+### 12.1 已完成
+
+- MURG 数据结构、alias/distinct/witness 关系和下界 solver；
+- `UBResourceContract` 抽象、registry 和严格未匹配策略；
+- verifier 前的结构预检；
+- direct static GM→UB load/copy matcher；
+- target UB capacity 单一 C++ 数据源；
+- pipeline identity 和 UB 相关选项闭包检查；
+- C++ pybind API 与 Python 结果二次校验；
+- off/shadow/enforce policy；
+- debug certificate dump；
+- autotune 串行/并行过滤接线和 telemetry；
+- PlanMemory seed/retry oracle、report 和 candidate gate；
+- 双语用户文档和完整单元测试。
+
+### 12.2 尚未形成生产收益的原因
+
+虽然执行链路已经接通，但当前生产 profile 为空，binding 也未加载生产合同。因此：
+
+- `off`：完全保持旧行为；
+- `shadow`：调用分析器，但真实 pipeline identity 会得到 defer；
+- `enforce`：当前也会 defer，不会提前过滤真实生产 config；
+- 测试中的 reject 使用显式 synthetic profile/测试 registry 验证机制正确性；
+- 不能把 synthetic reject 当作生产 profile 已上线。
+
+这是有意保留的上线门禁，不应通过放宽 fingerprint 或提供 `allow_unvalidated` 之类开关
+绕过。
+
+## 13. 下一步工作
+
+### P0：让生产 profile 真正可加载、可认证
+
+1. 定义最终 packaged profile item schema，至少包含：
+   - 完整 `PipelineIdentity`；
+   - 精确有序 `pipeline_stages`；
+   - 每阶段 contract ID/version/options；
+   - target、CANN/compiler 内容摘要；
+   - oracle seed/retry 认证摘要。
+2. 在 C++ binding 中严格解析 profile item，构造只读生产 `PipelineContractRegistry`。
+3. Python 根据 identity 选择唯一 profile，并把 profile 的精确 stage list 传给 binding。
+4. 拒绝重复 identity、重复 stage contract、未知 contract ID/version 和 schema 多余字段。
+5. 在真实 CANN 环境运行同一 binary identity 的 analyzer 与 PlanMemory。
+6. 只有 seeds `0..19`、retry 以及 auto-subblock enabled/disabled 两种 outcome 全部通过，
+   才人工安装 candidate。
+7. 安装后增加真实 binding 测试，证明生产 identity 能形成证书，近似 identity 必须 defer。
+
+### P0：为真实 pipeline 建立第一组合同
+
+优先选择最小、可证明且能产生收益的路径，不要直接声明整个 pipeline Preserve。
+
+建议顺序：
+
+1. canonical TTIR 到 before-CVPipelining 之间的 stage manifest；
+2. direct copy 路径中确定 Preserve 的 canonicalization；
+3. `TileAndBindSubBlock` 的最小 tile transfer function；
+4. multi-buffer disabled 的单实例合同；
+5. suffix 中影响大小、倍数、alias 和生存期的阶段；
+6. 每个合同分别准备正向 fixture 和 defer fixture。
+
+任何阶段无法证明时，整份证书失效并 defer。
+
+### P1：扩大真实 oracle corpus
+
+当前只有一个手工配对 fixture。下一步应从同一次真实编译自动保存 canonical TTIR 和
+before-CVPipelining IR，避免两端配置漂移。
+
+建议矩阵：
+
+- threshold 附近不同 BLOCK_SIZE；
+- FP16/BF16/FP32、常见整数类型；
+- A2/A3、910_95/950；
+- multi-buffer on/off、不同 `num_stages`；
+- auto blockify 和 sub-block tiling 两种 outcome；
+- vector add、elementwise chain、broadcast、DCE；
+- reduction、dot、mask、dynamic shape、SIMT、MIX/CV 作为 defer 对照；
+- 每个 fixture 固定 seeds `0..19` 和 retry。
+
+CI 必须把 oracle unavailable 与 comparison violation 分开报告。
+
+### P1：完善 Mandatory UB Resource Graph 求解
+
+1. 接入 `minInstances`，准确表达 multi-buffer 必需实例数。
+2. 为双输入 elementwise 建立 must-distinct + coexistence witness。
+3. 证明 alias 后再合并资源，不能按 SSA value 数量求和。
+4. 建模 reduction accumulator/scratch。
+5. 建模 loop-carried resource 和跨 iteration 生命周期。
+6. 将 `birth/lastRequiredUse` 与真实 stage transfer 结合，而不是仅保留字段。
+7. 在生产 analyzer 中按证书类型选择 singleton/witness solver。
+
+### P1：支持更多 TTIR 语义
+
+扩展顺序建议：
+
+1. 静态 elementwise unary；
+2. 两输入、无 broadcast 的静态 elementwise binary；
+3. 可证明的 broadcast；
+4. reduction accumulator；
+5. mask 和边界 tile；
+6. loop 与 multi-buffer；
+7. SplitMix 后 AIV 投影及 CV 融合路径。
+
+每次扩展都必须同时提交 matcher、MURG 关系、stage contract、oracle fixture 和回归测试。
+
+### P2：与 autotune config 建立更清晰的资源合同
+
+目前 policy 在 canonical TTIR 后执行。后续可把 config 中影响 UB 的字段规范化为
+`UBResourceContract` 输入，例如：
+
+- `BLOCK_SIZE`
+- `num_stages`
+- multi-buffer 开关与策略
+- auto blockify / sub-block tiling
+- CV tile depth
+
+同一配置规范化结果应同时参与 pipeline identity 和 cache key。不能出现分析器使用一组
+options，而真实后端使用另一组 options。
+
+### P2：上线策略
+
+1. 默认继续 `off`；
+2. CI 和代表性 workload 开 `shadow`；
+3. 对每个证书与真实 peak 做持续对照；
+4. 任一反例立即移除对应 profile/contract version；
+5. 零违规稳定后，仅允许用户显式 `enforce`；
+6. 收集 analyzed/rejected/deferred/passed-to-backend 和编译耗时收益；
+7. 最后再评估是否调整默认模式。
+
+## 14. 开发注意事项
+
+### 14.1 不要做的事情
+
+- 不要把 TTIR tensor 总大小直接当作最终 UB peak；
+- 不要假设未知 pass 是 Preserve；
+- 不要把 `defer` 显示为 fit；
+- 不要根据概率、confidence 或经验阈值在 enforce 模式过滤；
+- 不要让 manifest 或调用方覆盖 pipeline identity；
+- 不要把任意编译失败归类为 UB overflow；
+- 不要在没有 CANN/compiler 内容摘要的情况下复用 profile；
+- 不要自动把 oracle candidate 写入 packaged profile。
+
+### 14.2 增加规则的最小提交单元
+
+一个完整规则至少应包含：
+
+1. 明确输入合同；
+2. MURG resource/relation；
+3. 对受影响 stage 的 versioned contract；
+4. unsupported/defer 诊断；
+5. C++ 单元测试；
+6. Python policy 测试；
+7. 成对真实 compiler fixture；
+8. seed/retry oracle 结果；
+9. identity/profile version 更新；
+10. 中英文文档更新。
+
+## 15. 常用命令
+
+### 15.1 Python 聚焦测试
+
+```bash
+python -m pytest -q --noconftest \
+  third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py \
+  third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py \
+  third_party/ascend/unittest/autotune_ut/test_do_bench_compat.py \
+  python/test/unit/runtime/test_async_compile_context.py \
+  third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py
+```
+
+### 15.2 Oracle parser 测试
+
+```bash
+python -m pytest -q --noconftest \
+  third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py
+```
+
+### 15.3 真实 PlanMemory 对照
+
+```bash
+python third_party/ascend/tools/ttir_ub_oracle.py \
+  --manifest third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json \
+  --suffix-compiler /path/to/bishengir-cvpipeline-suffix-compile \
+  --seeds 0-19 \
+  --check-retry \
+  --report /tmp/ttir-ub-oracle-report.json \
+  --profile-candidate /tmp/ttir-ub-profile-candidate.json
+```
+
+返回码：
+
+- `0`：全部数据可用且 comparison violation 为 0；
+- `1`：发现下界或 reject 证明违规；
+- `2`：缺少 analyzer、compiler identity、PlanMemory 数据或其他必需环境。
+
+### 15.4 提交前检查
+
+```bash
+git diff --check
+git status --short
+git log -1 --show-signature
+```
+
+## 16. 关键文件索引
+
+| 模块 | 文件 |
+| --- | --- |
+| MURG API | `third_party/ascend/include/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h` |
+| MURG 实现 | `third_party/ascend/lib/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.cpp` |
+| Contract API | `third_party/ascend/include/Analysis/TTIRUBLowerBound/UBResourceContract.h` |
+| Contract 实现 | `third_party/ascend/lib/Analysis/TTIRUBLowerBound/UBResourceContract.cpp` |
+| Analyzer API | `third_party/ascend/include/Analysis/TTIRUBLowerBound/TTIRUBLowerBound.h` |
+| Analyzer 主流程 | `third_party/ascend/lib/Analysis/TTIRUBLowerBound/TTIRUBLowerBound.cpp` |
+| Direct-load matcher | `third_party/ascend/lib/Analysis/TTIRUBLowerBound/DirectTensorLoadMaterialization.cpp` |
+| Pybind | `third_party/ascend/ttir_ub_lower_bound_bindings.cc` |
+| Pipeline identity | `third_party/ascend/backend/compiler.py` |
+| Python policy | `third_party/ascend/backend/ub_lower_bound.py` |
+| Capacity/runtime | `third_party/ascend/backend/runtime/utils.py` |
+| Autotune | `third_party/ascend/backend/runtime/autotuner.py` |
+| Async compile | `python/triton/runtime/_async_compile.py` |
+| Profile | `third_party/ascend/backend/ub_contract_profiles.json` |
+| Oracle | `third_party/ascend/tools/ttir_ub_oracle.py` |
+| C++ 测试 | `third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp` |
+| Python 测试 | `third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py` |
+| Autotune 测试 | `third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py` |
+| Oracle 测试 | `third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py` |
+
+## 17. 交接结论
+
+当前代码已经完成“可审计的 TTIR UB 下界证明框架”和 autotune 接线：MURG、contract、
+identity、policy、telemetry、异步过滤以及真实 PlanMemory oracle 都已具备，并有完整的
+保守失败策略。
+
+但当前版本仍是生产 profile 上线前的基础阶段。它不会对真实生产 config 给出有效
+reject，原因是生产合同尚未认证、profile 为空且 binding 尚未加载生产 registry。
+
+后续最重要的工作不是继续放宽 matcher，而是先完成 P0：在真实 CANN/compiler identity
+环境中建立第一条端到端可认证 pipeline contract，严格加载 profile，并用逐 seed
+PlanMemory 证明该 profile 可以启用。完成这一步后，`enforce` 才真正开始产生早期过滤
+收益。
