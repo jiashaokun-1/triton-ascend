@@ -470,24 +470,26 @@ LB_bits <= ActualUBPeak_bits
 
 ### 10.4 当前验证结果
 
-- PlanMemory parser/profile gate 单测：33 项通过；
-- 独立运行真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
-- 21 次均成功解析，fixture UB peak 均为 `32768 bits`；
+- 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
+- UB/策略/oracle 聚焦 Python 测试：267 项通过；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：70 项通过；
+- 完整 identity-bound analyzer + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
+- analyzer contract LB 为 `4096 bytes`，21 次 fixture UB peak 均为 `32768 bits`，满足边界相等；
 - 21 次均由真实 `post-TileAndBindSubBlock` snapshot 确认 auto-tile outcome 为 `false`；
-- 既有 standalone PlanMemory 运行：violations 0，unavailable 0；
+- 联合 oracle report：violations 0，unavailable 0，并成功生成未安装的 candidate；
 - 新 promotion gate 要求 suffix compiler 提供唯一的 `post-TileAndBindSubBlock` stage snapshot；缺失或歧义会明确 unavailable；
-- 当前主机已有可执行 suffix compiler，但 Python 环境不能导入 Triton，且还缺少 outcome=`true` 的配对真实 fixture，完整 identity-bound analyzer + PlanMemory 联合认证未完成；
-- 因此没有生成或安装生产 profile。
+- identity 会把 `-cce-link-aicore-ll-module` 的绝对路径规范化为文件内容 SHA256；安装目录变化不再造成无意义漂移，文件内容变化仍会失配；
+- 当前主机没有真实 CANN toolkit；本次只用明确标记的 local-only install-info 验证端到端机制，因此 candidate 不能作为生产认证，也没有安装生产 profile；
+- outcome=`true` 只属于未来 split MIX AIV profile，不是当前纯 AIV direct-copy profile 的认证前置条件。
 
 ## 11. 测试与质量状态
 
 本次基线已执行：
 
-- UB Python 聚焦测试：233 项通过；
-- oracle 最终测试：20 项通过；
-- 普通 C++ GTest：65 项通过；
-- ASan/UBSan C++ GTest：65 项通过；
-- 其余可在无 NPU 环境运行的 autotune 测试：39 项通过，3 项跳过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：267 项通过；
+- 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
+- 普通 C++ GTest：70 项通过；
+- 真实 suffix compiler 联合 oracle：20 seeds + retry，0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
   - p50 `0.002542 ms`
   - p95 `0.003334 ms`
@@ -511,6 +513,7 @@ LB_bits <= ActualUBPeak_bits
 - direct static GM→UB load/copy matcher；
 - target UB capacity 单一 C++ 数据源；
 - pipeline identity 和 UB 相关选项闭包检查；
+- BiSheng linked-module 绝对路径按文件内容 SHA256 规范化，避免 profile 绑定安装目录；
 - 与真实 PassManager builder 同源的 ordered pipeline stage manifest；
 - packaged profile 严格 schema、唯一 identity 和 oracle promotion gate；
 - profile → production registry 装载与 ordinal/id/version/options 精确匹配；
@@ -547,11 +550,12 @@ Preserve/Transform 合同。因此：
 
 ### P1：为真实 pipeline 建立第一组有效合同
 
-当前已完成候选合同实现、canonical TTIR 绑定和 oracle candidate chain；尚未完成真实认证。
-下一步应在具备 suffix compiler 与可导入 Triton/CANN identity 的环境运行纯 AIV
-direct-copy 的完整 promotion gate。`TileAndBindSubBlock` 的 true 分支属于 split MIX AIV，
+当前已完成候选合同实现、canonical TTIR 绑定、可执行 oracle candidate chain，以及本机
+精确 LLVM 下的 analyzer + PlanMemory 联合验证。下一步是在具备真实 CANN toolkit 的目标环境
+重跑相同 promotion gate，使 `cann_version_hash`、NPU compiler 内容 hash、libdevice 内容 hash
+都来自待发布环境，再人工审核 candidate。`TileAndBindSubBlock` 的 true 分支属于 split MIX AIV，
 应在未来 MIX profile 的独立 identity/fixture 中认证，不再阻塞 P1 的 false-outcome profile。
-packaged profile 在完整 report 生成前必须保持为空。
+目标 CANN report 完成并审核前，packaged profile 必须保持为空。
 
 优先选择最小、可证明且能产生收益的路径，不要直接声明整个 pipeline Preserve。
 
