@@ -285,6 +285,49 @@ def build_proposed_contract_profile(identity: dict, pipeline_stages: list[dict],
     }
 
 
+def expected_direct_copy_contract_trace(analysis: dict) -> list[str]:
+    """Return the exact matcher + ordered stage chain required for promotion."""
+    stages = analysis.get("pipeline_stages_detail")
+    if type(stages) is not list or not stages:
+        raise OracleUnavailable("analyzer omitted the proposed pipeline contract stages")
+    contract_ids = []
+    for stage in stages:
+        if type(stage) is not dict:
+            raise OracleUnavailable("analyzer returned an invalid pipeline contract stage")
+        contract_id = stage.get("contract_id")
+        if type(contract_id) is not str or not contract_id:
+            raise OracleUnavailable("analyzer returned an invalid stage contract id")
+        contract_ids.append(contract_id)
+    return ["ttir-direct-load-v1", *contract_ids]
+
+
+def has_valid_direct_copy_certificate(analysis: dict) -> bool:
+    """Require the certificate to be produced by this exact candidate chain."""
+    lower_bound = analysis.get("lower_bound_bytes")
+    certificates = analysis.get("certificates")
+    if type(lower_bound) is not int or lower_bound <= 0:
+        return False
+    if type(certificates) is not list or len(certificates) != 1:
+        return False
+    certificate = certificates[0]
+    if type(certificate) is not dict:
+        return False
+    resource_ids = certificate.get("resource_ids")
+    try:
+        expected_trace = expected_direct_copy_contract_trace(analysis)
+    except OracleUnavailable:
+        return False
+    return (
+        certificate.get("kind") == "singleton"
+        and certificate.get("bytes") == lower_bound
+        and type(resource_ids) is list
+        and len(resource_ids) == 1
+        and type(resource_ids[0]) is int
+        and resource_ids[0] >= 0
+        and certificate.get("contract_trace") == expected_trace
+    )
+
+
 def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: float = 120.0) -> dict:
     if not compiler.is_file() or not os.access(compiler, os.X_OK):
         raise OracleUnavailable(f"suffix compiler is not executable: {compiler}")
@@ -451,6 +494,10 @@ def evaluate(
                     "lower_bound_bytes": analysis.get("lower_bound_bytes", 0),
                     "allocation_bytes": boundary_bytes,
                 })
+            if analysis.get("lower_bound_bytes", 0) > 0 and not has_valid_direct_copy_certificate(analysis):
+                report["violations"].append({
+                    "case": case["name"], "kind": "invalid-certificate-contract-trace",
+                })
         except OracleUnavailable as error:
             report["unavailable"].append({"case": case["name"], "phase": "analyzer", "reason": str(error)})
             report["cases"].append(case_report)
@@ -524,9 +571,9 @@ def build_profile_candidate(report: dict) -> dict:
         analysis = case.get("analysis", {})
         identity = analysis.get("pipeline_identity_detail")
         stages = analysis.get("pipeline_stages_detail")
-        if (analysis.get("lower_bound_bytes", 0) <= 0 or not analysis.get("certificates")
+        if (not has_valid_direct_copy_certificate(analysis)
                 or type(identity) is not dict or type(stages) is not list or not stages):
-            raise OracleUnavailable("profile candidate requires a non-empty analyzer certificate")
+            raise OracleUnavailable("profile candidate requires an exact-chain analyzer certificate")
         boundary_bytes = analysis.get("before_cvpipelining_allocation_bytes")
         if type(boundary_bytes) is not int or analysis["lower_bound_bytes"] > boundary_bytes:
             raise OracleUnavailable("profile candidate lacks a valid materialization bridge")

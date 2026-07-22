@@ -518,6 +518,8 @@ LB_bits <= ActualUBPeak_bits
 - canonical TTIR 全文 SHA256 已进入 pipeline identity；
 - 参数化 `direct-copy-preserve@1` / `direct-copy-max-tiles@1` 候选合同及严格 source-fact 校验；
 - oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
+- oracle promotion 要求 singleton certificate 的 bytes/resource ID 合法，且
+  `contract_trace` 精确等于 source matcher 与 ordered candidate contracts；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
 - debug certificate dump，并在每个 certificate 的 `contract_trace` 中保留实际参与

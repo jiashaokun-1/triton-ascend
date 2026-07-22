@@ -245,11 +245,17 @@ def test_proposed_contract_chain_requires_unique_materialization_stage():
 
 
 def _analysis(decision="defer", lower_bound_bytes=0):
+    certificate = {
+        "kind": "singleton",
+        "bytes": lower_bound_bytes,
+        "resource_ids": [0],
+        "contract_trace": ["ttir-direct-load-v1", "direct-copy-max-tiles"],
+    }
     return {
         "decision": decision,
         "lower_bound_bytes": lower_bound_bytes,
         "capacity_bytes": 196608,
-        "certificates": ([] if lower_bound_bytes == 0 else [{"kind": "singleton"}]),
+        "certificates": ([] if lower_bound_bytes == 0 else [certificate]),
         "unsupported_reasons": ([] if lower_bound_bytes else ["unknown-pipeline-profile"]),
         "pipeline_identity": "identity",
         "pipeline_identity_detail": {"sha256": "identity", "target_arch": "Ascend910B"},
@@ -303,6 +309,23 @@ def test_evaluate_detects_invalid_lower_bound_and_reject_result(tmp_path):
     report = oracle.evaluate(manifest, Path("compiler"), [0], False, lambda _case: _analysis("reject", 256), run)
     assert {item["kind"] for item in report["violations"]} == {
         "lower-bound-exceeds-actual", "reject-without-ub-capacity-result"
+    }
+
+
+def test_evaluate_rejects_certificate_from_a_different_contract_chain(tmp_path):
+    manifest = oracle.load_manifest(_write_manifest(tmp_path))
+    analysis = _analysis("defer", 256)
+    analysis["certificates"][0]["contract_trace"] = ["ttir-direct-load-v1", "different-contract"]
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed, "status": "success", "overflow_scope": None,
+            "actual_peak_bits": 4096, "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(manifest, Path("compiler"), [0], False, lambda _case: analysis, run)
+    assert {item["kind"] for item in report["violations"]} == {
+        "invalid-certificate-contract-trace"
     }
 
 
