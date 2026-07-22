@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import shlex
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -376,6 +377,35 @@ def test_pipeline_identity_binds_compiler_kind_and_content(monkeypatch, tmp_path
         third_options["effective_npu_compiler_content_sha256"]
 
 
+def test_pipeline_identity_binds_libdevice_content_not_install_path(monkeypatch, tmp_path):
+    _identity_runtime(monkeypatch)
+    first_path = tmp_path / "first install" / "libdevice.10.bc"
+    second_path = tmp_path / "second install" / "libdevice.10.bc"
+    changed_path = tmp_path / "changed install" / "libdevice.10.bc"
+    for path, content in (
+        (first_path, b"same libdevice"),
+        (second_path, b"same libdevice"),
+        (changed_path, b"changed libdevice"),
+    ):
+        path.parent.mkdir()
+        path.write_bytes(content)
+
+    def identity(path):
+        metadata = _compiler_metadata(
+            bisheng_options=f"-cce-link-aicore-ll-module {shlex.quote(str(path))} -mllvm -test-option"
+        )
+        return ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata)
+
+    first = identity(first_path)
+    second = identity(second_path)
+    changed = identity(changed_path)
+    assert first["sha256"] == second["sha256"]
+    assert first["sha256"] != changed["sha256"]
+    normalized = json.loads(first["relevant_options_json"])["bisheng_options"]
+    assert str(first_path) not in normalized
+    assert hashlib.sha256(b"same libdevice").hexdigest() in normalized
+
+
 def test_compiler_kind_changes_linalg_command_with_identical_content(monkeypatch, tmp_path):
     commands = []
 
@@ -668,7 +698,7 @@ def test_make_ttir_simt_identity_uses_real_direct_pipeline_without_future_pm(mon
     monkeypatch.setattr(
         ascend_compiler,
         "_ttir_ub_pipeline_identity",
-        lambda pipeline, _metadata: captured.append(pipeline) or {"sha256": "direct-id"},
+        lambda pipeline, _metadata, _canonical_ttir: captured.append(pipeline) or {"sha256": "direct-id"},
     )
     monkeypatch.setattr(
         ascend_compiler,

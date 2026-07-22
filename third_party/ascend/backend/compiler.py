@@ -252,19 +252,54 @@ def _compiler_file_stat_identity(file_stat):
     )
 
 
-def _npu_compiler_content_fingerprint(path):
+def _identity_file_content_fingerprint(path, description):
     resolved = Path(path).expanduser().resolve(strict=True)
     if not resolved.is_file():
-        raise OSError(f"selected NPU compiler is not a regular file: {resolved}")
+        raise OSError(f"{description} is not a regular file: {resolved}")
     sha256 = hashlib.sha256()
-    with resolved.open("rb") as compiler:
-        stat_before = os.fstat(compiler.fileno())
-        for chunk in iter(lambda: compiler.read(1024 * 1024), b""):
+    with resolved.open("rb") as source:
+        stat_before = os.fstat(source.fileno())
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
             sha256.update(chunk)
-        stat_after = os.fstat(compiler.fileno())
+        stat_after = os.fstat(source.fileno())
     if _compiler_file_stat_identity(stat_before) != _compiler_file_stat_identity(stat_after):
-        raise OSError(f"selected NPU compiler changed while hashing: {resolved}")
+        raise OSError(f"{description} changed while hashing: {resolved}")
     return sha256.hexdigest()
+
+
+def _npu_compiler_content_fingerprint(path):
+    return _identity_file_content_fingerprint(path, "selected NPU compiler")
+
+
+def _normalize_bisheng_options_for_identity(value):
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise TypeError("bisheng_options must be a string or None")
+    tokens = shlex.split(value)
+    normalized = []
+    index = 0
+    linked_module_flag = "-cce-link-aicore-ll-module"
+    while index < len(tokens):
+        token = tokens[index]
+        if token == linked_module_flag:
+            if index + 1 == len(tokens):
+                raise ValueError(f"{linked_module_flag} requires a path")
+            digest = _identity_file_content_fingerprint(tokens[index + 1], "BiSheng linked module")
+            normalized.extend((token, f"sha256:{digest}"))
+            index += 2
+            continue
+        if token.startswith(linked_module_flag + "="):
+            path = token.split("=", 1)[1]
+            if not path:
+                raise ValueError(f"{linked_module_flag} requires a path")
+            digest = _identity_file_content_fingerprint(path, "BiSheng linked module")
+            normalized.append(f"{linked_module_flag}=sha256:{digest}")
+            index += 1
+            continue
+        normalized.append(token)
+        index += 1
+    return shlex.join(normalized)
 
 
 def _direct_simt_libdevice_compile_options(metadata):
@@ -277,6 +312,7 @@ def _direct_simt_libdevice_compile_options(metadata):
 
 def _ub_affecting_identity_options(metadata, *, direct_simt=False):
     options = {name: metadata.get(name) for name in UB_AFFECTING_OPTIONS}
+    options["bisheng_options"] = _normalize_bisheng_options_for_identity(options["bisheng_options"])
     options["auto_tile_and_bind_subblock"] = TTIR_UB_MODULE_DERIVED_AUTO_TILE
     auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
     env_vf = os.getenv("TRITON_ENABLE_VF_FUSION")
