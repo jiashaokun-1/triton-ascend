@@ -60,6 +60,7 @@ struct LowerBoundCertificate {
   int64_t bytes = 0;
   SmallVector<ResourceId> resourceIds;
   std::string kind;
+  SmallVector<std::string> contractTrace;
 };
 
 struct StableIdLimits {

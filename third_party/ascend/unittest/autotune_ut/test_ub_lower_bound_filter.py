@@ -132,6 +132,7 @@ def _analysis_result(decision, pipeline_identity):
                 "kind": "singleton",
                 "bytes": 196609,
                 "resource_ids": [7],
+                "contract_trace": ["synthetic-autotune-contract"],
             }],
             "unsupported_reasons": [],
             "pipeline_identity": pipeline_identity,

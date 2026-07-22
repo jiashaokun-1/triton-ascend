@@ -345,7 +345,7 @@ Reject ⇔ Proven(LB) ∧ LB &gt; Capacity(target)</div>
       <section class="sheet" id="murg">
         <h2>7. Matcher 与 MURG：如何从完整 TTIR 得到资源</h2>
         <p>matcher 遍历完整 ModuleOp，并沿 SSA use-def graph 匹配语义子图；不是按文本行切割，也不是每个 operation 都生成资源。</p>
-        <div class="callout blue"><strong>“证明”不是定理证明器。</strong>这里更准确的说法是<strong>可审计的下界证据链</strong>：matcher 先提出一个带前置条件的资源事实，后续每个 stage 要么确认该事实仍成立，要么把它保守地改小，要么宣布无法继续保证并 Invalidate。只有证据链没有断，solver 才能使用这个资源。MURG 因而也可以直观地叫作“资源下界证据图”。</div>
+        <div class="callout blue"><strong>“证明”不是定理证明器。</strong>这里更准确的说法是<strong>可审计的下界证据链</strong>：matcher 先提出一个带前置条件的资源事实，后续每个 stage 要么确认该事实仍成立，要么把它保守地改小，要么宣布无法继续保证并 Invalidate。只有证据链没有断，solver 才能使用这个资源。MURG 因而也可以直观地叫作“资源下界证据图”。最终 certificate 会携带 <span class="mono">contract_trace</span>，逐项记录 matcher 与各 stage 实际采用的 contract id；debug JSON 可以直接回答“这个下界经过了哪些规则”。</div>
         <div class="grid-2">
           <div class="card">
             <h3>当前 V1 pattern</h3>
@@ -547,8 +547,8 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <p>如果中间任一 stage 可能进一步缩小/消除资源却没有 transfer function，则 R0 失效，结果 defer。</p>
         <h3>多资源求解</h3>
         <div class="grid-2">
-          <div class="card"><h4>Singleton certificate</h4><div class="formula">LBsingle = max(bytes(r) × minInstances(r))</div><p>当前生产分析只启用这一类。</p></div>
-          <div class="card"><h4>Coexistence certificate</h4><div class="formula">LBwitness = Σ bytes(r) × minInstances(r)</div><p>只有同一 witness 中所有资源有效、两两 mustDistinct，且不存在 mayAlias 才能求和。</p></div>
+          <div class="card"><h4>Singleton certificate</h4><div class="formula">LBsingle = max(bytes(r) × minInstances(r))</div><p>当前生产分析只启用这一类；certificate 同时复制获胜资源的完整 <span class="mono">contract_trace</span>。</p></div>
+          <div class="card"><h4>Coexistence certificate</h4><div class="formula">LBwitness = Σ bytes(r) × minInstances(r)</div><p>只有同一 witness 中所有资源有效、两两 mustDistinct，且不存在 mayAlias 才能求和；certificate 合并 witness 与各资源的 contract trace。</p></div>
         </div>
         <div class="callout"><strong>没有“fit”结论：</strong><span class="mono">LB ≤ capacity</span> 只能说明当前证明不足以拒绝，真实 peak 仍可能更高，因此必须 defer。</div>
       </section>
@@ -563,6 +563,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>Direct-copy strict matcher</td><td><span class="tag fact">已实现</span></td><td>只接受单函数/单 block/静态一维/无 mask load→store</td></tr>
             <tr><td>MURG resource/alias/witness API</td><td><span class="tag fact">基础已实现</span></td><td>关系 API 和 solver 存在，但 matcher 只填单资源</td></tr>
             <tr><td>Singleton lower-bound solver</td><td><span class="tag fact">已实现</span></td><td>取最大有效资源 bytes × instances</td></tr>
+            <tr><td>Certificate contract trace</td><td><span class="tag fact">已实现</span></td><td>solver 保留获胜资源/witness 的 matcher + stage contract 链，binding 与 debug JSON 原样输出</td></tr>
             <tr><td>Witness solver</td><td><span class="tag plan">代码存在</span></td><td>生产决策未启用</td></tr>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
@@ -580,7 +581,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <div class="phase">
             <h3>P0 · 打通可执行合同链 <span class="tag fact">Implemented</span></h3>
             <p>已把真实 pass builder 同步记录为 ordered stage contexts，实现严格 packaged schema、profile → registry 装载、contract id/version 绑定和 identity/stage golden；BiSheng 未公开的内部 pipeline 作为由 compiler 内容哈希约束的原子 suffix stage。</p>
-            <p class="small"><strong>已覆盖：</strong>人工 profile 可运行 fail-closed contract；pass/order/option/version/identity 任一漂移稳定 defer。canonical TTIR → before CVPipelining 的语义字段映射随 P1 首个 materialization contract 落地。</p>
+            <p class="small"><strong>已覆盖：</strong>人工 profile 可运行 fail-closed contract；pass/order/option/version/identity 任一漂移稳定 defer。canonical TTIR → before CVPipelining 的语义字段映射随 P1 首个 materialization contract 落地；最终 certificate 与 debug JSON 已保留完整 <span class="mono">contract_trace</span>，可回溯每条下界事实经过的 matcher/contract。</p>
           </div>
           <div class="phase">
             <h3>P1 · Direct-copy 生产闭环 <span class="tag plan">In progress</span></h3>

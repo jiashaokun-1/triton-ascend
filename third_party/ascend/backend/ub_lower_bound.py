@@ -50,7 +50,7 @@ _RESULT_KEYS = frozenset({
     "pipeline_identity",
     "contract_version",
 })
-_CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids"})
+_CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids", "contract_trace"})
 _PIPELINE_IDENTITY_KEYS = frozenset({
     "open_source_pipeline",
     "canonical_ttir_sha256",
@@ -265,10 +265,15 @@ def _normalize_certificate(certificate, lower_bound_bytes):
     resource_id = resource_ids[0]
     if type(resource_id) is not int or not 0 <= resource_id < _INVALID_RESOURCE_ID:
         return None
+    contract_trace = certificate.get("contract_trace")
+    if (type(contract_trace) is not list or not contract_trace
+            or not all(type(contract_id) is str and contract_id for contract_id in contract_trace)):
+        return None
     return {
         "kind": certificate["kind"],
         "bytes": certificate["bytes"],
         "resource_ids": list(resource_ids),
+        "contract_trace": list(contract_trace),
     }
 
 

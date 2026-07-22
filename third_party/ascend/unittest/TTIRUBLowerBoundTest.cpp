@@ -184,11 +184,15 @@ Operation *replaceWithMalformedOperation(Operation *original,
 TEST(MandatoryUBResourceGraph, SingletonUsesLargestMandatoryResource) {
   MandatoryUBResourceGraph graph;
   graph.addResource({"load0", 64 * 1024, 1});
-  graph.addResource({"load1", 192 * 1024 + 4, 1});
+  MandatoryUBResource largest{"load1", 192 * 1024 + 4, 1};
+  largest.contractTrace = {"source", "materialize"};
+  graph.addResource(std::move(largest));
   auto result = graph.solveSingletonLowerBound();
   ASSERT_TRUE(succeeded(result));
   EXPECT_EQ(result->bytes, 192 * 1024 + 4);
   EXPECT_EQ(result->resourceIds.size(), 1u);
+  EXPECT_EQ(result->contractTrace,
+            SmallVector<std::string>({"source", "materialize"}));
 }
 
 TEST(MandatoryUBResourceGraph, InvalidResourceCannotContribute) {
@@ -209,14 +213,26 @@ TEST(MandatoryUBResourceGraph, ArithmeticOverflowFailsClosed) {
 TEST(MandatoryUBResourceGraph, PairwiseOverlapIsNotAThreeWayWitness) {
   MandatoryUBResourceGraph graph;
   auto a = graph.addResource({"a", 32, 1});
-  auto b = graph.addResource({"b", 64, 1});
-  auto c = graph.addResource({"c", 128, 1});
+  MandatoryUBResource bResource{"b", 64, 1};
+  bResource.contractTrace = {"b-source"};
+  auto b = graph.addResource(std::move(bResource));
+  MandatoryUBResource cResource{"c", 128, 1};
+  cResource.contractTrace = {"c-source"};
+  auto c = graph.addResource(std::move(cResource));
   graph.addMustDistinct(a, b);
   graph.addMustDistinct(b, c);
   graph.addMustDistinct(a, c);
   graph.addWitness({a, b});
-  graph.addWitness({b, c});
-  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 192);
+  CoexistenceWitness witness;
+  witness.resources = {b, c};
+  witness.contractTrace = {"lifetime-overlap"};
+  graph.addWitness(std::move(witness));
+  auto result = graph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->bytes, 192);
+  EXPECT_EQ(result->contractTrace,
+            SmallVector<std::string>({"lifetime-overlap", "b-source",
+                                      "c-source"}));
 }
 
 TEST(MandatoryUBResourceGraph, PossibleAliasCannotBeSummed) {

@@ -187,6 +187,7 @@ MandatoryUBResourceGraph::solveSingletonLowerBound() const {
     if (*bytes > result.bytes) {
       result.bytes = *bytes;
       result.resourceIds.assign({*id});
+      result.contractTrace = resource.contractTrace;
     }
   }
   return result;
@@ -288,6 +289,10 @@ MandatoryUBResourceGraph::solveWitnessLowerBound() const {
       result.bytes = bytes;
       result.resourceIds = std::move(resourceIds);
       result.kind = "witness";
+      result.contractTrace = witness.contractTrace;
+      for (ResourceId id : result.resourceIds)
+        result.contractTrace.append(resources_[id].contractTrace.begin(),
+                                    resources_[id].contractTrace.end());
     }
   }
 

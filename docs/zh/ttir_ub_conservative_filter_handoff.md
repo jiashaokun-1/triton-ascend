@@ -520,7 +520,8 @@ LB_bits <= ActualUBPeak_bits
 - oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
-- debug certificate dump；
+- debug certificate dump，并在每个 certificate 的 `contract_trace` 中保留实际参与
+  下界计算的 matcher、witness 和逐 stage contract ID；
 - autotune 串行/并行过滤接线和 telemetry；
 - PlanMemory seed/retry oracle、report 和 candidate gate；
 - 双语用户文档和完整单元测试。

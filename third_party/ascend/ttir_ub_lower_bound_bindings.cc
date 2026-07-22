@@ -321,6 +321,10 @@ py::dict serializeCertificate(const LowerBoundCertificate &certificate) {
   for (ResourceId id : certificate.resourceIds)
     resourceIds.append(id);
   result["resource_ids"] = std::move(resourceIds);
+  py::list contractTrace;
+  for (const std::string &contractId : certificate.contractTrace)
+    contractTrace.append(contractId);
+  result["contract_trace"] = std::move(contractTrace);
   return result;
 }
 

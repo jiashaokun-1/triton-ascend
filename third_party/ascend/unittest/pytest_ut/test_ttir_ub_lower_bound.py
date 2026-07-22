@@ -83,7 +83,12 @@ def _analysis_result(decision="reject"):
         "decision": decision,
         "lower_bound_bytes": 262144,
         "capacity_bytes": 196608,
-        "certificates": [{"kind": "singleton", "bytes": 262144, "resource_ids": [0]}],
+        "certificates": [{
+            "kind": "singleton",
+            "bytes": 262144,
+            "resource_ids": [0],
+            "contract_trace": ["ttir-direct-load-v1", "direct-copy-max-tiles"],
+        }],
         "unsupported_reasons": [],
         "contract_version": "ttir-ub-lb-v1",
         "pipeline_identity": "test-id",
@@ -733,6 +738,10 @@ def test_debug_policy_dump_uses_dump_manager_and_contains_full_result(monkeypatc
     assert filename == "kernel.ttir.ub-lower-bound.json"
     assert dump_manager.put.call_args.kwargs == {"binary": False}
     assert json.loads(content) == result
+    assert json.loads(content)["certificates"][0]["contract_trace"] == [
+        "ttir-direct-load-v1",
+        "direct-copy-max-tiles",
+    ]
 
 
 def test_core_compiler_preserves_ub_lower_bound_overflow(monkeypatch):
@@ -867,6 +876,10 @@ def test_enforce_raises_only_proven_reject(monkeypatch):
         (("certificates", 0, "resource_ids"), [1 << 32]),
         (("certificates", 0, "resource_ids"), [0, 1]),
         (("certificates", 0, "resource_ids"), [object()]),
+        (("certificates", 0, "contract_trace"), None),
+        (("certificates", 0, "contract_trace"), []),
+        (("certificates", 0, "contract_trace"), [""]),
+        (("certificates", 0, "contract_trace"), [object()]),
         (("certificates", 0, "extra"), object()),
         (("unsupported_reasons", ), None),
         (("unsupported_reasons", ), [None]),
@@ -1505,7 +1518,17 @@ def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):
     assert result["decision"] == "defer"
     assert result["lower_bound_bytes"] == 4096
     assert result["unsupported_reasons"] == []
-    assert result["certificates"] == [{"kind": "singleton", "bytes": 4096, "resource_ids": [0]}]
+    assert result["certificates"] == [{
+        "kind": "singleton",
+        "bytes": 4096,
+        "resource_ids": [0],
+        "contract_trace": [
+            "ttir-direct-load-v1",
+            "direct-copy-preserve",
+            "direct-copy-max-tiles",
+            "direct-copy-preserve",
+        ],
+    }]
 
     profile["profiles"][0].update({
         "contract_version": "ttir-ub-lb-v1",
