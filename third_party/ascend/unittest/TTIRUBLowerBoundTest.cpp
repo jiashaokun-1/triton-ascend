@@ -104,6 +104,7 @@ protected:
     result.compileMode = "aiv";
     result.pipelineIdentity = {
         .openSourcePipeline = "synthetic-all-preserve",
+        .canonicalTtirSha256 = "synthetic-canonical-ttir-v1",
         .relevantOptionsJson = "{}",
         .targetArch = targetArch.str(),
         .tritonVersion = "test",
@@ -334,6 +335,75 @@ TEST(UBResourceContract, TransformCanOnlyLowerToProvenMinimum) {
   EXPECT_TRUE(
       succeeded(registry.applyOrInvalidateAll(graph, {.stageName = "tile"})));
   EXPECT_EQ(graph.resources()[id].minPayloadBytes, 131072);
+}
+
+MandatoryUBResource directCopyResource(int64_t payloadBytes = 262144) {
+  MandatoryUBResource resource{"load0", payloadBytes, 1};
+  resource.origin = "tt.load";
+  resource.kind = MaterializationKind::GMToUBLoad;
+  resource.sourceElements = 65536;
+  resource.elementBitWidth = 32;
+  return resource;
+}
+
+TEST(UBResourceContract, DirectCopyPreserveRequiresExactSourceFacts) {
+  MandatoryUBResourceGraph graph;
+  auto id = graph.addResource(directCopyResource());
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeDirectCopyPreserveContract(
+      {.stageName = "canonicalize"}, 1, 65536, 32, 262144));
+
+  EXPECT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "canonicalize"})));
+  ASSERT_EQ(graph.resources()[id].validity, ValidityState::Valid);
+  ASSERT_EQ(graph.resources()[id].contractTrace.size(), 1u);
+  EXPECT_EQ(graph.resources()[id].contractTrace.back(),
+            "direct-copy-preserve");
+}
+
+TEST(UBResourceContract, DirectCopyPreserveInvalidatesShapeDrift) {
+  MandatoryUBResourceGraph graph;
+  auto resource = directCopyResource();
+  resource.sourceElements = 32768;
+  auto id = graph.addResource(std::move(resource));
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeDirectCopyPreserveContract(
+      {.stageName = "canonicalize"}, 1, 65536, 32, 262144));
+
+  EXPECT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "canonicalize"})));
+  EXPECT_EQ(graph.resources()[id].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[id].invalidReason, "direct-copy-preserve");
+}
+
+TEST(UBResourceContract, DirectCopyMaxTilesProducesCeilingLowerBound) {
+  MandatoryUBResourceGraph graph;
+  auto resource = directCopyResource(262145);
+  auto id = graph.addResource(std::move(resource));
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeDirectCopyMaxTilesContract(
+      {.stageName = "materialize"}, 1, 65536, 32, 262145, 64));
+
+  EXPECT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "materialize"})));
+  EXPECT_EQ(graph.resources()[id].minPayloadBytes, 4097);
+  EXPECT_EQ(graph.resources()[id].contractTrace.back(),
+            "direct-copy-max-tiles");
+}
+
+TEST(UBResourceContract, DirectCopyMaxTilesRejectsResourceCountDrift) {
+  MandatoryUBResourceGraph graph;
+  auto first = graph.addResource(directCopyResource());
+  graph.addResource(directCopyResource());
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeDirectCopyMaxTilesContract(
+      {.stageName = "materialize"}, 1, 65536, 32, 262144, 64));
+
+  EXPECT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "materialize"})));
+  EXPECT_EQ(graph.resources()[first].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[first].invalidReason,
+            "direct-copy-max-tiles");
 }
 
 TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
@@ -985,6 +1055,15 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
 TEST_F(TTIRUBLowerBoundAnalysisTest, TargetMismatchDefersAsUnknownProfile) {
   TTIRUBAnalysisOptions analysisOptions = options();
   analysisOptions.pipelineIdentity.targetArch = "Ascend950";
+  TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       CanonicalTTIRHashMismatchDefersAsUnknownProfile) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.pipelineIdentity.canonicalTtirSha256 = "other-ttir";
   TTIRUBAnalysisResult result = analyze(kDirectLoadCopy, analysisOptions);
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));

@@ -20,6 +20,7 @@ enum class ContractDisposition { Preserve, Transform, Invalidate, InternalError 
 
 struct PipelineIdentity {
   std::string openSourcePipeline;
+  std::string canonicalTtirSha256;
   std::string relevantOptionsJson;
   std::string targetArch;
   std::string tritonVersion;
@@ -36,6 +37,7 @@ struct PipelineContractBinding {
   PipelineStageContext stage;
   std::string contractId;
   std::string contractVersion;
+  StringMap<std::string> parameters;
 };
 
 class UBResourceContract {
@@ -84,6 +86,14 @@ std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
                                                           int64_t maxTiles);
 std::unique_ptr<UBResourceContract>
 makeInvalidateContract(const PipelineStageContext &stage);
+std::unique_ptr<UBResourceContract> makeDirectCopyPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes);
+std::unique_ptr<UBResourceContract> makeDirectCopyMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t maxTiles);
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch);
 

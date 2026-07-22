@@ -308,13 +308,14 @@ def _ub_affecting_identity_options(metadata, *, direct_simt=False):
     return options
 
 
-def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict) -> dict:
+def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict, canonical_ttir: str = "") -> dict:
     target_arch = metadata["target"].arch
     triton_version = metadata["triton_version"]
     cann_version_hash = get_cann_version_file_hash()
     options = _ub_affecting_identity_options(metadata, direct_simt=(pipeline == TTIR_UB_DIRECT_BISHENG_PIPELINE))
     payload = {
         "cann_version_hash": cann_version_hash,
+        "canonical_ttir_sha256": hashlib.sha256(canonical_ttir.encode("utf-8")).hexdigest(),
         "open_source_pipeline": pipeline,
         "relevant_options": options,
         "target_arch": target_arch,
@@ -323,6 +324,7 @@ def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict) -> dict:
     encoded = _canonical_json(payload)
     return {
         "open_source_pipeline": pipeline,
+        "canonical_ttir_sha256": payload["canonical_ttir_sha256"],
         "relevant_options_json": _canonical_json(options),
         "target_arch": target_arch,
         "triton_version": triton_version,
@@ -476,7 +478,7 @@ def make_ttir(mod, metadata, opt):
                 )
                 pipeline = future_pm.get_pipeline_str()
                 _record_pipeline_stage(pipeline_stages, TTIR_UB_BISHENG_SUFFIX_STAGE)
-            pipeline_identity = _ttir_ub_pipeline_identity(pipeline, metadata)
+            pipeline_identity = _ttir_ub_pipeline_identity(pipeline, metadata, str(mod))
         except Exception:
             pipeline_identity = ""
             pipeline_stages = []

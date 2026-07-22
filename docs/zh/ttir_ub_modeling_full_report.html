@@ -172,7 +172,7 @@
         <div class="grid-3">
           <div class="card blue"><h3>模型定位</h3><p>以抽象解释/语义事实传播为主，辅以解析公式；不是统计回归，也不是完整后端模拟器。</p></div>
           <div class="card violet"><h3>核心资产</h3><p><span class="mono">MURG</span> 保存资源下界事实；<span class="mono">UBResourceContract</span> 负责逐 lowering stage 更新这些事实。</p></div>
-          <div class="card amber"><h3>当前事实</h3><p>P0 可执行合同链已接通，direct-copy matcher 已实现；但 packaged profile 仍为空，且尚无经 oracle 认证的 Preserve/Transform 合同，所以真实运行仍会安全 <span class="mono">defer</span>。</p></div>
+          <div class="card amber"><h3>当前事实</h3><p>P0 可执行合同链已接通；P1 已加入 direct-copy 候选 Preserve/Transform 合同和 oracle candidate gate。但 packaged profile 仍为空，尚无经真实 oracle 认证的合同，所以真实运行仍会安全 <span class="mono">defer</span>。</p></div>
         </div>
         <div class="meta">
           <span class="pill">分支：codex/ttir-ub-conservative-filter</span>
@@ -295,7 +295,7 @@
         <div class="flow">
           <div class="node"><strong>1. Per-config TTIR</strong>完整 ModuleOp；constexpr tile 已实例化</div>
           <div class="arrow">→</div>
-          <div class="node"><strong>2. PipelineIdentity</strong>真实 pass 顺序、选项、target、版本、compiler hash</div>
+          <div class="node"><strong>2. PipelineIdentity</strong>完整 canonical TTIR hash + 真实 pass 顺序、选项、target、版本、compiler hash</div>
           <div class="arrow">→</div>
           <div class="node"><strong>3. Source Matcher</strong>按 SSA 子图识别受支持语义模式</div>
           <div class="arrow">→</div>
@@ -327,7 +327,7 @@ Reject ⇔ Proven(LB) ∧ LB &gt; Capacity(target)</div>
 
       <section class="sheet" id="identity">
         <h2>6. PipelineIdentity 与 profile 的真实作用</h2>
-        <p><span class="mono">PipelineIdentity</span> 不记录 TTIR 文本，也不计算 UB。它是“合同适用环境的指纹”。当前代码从与真实编译相同的 PassManager builder 调用 <span class="mono">get_pipeline_str()</span>，并加入影响 UB 的选项、target、Triton/CANN 版本、实际 NPU compiler 类型与文件内容 SHA256。</p>
+        <p><span class="mono">PipelineIdentity</span> 不保存 TTIR 文本，也不计算 UB；它保存完整 canonical TTIR 文本的 SHA256，并作为“输入 + 合同适用环境”的指纹。当前代码还从与真实编译相同的 PassManager builder 调用 <span class="mono">get_pipeline_str()</span>，加入影响 UB 的选项、target、Triton/CANN 版本、实际 NPU compiler 类型与文件内容 SHA256。</p>
         <div class="flow">
           <div class="node"><strong>Validated pipeline P1</strong>固定 pass 顺序、参数、target 和 compiler 版本</div>
           <div class="arrow">→</div>
@@ -482,7 +482,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <h3>A. Applicability &amp; source materialization</h3>
         <div class="contract"><code>PipelineApplicabilityContract</code><span>绑定 identity、target、compile mode、版本、stage order；任一不匹配即拒绝使用整套 profile。</span><span class="status todo">Proposed</span></div>
         <div class="contract"><code>DirectTensorLoadSourceContract</code><span>定义 direct contiguous load/store source pattern，产生 GMToUBLoad candidate。</span><span class="status now">Matcher exists</span></div>
-        <div class="contract"><code>TritonToLinalgLoadMaterializationContract</code><span>证明 candidate 在 TTIR→Linalg/HIVM 中真正成为 local/UB allocation 与 GM→local copy。</span><span class="status todo">P0/P1</span></div>
+        <div class="contract"><code>TritonToLinalgLoadMaterializationContract</code><span>证明 candidate 在 TTIR→Linalg/HIVM 中真正成为 local/UB allocation 与 GM→local copy；当前由 <span class="mono">direct-copy-max-tiles@1</span> 候选摘要表达。</span><span class="status now">Candidate implemented</span></div>
         <div class="contract"><code>TritonToLinalgStoreMaterializationContract</code><span>定义输出是否物化、是否通过 DPS/inplace 复用输入。</span><span class="status todo">P2</span></div>
         <div class="contract"><code>IntermediateMaterializationContract</code><span>elementwise/layout/reduction 中间 tensor 是融合、view 还是独立 buffer。</span><span class="status todo">P2+</span></div>
 
@@ -518,7 +518,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>SplitMixContract</code><span>MIX 拆分后的 AIV 投影、跨 core buffer 与 address-space 变化。</span><span class="status todo">P4</span></div>
 
         <h3>E. BiSheng / downstream memory contracts</h3>
-        <div class="contract"><code>BiShengTilingContract</code><span>外部 tiling 对最小 tile payload 的单调传递；必须绑定 compiler hash/options。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>BiShengTilingContract</code><span>外部 tiling 对最小 tile payload 的单调传递；候选合同按“最多 N 个 tiles ⇒ 至少一个 tile ≥ ceil(payload/N)”计算，并绑定 canonical TTIR/compiler/options。</span><span class="status now">Candidate implemented</span></div>
         <div class="contract"><code>TileAndBindSubBlockContract</code><span>sub-block 切分的最大 tile 数或最小 tile shape 证明。</span><span class="status todo">P1</span></div>
         <div class="contract"><code>CanonicalizationEliminationContract</code><span>DCE/fusion/canonicalization 是否消除或缩小 resource。</span><span class="status todo">P1/P2</span></div>
         <div class="contract"><code>BufferizationContract</code><span>逻辑 tensor 到 allocation 的映射与 memory space；是后续 alias/lifetime 的基础。</span><span class="status todo">P1</span></div>
@@ -529,7 +529,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存。</span><span class="status todo">P3/P4</span></div>
         <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status todo">P0</span></div>
 
-        <div class="callout amber"><strong>当前可装载生产合同：</strong>P0 新增 <span class="mono">invalidate-unmodeled-stage@1</span>，只用于证明 profile→registry→ordered chain 能安全执行；它必然终止证据链，不可能产生 reject。经 oracle 认证的 Preserve/Transform 合同仍为 0。</div>
+        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 <span class="mono">invalidate-unmodeled-stage@1</span>、<span class="mono">direct-copy-preserve@1</span> 和 <span class="mono">direct-copy-max-tiles@1</span>。后两者会严格核对资源数量、source elements、element width、输入 payload 和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证的 Preserve/Transform 合同仍为 0。</div>
       </section>
 
       <section class="sheet" id="solver">
@@ -559,15 +559,15 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <thead><tr><th>能力</th><th>状态</th><th>说明</th></tr></thead>
           <tbody>
             <tr><td>Per-config canonical TTIR 接入</td><td><span class="tag fact">已实现</span></td><td>make_ttir canonicalization 后调用 policy</td></tr>
-            <tr><td>PipelineIdentity 构造</td><td><span class="tag fact">已实现</span></td><td>pipeline string + UB options + target/version/compiler hash</td></tr>
+            <tr><td>PipelineIdentity 构造</td><td><span class="tag fact">已实现</span></td><td>canonical TTIR SHA256 + pipeline string + UB options + target/version/compiler hash</td></tr>
             <tr><td>Direct-copy strict matcher</td><td><span class="tag fact">已实现</span></td><td>只接受单函数/单 block/静态一维/无 mask load→store</td></tr>
             <tr><td>MURG resource/alias/witness API</td><td><span class="tag fact">基础已实现</span></td><td>关系 API 和 solver 存在，但 matcher 只填单资源</td></tr>
             <tr><td>Singleton lower-bound solver</td><td><span class="tag fact">已实现</span></td><td>取最大有效资源 bytes × instances</td></tr>
             <tr><td>Witness solver</td><td><span class="tag plan">代码存在</span></td><td>生产决策未启用</td></tr>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
-            <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复或漂移均 defer</td></tr>
-            <tr><td>Production contracts</td><td><span class="tag gap">安全合同 1 / 有效合同 0</span></td><td>只有 fail-closed invalidate scaffold；尚无经 oracle 认证的 Preserve/Transform</td></tr>
+            <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
+            <tr><td>Production contracts</td><td><span class="tag plan">候选合同 2 / 已认证 0</span></td><td>Preserve 与 max-tiles transfer function 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
         </table></div>
@@ -583,8 +583,9 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <p class="small"><strong>已覆盖：</strong>人工 profile 可运行 fail-closed contract；pass/order/option/version/identity 任一漂移稳定 defer。canonical TTIR → before CVPipelining 的语义字段映射随 P1 首个 materialization contract 落地。</p>
           </div>
           <div class="phase">
-            <h3>P1 · Direct-copy 生产闭环</h3>
-            <p>从真实 pass 和现有语义模型提炼 direct-copy 所需的 Preserve/Formula/SemanticRelation 摘要；实现 TTIR→HIVM materialization bridge、tiling、bufferization 与 PlanMemory interpretation 的最小合同链，不重写完整 lowering。</p>
+            <h3>P1 · Direct-copy 生产闭环 <span class="tag plan">In progress</span></h3>
+            <p>已实现参数化 <span class="mono">direct-copy-preserve@1</span>、<span class="mono">direct-copy-max-tiles@1</span>、canonical TTIR hash 绑定，以及不安装 profile 的 oracle candidate chain。候选链通过 candidate-only API 执行；生产 API 只接受带完整 promotion 认证元数据的 active profile。max-tiles 使用 <span class="mono">ceil(payload/maxTiles)</span>，绑定真实 <span class="mono">ttir.triton-to-linalg</span> stage，并与 before-CVPipelining snapshot 中唯一静态 local allocation 交叉验证；后续 BiSheng suffix 只能 Preserve 或 Invalidate。首版仅允许 <span class="mono">compile_mode=simd</span>、<span class="mono">multibuffer=false</span>，资源事实或 stage 漂移即 Invalidate。</p>
+            <p class="small"><strong>当前门禁：</strong>oracle 通过 suffix compiler 的 <span class="mono">post-TileAndBindSubBlock</span> 真实 stage snapshot 检测 <span class="mono">get_sub_block_idx</span>，得到实际 auto-tile outcome；snapshot 缺失、歧义或与 fixture 不一致均 fail closed。当前 false-outcome fixture 已用真实 suffix compiler 跑完 seeds 0..19 + retry，21 次 peak 均为 32768 bits；但 Python 环境仍不能导入 Triton，且缺少 true-outcome 配对 fixture，所以联合认证尚未完成，生产 profile 保持空。</p>
             <p class="small"><strong>验收：</strong>direct-copy fixtures 同时经过真实 compiler snapshot、现有语义重放和 contracts；seed 0..19 上满足 LB ≤ min actual peak，且 reject 的 config 全部真实 overflow。</p>
           </div>
           <div class="phase">

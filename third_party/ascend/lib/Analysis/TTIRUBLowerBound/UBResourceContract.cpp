@@ -1,5 +1,7 @@
 #include "Analysis/TTIRUBLowerBound/UBResourceContract.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 #include <utility>
 
 namespace mlir::triton::ascend::ub {
@@ -33,6 +35,7 @@ bool areEqual(const PipelineStageContext &lhs,
 
 bool areEqual(const PipelineIdentity &lhs, const PipelineIdentity &rhs) {
   return lhs.openSourcePipeline == rhs.openSourcePipeline &&
+         lhs.canonicalTtirSha256 == rhs.canonicalTtirSha256 &&
          lhs.relevantOptionsJson == rhs.relevantOptionsJson &&
          lhs.targetArch == rhs.targetArch &&
          lhs.tritonVersion == rhs.tritonVersion &&
@@ -114,6 +117,121 @@ public:
 
 private:
   std::string stageName;
+  int64_t maxTiles;
+};
+
+class DirectCopyContractBase : public UBResourceContract {
+public:
+  DirectCopyContractBase(const PipelineStageContext &stage,
+                         int64_t expectedResourceCount,
+                         int64_t expectedSourceElements,
+                         unsigned expectedElementBitWidth,
+                         int64_t expectedInputPayloadBytes)
+      : stageName(stage.stageName),
+        expectedResourceCount(expectedResourceCount),
+        expectedSourceElements(expectedSourceElements),
+        expectedElementBitWidth(expectedElementBitWidth),
+        expectedInputPayloadBytes(expectedInputPayloadBytes) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef version() const final { return "1"; }
+
+  bool matches(const PipelineStageContext &context) const final {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+
+protected:
+  bool matchesResources(const MandatoryUBResourceGraph &graph) const {
+    if (expectedResourceCount <= 0 || expectedSourceElements <= 0 ||
+        expectedElementBitWidth == 0 || expectedInputPayloadBytes <= 0 ||
+        graph.resources().size() !=
+            static_cast<size_t>(expectedResourceCount))
+      return false;
+    return llvm::all_of(graph.resources(), [&](const auto &resource) {
+      return resource.validity == ValidityState::Valid &&
+             resource.origin == "tt.load" &&
+             resource.kind == MaterializationKind::GMToUBLoad &&
+             resource.minInstances == 1 &&
+             resource.sourceElements == expectedSourceElements &&
+             resource.elementBitWidth == expectedElementBitWidth &&
+             resource.minPayloadBytes == expectedInputPayloadBytes;
+    });
+  }
+
+  LogicalResult appendTrace(MandatoryUBResourceGraph &graph,
+                            StringRef contractId) const {
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
+      if (failed(graph.appendResourceTrace(static_cast<ResourceId>(ordinal),
+                                           contractId)))
+        return failure();
+    return success();
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+  int64_t expectedResourceCount;
+  int64_t expectedSourceElements;
+  unsigned expectedElementBitWidth;
+  int64_t expectedInputPayloadBytes;
+};
+
+class DirectCopyPreserveContract final : public DirectCopyContractBase {
+public:
+  using DirectCopyContractBase::DirectCopyContractBase;
+
+  StringRef id() const override { return "direct-copy-preserve"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (!matchesResources(graph))
+      return ContractDisposition::Invalidate;
+    if (failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Preserve;
+  }
+};
+
+class DirectCopyMaxTilesContract final : public DirectCopyContractBase {
+public:
+  DirectCopyMaxTilesContract(const PipelineStageContext &stage,
+                             int64_t expectedResourceCount,
+                             int64_t expectedSourceElements,
+                             unsigned expectedElementBitWidth,
+                             int64_t expectedInputPayloadBytes,
+                             int64_t maxTiles)
+      : DirectCopyContractBase(stage, expectedResourceCount,
+                               expectedSourceElements,
+                               expectedElementBitWidth,
+                               expectedInputPayloadBytes),
+        maxTiles(maxTiles) {}
+
+  StringRef id() const override { return "direct-copy-max-tiles"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (maxTiles <= 0)
+      return ContractDisposition::InternalError;
+    if (!matchesResources(graph))
+      return ContractDisposition::Invalidate;
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal) {
+      const int64_t payload = graph.resources()[ordinal].minPayloadBytes;
+      int64_t transformed = payload / maxTiles;
+      if (payload % maxTiles != 0)
+        ++transformed;
+      if (failed(graph.lowerResourcePayload(static_cast<ResourceId>(ordinal),
+                                            transformed, id())))
+        return ContractDisposition::InternalError;
+    }
+    return ContractDisposition::Transform;
+  }
+
+private:
   int64_t maxTiles;
 };
 
@@ -209,6 +327,24 @@ std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
 std::unique_ptr<UBResourceContract>
 makeInvalidateContract(const PipelineStageContext &stage) {
   return std::make_unique<InvalidateContract>(stage);
+}
+
+std::unique_ptr<UBResourceContract> makeDirectCopyPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes) {
+  return std::make_unique<DirectCopyPreserveContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes);
+}
+
+std::unique_ptr<UBResourceContract> makeDirectCopyMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t maxTiles) {
+  return std::make_unique<DirectCopyMaxTilesContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
 }
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {

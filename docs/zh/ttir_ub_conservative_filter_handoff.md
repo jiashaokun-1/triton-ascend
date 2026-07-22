@@ -193,10 +193,20 @@ MURG 已定义：
 
 ### 5.4 当前实现状态
 
-P0 已实现 production profile → ordered registry 装载。当前生产 allowlist 中只有
-`invalidate-unmodeled-stage@1`：它用于安全验证可执行链，会使资源失效，永远不能产生
-`reject`。测试用 fixed-tile/fixed-disposition 仍不会被 production loader 接受。尚未安装
-经 oracle 认证的 Preserve/Transform 合同。
+P0 已实现 production profile → ordered registry 装载。P1 已新增可参数化的
+`direct-copy-preserve@1` 与 `direct-copy-max-tiles@1` 候选合同；后者按
+`ceil(inputPayload/maxTiles)` 传递下界。二者会核对资源数量、source elements、element
+width、输入 payload、stage/options，任一漂移即 Invalidate。packaged profile 仍为空，
+因此尚未安装经 oracle 认证的 Preserve/Transform 合同。
+
+首个 fixture 把 `direct-copy-max-tiles@1` 绑定在真实的 `ttir.triton-to-linalg` stage；
+before-CVPipelining snapshot 中的 local allocation 用来验证这一 stage 输出的 payload，
+之后的 BiSheng suffix 只能 Preserve 或 Invalidate，不能反过来冒充 materialization stage。
+
+候选与生产入口已经隔离：离线 oracle 只能通过
+`ttir_ub_lower_bound_candidate_for_oracle` 试跑未认证的 active contracts；正常编译调用
+`ttir_ub_lower_bound`，其中 Preserve/Transform profile 缺少完整认证元数据时按未知 profile
+处理并 `defer`。只会使证明失效的 `invalidate-unmodeled-stage@1` 不需要认证。
 
 ## 6. TTIR matcher 与当前建模范围
 
@@ -264,10 +274,11 @@ contractTrace = ["ttir-direct-load-v1"]
 - 收集影响 UB 的编译选项和环境开关；
 - 记录 target arch、Triton version 和 CANN version hash；
 - 记录实际选择的 compiler 类型及 compiler 文件内容 SHA256；
+- 对完整 canonical TTIR 文本求 SHA256 并纳入 identity，不在 profile 中保存整份 IR；
 - `auto_tile_and_bind_subblock` 使用 module-derived identity 规则；
 - 对 canonical JSON 求 SHA256，作为证书 fingerprint。
 
-身份中 pass 调序、UB 相关选项变化、compiler 类型或内容变化，都会产生不同 fingerprint。
+身份中 canonical TTIR、pass 调序、UB 相关选项、compiler 类型或内容任一变化，都会产生不同 fingerprint。
 
 ### 7.2 Profile 文件
 
@@ -439,9 +450,16 @@ LB_bits <= ActualUBPeak_bits
 - 区分 UB、L1 等 memory scope；
 - 解析 `PLANMEM_PEAK` 和 `PLANMEM_REQUIRED`；
 - 输出机器可读 report；
+- report 记录 TTIR fixture、before-CVP snapshot 和 suffix compiler 二进制 SHA256；
 - violation 返回码 1，oracle unavailable 返回码 2，完整通过返回码 0；
 - 只在完整、零违规且存在非空证书时生成 profile candidate；
+- oracle 使用 candidate-only analyzer 入口运行未安装的候选合同链，打破“空 profile 无法认证”的循环依赖；
+- oracle 从真实 `post-TileAndBindSubBlock` stage snapshot 检测 `get_sub_block_idx`，manifest 标签本身不算 outcome 证据；
+- 严格解析配对 before-CVPipelining snapshot 中唯一的静态 1-D local allocation，先验证合同下界不超过 materialization boundary；
+- 只有 seeds `0..19`、retry、两种 outcome 均验证且 identity 唯一时才生成可安装 candidate；
+- 首个 direct-copy profile 只接受 `compile_mode=simd`、`multibuffer=false`；其他组合继续 defer；
 - 永远不自动编辑 packaged profile。
+- `--profile-candidate` 必须同时提供 `--report`，保证 profile 中的 report hash 可审计。
 
 ### 10.3 单位
 
@@ -451,11 +469,13 @@ LB_bits <= ActualUBPeak_bits
 
 ### 10.4 当前验证结果
 
-- PlanMemory parser/profile gate 单测：20 项通过；
+- PlanMemory parser/profile gate 单测：33 项通过；
 - 独立运行真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - 21 次均成功解析，fixture UB peak 均为 `32768 bits`；
-- standalone PlanMemory 运行：violations 0，unavailable 0；
-- 当前主机没有 CANN identity 环境，完整 identity-bound analyzer + PlanMemory 联合认证未完成；
+- 21 次均由真实 `post-TileAndBindSubBlock` snapshot 确认 auto-tile outcome 为 `false`；
+- 既有 standalone PlanMemory 运行：violations 0，unavailable 0；
+- 新 promotion gate 要求 suffix compiler 提供唯一的 `post-TileAndBindSubBlock` stage snapshot；缺失或歧义会明确 unavailable；
+- 当前主机已有可执行 suffix compiler，但 Python 环境不能导入 Triton，且还缺少 outcome=`true` 的配对真实 fixture，完整 identity-bound analyzer + PlanMemory 联合认证未完成；
 - 因此没有生成或安装生产 profile。
 
 ## 11. 测试与质量状态
@@ -494,6 +514,10 @@ LB_bits <= ActualUBPeak_bits
 - packaged profile 严格 schema、唯一 identity 和 oracle promotion gate；
 - profile → production registry 装载与 ordinal/id/version/options 精确匹配；
 - fail-closed `invalidate-unmodeled-stage@1` 可执行合同；
+- production/candidate analyzer API 分离，未认证 active contract 不能由生产入口装载；
+- canonical TTIR 全文 SHA256 已进入 pipeline identity；
+- 参数化 `direct-copy-preserve@1` / `direct-copy-max-tiles@1` 候选合同及严格 source-fact 校验；
+- oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
 - debug certificate dump；
@@ -518,6 +542,10 @@ Preserve/Transform 合同。因此：
 ## 13. 下一步工作
 
 ### P1：为真实 pipeline 建立第一组有效合同
+
+当前已完成候选合同实现、canonical TTIR 绑定和 oracle candidate chain；尚未完成真实认证。
+下一步应补齐 enabled/disabled 两类真实 fixture，并在具备 suffix compiler 与 Triton/CANN
+identity 的环境运行完整 promotion gate。packaged profile 在此之前必须保持为空。
 
 优先选择最小、可证明且能产生收益的路径，不要直接声明整个 pipeline Preserve。
 

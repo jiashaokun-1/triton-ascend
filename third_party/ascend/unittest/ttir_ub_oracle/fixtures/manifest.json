@@ -10,6 +10,15 @@
         "compile_mode": "simd",
         "multibuffer": false
       },
+      "contract_proposal": {
+        "expected_resource_count": 1,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 64,
+        "auto_tile_and_bind_subblock_outcome": false
+      },
       "expected_analyzer_decision": "defer"
     }
   ]

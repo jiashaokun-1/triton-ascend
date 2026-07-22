@@ -293,6 +293,7 @@ def test_pipeline_identity_is_canonical_json_and_contains_complete_payload(monke
     options = json.loads(identity["relevant_options_json"])
     assert identity.keys() == {
         "open_source_pipeline",
+        "canonical_ttir_sha256",
         "relevant_options_json",
         "target_arch",
         "triton_version",
@@ -300,6 +301,7 @@ def test_pipeline_identity_is_canonical_json_and_contains_complete_payload(monke
         "sha256",
     }
     assert identity["open_source_pipeline"] == "pass-a,pass-b"
+    assert identity["canonical_ttir_sha256"] == hashlib.sha256(b"").hexdigest()
     assert identity["target_arch"] == "Ascend910B"
     assert identity["triton_version"] == "test-triton-version"
     assert identity["cann_version_hash"] == "test-cann-hash"
@@ -307,6 +309,7 @@ def test_pipeline_identity_is_canonical_json_and_contains_complete_payload(monke
     assert identity["relevant_options_json"] == json.dumps(options, sort_keys=True, separators=(",", ":"))
     payload = {
         "cann_version_hash": "test-cann-hash",
+        "canonical_ttir_sha256": hashlib.sha256(b"").hexdigest(),
         "open_source_pipeline": "pass-a,pass-b",
         "relevant_options": options,
         "target_arch": "Ascend910B",
@@ -322,6 +325,15 @@ def test_pipeline_identity_changes_when_pass_order_changes(monkeypatch):
     metadata = _compiler_metadata()
     first = ascend_compiler._ttir_ub_pipeline_identity("pass-a,pass-b", metadata)
     second = ascend_compiler._ttir_ub_pipeline_identity("pass-b,pass-a", metadata)
+    assert first["sha256"] != second["sha256"]
+
+
+def test_pipeline_identity_changes_when_canonical_ttir_changes(monkeypatch):
+    _identity_runtime(monkeypatch)
+    metadata = _compiler_metadata()
+    first = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata, "module { // a\n}")
+    second = ascend_compiler._ttir_ub_pipeline_identity("pipeline", metadata, "module { // b\n}")
+    assert first["canonical_ttir_sha256"] != second["canonical_ttir_sha256"]
     assert first["sha256"] != second["sha256"]
 
 
@@ -1124,6 +1136,7 @@ def test_profile_loader_rejects_missing_contract_version(monkeypatch, tmp_path):
         "profiles": [{
             "pipeline_identity": {
                 "open_source_pipeline": "pipeline",
+                "canonical_ttir_sha256": hashlib.sha256(b"ttir").hexdigest(),
                 "relevant_options_json": "{}",
                 "target_arch": "Ascend910B",
                 "triton_version": "test",
@@ -1146,6 +1159,7 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
     profile_path = tmp_path / "profiles.json"
     identity = {
         "open_source_pipeline": "pipeline",
+        "canonical_ttir_sha256": hashlib.sha256(b"ttir").hexdigest(),
         "relevant_options_json": "{}",
         "target_arch": "Ascend910B",
         "triton_version": "test",
@@ -1154,6 +1168,7 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
     }
     identity["sha256"] = hashlib.sha256(json.dumps({
         "cann_version_hash": "test",
+        "canonical_ttir_sha256": identity["canonical_ttir_sha256"],
         "open_source_pipeline": "pipeline",
         "relevant_options": {},
         "target_arch": "Ascend910B",
@@ -1166,6 +1181,7 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
             "options": {},
             "contract_id": "invalidate-unmodeled-stage",
             "contract_version": "1",
+            "contract_parameters": {},
         }],
         "contract_version": "ttir-ub-lb-v1",
         "oracle_report_sha256": "0" * 64,
@@ -1180,6 +1196,78 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
     }))
     monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
     with pytest.raises(ValueError, match="duplicate packaged"):
+        load_contract_profiles()
+
+
+def _direct_copy_profile_entry(*, compile_mode="simd", multibuffer=False):
+    relevant_options = {"compile_mode": compile_mode, "multibuffer": multibuffer}
+    identity = {
+        "open_source_pipeline": "pipeline",
+        "canonical_ttir_sha256": "a" * 64,
+        "relevant_options_json": json.dumps(relevant_options, sort_keys=True, separators=(",", ":")),
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "",
+    }
+    identity["sha256"] = hashlib.sha256(json.dumps({
+        "cann_version_hash": identity["cann_version_hash"],
+        "canonical_ttir_sha256": identity["canonical_ttir_sha256"],
+        "open_source_pipeline": identity["open_source_pipeline"],
+        "relevant_options": relevant_options,
+        "target_arch": identity["target_arch"],
+        "triton_version": identity["triton_version"],
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "pipeline_identity": identity,
+        "pipeline_stages": [{
+            "stage_name": "bisheng.ub-affecting-suffix",
+            "options": {},
+            "contract_id": "direct-copy-max-tiles",
+            "contract_version": "1",
+            "contract_parameters": {
+                "expected_resource_count": "1",
+                "expected_source_elements": "65536",
+                "expected_element_bit_width": "32",
+                "expected_input_payload_bytes": "262144",
+                "max_tiles": "64",
+            },
+        }],
+        "contract_version": "ttir-ub-lb-v1",
+        "oracle_report_sha256": "b" * 64,
+        "validated_seeds": list(range(20)),
+        "retry_validated": True,
+        "auto_tile_and_bind_subblock_outcomes": [False, True],
+    }
+
+
+def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [_direct_copy_profile_entry()],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
+@pytest.mark.parametrize(
+    ("compile_mode", "multibuffer"),
+    [("simt", False), ("simd", True)],
+)
+def test_profile_loader_rejects_uncertified_direct_copy_modes(
+        monkeypatch, tmp_path, compile_mode, multibuffer):
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [_direct_copy_profile_entry(
+            compile_mode=compile_mode, multibuffer=multibuffer)],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
         load_contract_profiles()
 
 
@@ -1279,6 +1367,7 @@ def test_caller_supplied_contract_profile_cannot_enable_rejection(tmp_path):
             "compile_mode": "aiv",
             "pipeline_identity": {
                 "open_source_pipeline": "synthetic-all-preserve",
+                "canonical_ttir_sha256": hashlib.sha256(DIRECT_LOAD_COPY.encode()).hexdigest(),
                 "relevant_options_json": "{}",
                 "target_arch": "Ascend910B",
                 "triton_version": "test",
@@ -1304,6 +1393,7 @@ def test_binding_loads_exact_ordered_fail_closed_profile(tmp_path):
     module = ir.parse_mlir_module(str(source), context)
     identity = {
         "open_source_pipeline": "p0-test-pipeline",
+        "canonical_ttir_sha256": hashlib.sha256(DIRECT_LOAD_COPY.encode()).hexdigest(),
         "relevant_options_json": "{}",
         "target_arch": "Ascend910B",
         "triton_version": "test",
@@ -1337,6 +1427,147 @@ def test_binding_loads_exact_ordered_fail_closed_profile(tmp_path):
     assert result["certificates"] == []
 
 
+def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p1-direct-copy-test",
+        "canonical_ttir_sha256": hashlib.sha256(DIRECT_LOAD_COPY.encode()).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p1-direct-copy-test-identity",
+    }
+    stages = [
+        {"stage_name": "canonicalize", "options": {}},
+        {"stage_name": "ttir.triton-to-linalg", "options": {"named_ops": "true"}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    common = {
+        "expected_resource_count": "1",
+        "expected_source_elements": "65536",
+        "expected_element_bit_width": "32",
+    }
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [
+                {
+                    **stages[0],
+                    "contract_id": "direct-copy-preserve",
+                    "contract_version": "1",
+                    "contract_parameters": {
+                        **common, "expected_input_payload_bytes": "262144",
+                    },
+                },
+                {
+                    **stages[1],
+                    "contract_id": "direct-copy-max-tiles",
+                    "contract_version": "1",
+                    "contract_parameters": {
+                        **common,
+                        "expected_input_payload_bytes": "262144",
+                        "max_tiles": "64",
+                    },
+                },
+                {
+                    **stages[2],
+                    "contract_id": "direct-copy-preserve",
+                    "contract_version": "1",
+                    "contract_parameters": {
+                        **common, "expected_input_payload_bytes": "4096",
+                    },
+                },
+            ],
+        }],
+    }
+    raw_options = {
+        "arch": "Ascend910B",
+        "compile_mode": "aiv",
+        "pipeline_identity": identity,
+        "pipeline_stages": stages,
+        "contract_profile": profile,
+    }
+    production_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
+    assert production_result["decision"] == "defer"
+    assert production_result["lower_bound_bytes"] == 0
+    assert production_result["unsupported_reasons"] == ["unknown-pipeline-profile"]
+
+    result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        raw_options,
+    )
+    assert result["decision"] == "defer"
+    assert result["lower_bound_bytes"] == 4096
+    assert result["unsupported_reasons"] == []
+    assert result["certificates"] == [{"kind": "singleton", "bytes": 4096, "resource_ids": [0]}]
+
+    profile["profiles"][0].update({
+        "contract_version": "ttir-ub-lb-v1",
+        "oracle_report_sha256": "a" * 64,
+        "validated_seeds": list(range(20)),
+        "retry_validated": True,
+        "auto_tile_and_bind_subblock_outcomes": [False, True],
+    })
+    certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
+    assert certified_result["lower_bound_bytes"] == 4096
+    assert certified_result["unsupported_reasons"] == []
+
+
+def test_binding_direct_copy_contract_defers_on_parameter_drift(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p1-direct-copy-test",
+        "canonical_ttir_sha256": hashlib.sha256(DIRECT_LOAD_COPY.encode()).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p1-direct-copy-test-identity",
+    }
+    stages = [{"stage_name": "materialize", "options": {}}]
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [{
+                **stages[0],
+                "contract_id": "direct-copy-max-tiles",
+                "contract_version": "1",
+                "contract_parameters": {
+                    "expected_resource_count": "1",
+                    "expected_source_elements": "32768",
+                    "expected_element_bit_width": "32",
+                    "expected_input_payload_bytes": "131072",
+                    "max_tiles": "32",
+                },
+            }],
+        }],
+    }
+    result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend910B",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+    assert result["decision"] == "defer"
+    assert result["lower_bound_bytes"] == 0
+    assert result["unsupported_reasons"] == ["direct-copy-max-tiles"]
+
+
 def test_binding_rejects_stage_option_drift_from_profile(tmp_path):
     source = tmp_path / "direct-load.ttir"
     source.write_text(DIRECT_LOAD_COPY)
@@ -1345,6 +1576,7 @@ def test_binding_rejects_stage_option_drift_from_profile(tmp_path):
     module = ir.parse_mlir_module(str(source), context)
     identity = {
         "open_source_pipeline": "p0-test-pipeline",
+        "canonical_ttir_sha256": hashlib.sha256(DIRECT_LOAD_COPY.encode()).hexdigest(),
         "relevant_options_json": "{}",
         "target_arch": "Ascend910B",
         "triton_version": "test",

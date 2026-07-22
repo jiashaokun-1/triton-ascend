@@ -53,13 +53,20 @@ _RESULT_KEYS = frozenset({
 _CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids"})
 _PIPELINE_IDENTITY_KEYS = frozenset({
     "open_source_pipeline",
+    "canonical_ttir_sha256",
     "relevant_options_json",
     "target_arch",
     "triton_version",
     "cann_version_hash",
     "sha256",
 })
-_PROFILE_STAGE_KEYS = frozenset({"stage_name", "options", "contract_id", "contract_version"})
+_PROFILE_STAGE_KEYS = frozenset({
+    "stage_name",
+    "options",
+    "contract_id",
+    "contract_version",
+    "contract_parameters",
+})
 _PROFILE_ENTRY_KEYS = frozenset({
     "pipeline_identity",
     "pipeline_stages",
@@ -69,6 +76,41 @@ _PROFILE_ENTRY_KEYS = frozenset({
     "retry_validated",
     "auto_tile_and_bind_subblock_outcomes",
 })
+_DIRECT_COPY_PARAMETER_KEYS = frozenset({
+    "expected_resource_count",
+    "expected_source_elements",
+    "expected_element_bit_width",
+    "expected_input_payload_bytes",
+})
+
+
+def _has_positive_decimal_parameters(parameters, expected_keys):
+    return (type(parameters) is dict and set(parameters) == expected_keys
+            and all(type(value) is str and value.isdecimal() and 0 < int(value) <= _INT64_MAX
+                    for value in parameters.values()))
+
+
+def _is_valid_profile_stage(stage):
+    if type(stage) is not dict or set(stage) != _PROFILE_STAGE_KEYS:
+        return False
+    if type(stage["stage_name"]) is not str or not stage["stage_name"]:
+        return False
+    options = stage["options"]
+    if type(options) is not dict or not all(
+            type(name) is str and type(value) is str for name, value in options.items()):
+        return False
+    contract_id = stage["contract_id"]
+    contract_version = stage["contract_version"]
+    if contract_version != "1":
+        return False
+    parameters = stage["contract_parameters"]
+    if contract_id == "invalidate-unmodeled-stage":
+        return parameters == {}
+    if contract_id == "direct-copy-preserve":
+        return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
+    if contract_id == "direct-copy-max-tiles":
+        return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
+    return False
 
 
 @dataclass
@@ -124,6 +166,10 @@ def _is_valid_profile_entry(entry):
     if (type(identity) is not dict or set(identity) != _PIPELINE_IDENTITY_KEYS
             or not all(type(value) is str and value for value in identity.values())):
         return False
+    canonical_ttir_sha256 = identity["canonical_ttir_sha256"]
+    if (len(canonical_ttir_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in canonical_ttir_sha256)):
+        return False
     try:
         relevant_options = json.loads(identity["relevant_options_json"])
         if json.dumps(relevant_options, sort_keys=True, separators=(",", ":"), allow_nan=False) != \
@@ -133,6 +179,7 @@ def _is_valid_profile_entry(entry):
         return False
     identity_payload = {
         "cann_version_hash": identity["cann_version_hash"],
+        "canonical_ttir_sha256": identity["canonical_ttir_sha256"],
         "open_source_pipeline": identity["open_source_pipeline"],
         "relevant_options": relevant_options,
         "target_arch": identity["target_arch"],
@@ -144,18 +191,10 @@ def _is_valid_profile_entry(entry):
     stages = entry.get("pipeline_stages")
     if type(stages) is not list or not stages:
         return False
-    for stage in stages:
-        if type(stage) is not dict or set(stage) != _PROFILE_STAGE_KEYS:
-            return False
-        if type(stage["stage_name"]) is not str or not stage["stage_name"]:
-            return False
-        if type(stage["contract_id"]) is not str or not stage["contract_id"]:
-            return False
-        if type(stage["contract_version"]) is not str or not stage["contract_version"]:
-            return False
-        options = stage["options"]
-        if type(options) is not dict or not all(
-                type(name) is str and type(value) is str for name, value in options.items()):
+    if not all(_is_valid_profile_stage(stage) for stage in stages):
+        return False
+    if any(stage["contract_id"].startswith("direct-copy-") for stage in stages):
+        if relevant_options.get("compile_mode") != "simd" or relevant_options.get("multibuffer") is not False:
             return False
     if entry["contract_version"] != _CONTRACT_VERSION:
         return False

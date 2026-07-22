@@ -270,6 +270,8 @@ LogicalResult materializeLoad(triton::LoadOp load,
   resource.minInstances = 1;
   resource.origin = "tt.load";
   resource.kind = MaterializationKind::GMToUBLoad;
+  resource.sourceElements = resultType.getNumElements();
+  resource.elementBitWidth = resultType.getElementType().getIntOrFloatBitWidth();
   resource.contractTrace.push_back("ttir-direct-load-v1");
   if (graph.addResource(std::move(resource)) == InvalidResourceId)
     return defer(reasons, "malformed-resource-graph");

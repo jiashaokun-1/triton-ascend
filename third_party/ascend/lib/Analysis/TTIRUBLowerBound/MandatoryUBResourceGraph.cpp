@@ -157,6 +157,16 @@ LogicalResult MandatoryUBResourceGraph::lowerResourcePayload(
   return success();
 }
 
+LogicalResult MandatoryUBResourceGraph::appendResourceTrace(
+    ResourceId id, StringRef contractId) {
+  if (id >= resources_.size() || contractId.empty()) {
+    malformed_ = true;
+    return failure();
+  }
+  resources_[id].contractTrace.push_back(contractId.str());
+  return success();
+}
+
 FailureOr<LowerBoundCertificate>
 MandatoryUBResourceGraph::solveSingletonLowerBound() const {
   if (malformed_)

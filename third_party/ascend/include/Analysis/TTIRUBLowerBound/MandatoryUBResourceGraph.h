@@ -47,6 +47,8 @@ struct MandatoryUBResource {
   ValidityState validity = ValidityState::Valid;
   SmallVector<std::string> contractTrace;
   std::string invalidReason;
+  int64_t sourceElements = -1;
+  unsigned elementBitWidth = 0;
 };
 
 struct CoexistenceWitness {
@@ -79,6 +81,7 @@ public:
   void invalidate(ResourceId id, StringRef reason);
   LogicalResult lowerResourcePayload(ResourceId id, int64_t minPayloadBytes,
                                      StringRef contractId);
+  LogicalResult appendResourceTrace(ResourceId id, StringRef contractId);
   FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;
   FailureOr<LowerBoundCertificate> solveWitnessLowerBound() const;
   ArrayRef<MandatoryUBResource> resources() const;

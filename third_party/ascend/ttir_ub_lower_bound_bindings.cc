@@ -6,6 +6,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
+#include <charconv>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -32,6 +35,8 @@ PipelineIdentity parsePipelineIdentity(const py::handle &value,
   py::dict mapping = py::cast<py::dict>(value);
   identity.openSourcePipeline =
       requireString(mapping, "open_source_pipeline");
+  identity.canonicalTtirSha256 =
+      requireString(mapping, "canonical_ttir_sha256");
   identity.relevantOptionsJson =
       requireString(mapping, "relevant_options_json");
   identity.targetArch = requireString(mapping, "target_arch");
@@ -61,6 +66,7 @@ SmallVector<PipelineStageContext> parsePipelineStages(const py::handle &value) {
 
 bool sameIdentity(const PipelineIdentity &lhs, const PipelineIdentity &rhs) {
   return lhs.openSourcePipeline == rhs.openSourcePipeline &&
+         lhs.canonicalTtirSha256 == rhs.canonicalTtirSha256 &&
          lhs.relevantOptionsJson == rhs.relevantOptionsJson &&
          lhs.targetArch == rhs.targetArch &&
          lhs.tritonVersion == rhs.tritonVersion &&
@@ -89,19 +95,96 @@ parseProfileBinding(const py::handle &value) {
     binding.stage = std::move(parsedStages.front());
     binding.contractId = requireString(mapping, "contract_id");
     binding.contractVersion = requireString(mapping, "contract_version");
+    if (mapping.contains("contract_parameters")) {
+      py::dict parameters = py::cast<py::dict>(mapping["contract_parameters"]);
+      for (auto parameter : parameters)
+        binding.parameters[py::cast<std::string>(parameter.first)] =
+            py::cast<std::string>(parameter.second);
+    }
     return binding;
   } catch (const std::exception &) {
     return std::nullopt;
   }
 }
 
+bool hasExactParameters(const PipelineContractBinding &binding,
+                        ArrayRef<StringRef> names) {
+  if (binding.parameters.size() != names.size())
+    return false;
+  return llvm::all_of(names, [&](StringRef name) {
+    return binding.parameters.contains(name);
+  });
+}
+
+std::optional<int64_t> getPositiveInt64Parameter(
+    const PipelineContractBinding &binding, StringRef name) {
+  auto found = binding.parameters.find(name);
+  if (found == binding.parameters.end() || found->second.empty())
+    return std::nullopt;
+  int64_t value = 0;
+  const char *first = found->second.data();
+  const char *last = first + found->second.size();
+  auto parsed = std::from_chars(first, last, value);
+  if (parsed.ec != std::errc() || parsed.ptr != last || value <= 0)
+    return std::nullopt;
+  return value;
+}
+
+std::unique_ptr<UBResourceContract>
+makeProfileContract(const PipelineContractBinding &binding) {
+  if (binding.contractId == "invalidate-unmodeled-stage" &&
+      binding.contractVersion == "1" && binding.parameters.empty())
+    return makeInvalidateContract(binding.stage);
+
+  constexpr std::array<StringRef, 4> directCopyParameters = {
+      "expected_resource_count", "expected_source_elements",
+      "expected_element_bit_width", "expected_input_payload_bytes"};
+  const bool preserve = binding.contractId == "direct-copy-preserve" &&
+                        binding.contractVersion == "1";
+  const bool transform = binding.contractId == "direct-copy-max-tiles" &&
+                         binding.contractVersion == "1";
+  SmallVector<StringRef> expectedNames(directCopyParameters.begin(),
+                                       directCopyParameters.end());
+  if (transform)
+    expectedNames.push_back("max_tiles");
+  if ((!preserve && !transform) ||
+      !hasExactParameters(binding, expectedNames))
+    return nullptr;
+
+  auto resourceCount =
+      getPositiveInt64Parameter(binding, "expected_resource_count");
+  auto sourceElements =
+      getPositiveInt64Parameter(binding, "expected_source_elements");
+  auto elementBitWidth =
+      getPositiveInt64Parameter(binding, "expected_element_bit_width");
+  auto inputPayload =
+      getPositiveInt64Parameter(binding, "expected_input_payload_bytes");
+  if (!resourceCount || !sourceElements || !elementBitWidth ||
+      !inputPayload ||
+      *elementBitWidth > std::numeric_limits<unsigned>::max())
+    return nullptr;
+  if (preserve)
+    return makeDirectCopyPreserveContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload);
+
+  auto maxTiles = getPositiveInt64Parameter(binding, "max_tiles");
+  if (!maxTiles)
+    return nullptr;
+  return makeDirectCopyMaxTilesContract(
+      binding.stage, *resourceCount, *sourceElements,
+      static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
+}
+
 bool loadMatchingProfile(const py::handle &value,
                          const PipelineIdentity &identity,
                          ArrayRef<PipelineStageContext> actualStages,
-                         PipelineContractRegistry &registry) {
+                         PipelineContractRegistry &registry,
+                         bool allowUncertifiedActiveContracts) {
   py::dict document = py::cast<py::dict>(value);
   py::list profiles = py::cast<py::list>(document["profiles"]);
   std::optional<SmallVector<PipelineContractBinding>> matchedBindings;
+  bool matchedProfileIsCertified = false;
   for (const py::handle item : profiles) {
     try {
       if (!py::isinstance<py::dict>(item))
@@ -128,6 +211,44 @@ bool loadMatchingProfile(const py::handle &value,
         bindings.push_back(std::move(*binding));
       }
       matchedBindings = std::move(bindings);
+      try {
+        if (profile.contains("contract_version") &&
+            requireString(profile, "contract_version") == "ttir-ub-lb-v1" &&
+            profile.contains("oracle_report_sha256") &&
+            profile.contains("validated_seeds") &&
+            profile.contains("retry_validated") &&
+            profile.contains("auto_tile_and_bind_subblock_outcomes")) {
+          const std::string reportHash =
+              requireString(profile, "oracle_report_sha256");
+          py::list seeds = py::cast<py::list>(profile["validated_seeds"]);
+          py::list outcomes = py::cast<py::list>(
+              profile["auto_tile_and_bind_subblock_outcomes"]);
+          bool validHash = reportHash.size() == 64 &&
+                           llvm::all_of(reportHash, [](char character) {
+                             return (character >= '0' && character <= '9') ||
+                                    (character >= 'a' && character <= 'f');
+                           });
+          bool validSeeds = seeds.size() == 20;
+          for (size_t ordinal = 0; validSeeds && ordinal < seeds.size();
+               ++ordinal) {
+            py::handle seed = seeds[ordinal];
+            validSeeds = py::isinstance<py::int_>(seed) &&
+                         !py::isinstance<py::bool_>(seed) &&
+                         py::cast<int64_t>(seed) ==
+                             static_cast<int64_t>(ordinal);
+          }
+          const py::handle retry = profile["retry_validated"];
+          matchedProfileIsCertified =
+              validHash && validSeeds && py::isinstance<py::bool_>(retry) &&
+              py::cast<bool>(retry) &&
+              outcomes.size() == 2 &&
+              py::isinstance<py::bool_>(outcomes[0]) &&
+              py::isinstance<py::bool_>(outcomes[1]) &&
+              !py::cast<bool>(outcomes[0]) && py::cast<bool>(outcomes[1]);
+        }
+      } catch (const std::exception &) {
+        matchedProfileIsCertified = false;
+      }
     } catch (const std::exception &) {
       continue;
     }
@@ -135,16 +256,20 @@ bool loadMatchingProfile(const py::handle &value,
   if (!matchedBindings || matchedBindings->size() != actualStages.size())
     return false;
 
+  const bool containsActiveContract = llvm::any_of(
+      *matchedBindings, [](const PipelineContractBinding &binding) {
+        return binding.contractId == "direct-copy-preserve" ||
+               binding.contractId == "direct-copy-max-tiles";
+      });
+  if (containsActiveContract && !allowUncertifiedActiveContracts &&
+      !matchedProfileIsCertified)
+    return false;
+
   registry.setProfileIdentity(identity);
   for (PipelineContractBinding &binding : *matchedBindings) {
-    std::unique_ptr<UBResourceContract> contract;
-    // P0 deliberately exposes only a fail-closed production constructor.
-    // Preserve/Transform constructors must be added here only after their
-    // packaged profiles pass the oracle promotion gate.
-    if (binding.contractId == "invalidate-unmodeled-stage" &&
-        binding.contractVersion == "1")
-      contract = makeInvalidateContract(binding.stage);
-    else
+    std::unique_ptr<UBResourceContract> contract =
+        makeProfileContract(binding);
+    if (!contract)
       return false;
     if (failed(registry.addProfileContract(std::move(binding),
                                            std::move(contract))))
@@ -224,6 +349,18 @@ py::dict serializeResult(const TTIRUBAnalysisResult &analysis,
   return result;
 }
 
+py::dict runAnalysis(ModuleOp &module, const py::dict &rawOptions,
+                     bool allowUncertifiedActiveContracts) {
+  TTIRUBAnalysisOptions options = parseOptions(rawOptions);
+  PipelineContractRegistry registry;
+  loadMatchingProfile(rawOptions["contract_profile"],
+                      options.pipelineIdentity, options.stages, registry,
+                      allowUncertifiedActiveContracts);
+  TTIRUBAnalysisResult analysis =
+      analyzeTTIRUBLowerBound(module, options, registry);
+  return serializeResult(analysis, options.pipelineIdentity);
+}
+
 } // namespace
 
 void initTTIRUBLowerBoundBindings(py::module_ &module) {
@@ -236,14 +373,11 @@ void initTTIRUBLowerBoundBindings(py::module_ &module) {
 
   module.def("ttir_ub_lower_bound",
              [](ModuleOp &module, const py::dict &rawOptions) {
-               TTIRUBAnalysisOptions options = parseOptions(rawOptions);
-               PipelineContractRegistry registry;
-               loadMatchingProfile(rawOptions["contract_profile"],
-                                   options.pipelineIdentity, options.stages,
-                                   registry);
-               TTIRUBAnalysisResult analysis =
-                   analyzeTTIRUBLowerBound(module, options, registry);
-               return serializeResult(analysis, options.pipelineIdentity);
+               return runAnalysis(module, rawOptions, false);
+             });
+  module.def("ttir_ub_lower_bound_candidate_for_oracle",
+             [](ModuleOp &module, const py::dict &rawOptions) {
+               return runAnalysis(module, rawOptions, true);
              });
 }
 
