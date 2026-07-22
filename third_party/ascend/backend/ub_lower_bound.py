@@ -72,6 +72,7 @@ _PROFILE_ENTRY_KEYS = frozenset({
     "pipeline_stages",
     "contract_version",
     "oracle_report_sha256",
+    "semantic_model_sha256",
     "validated_seeds",
     "retry_validated",
     "auto_tile_and_bind_subblock_outcome",
@@ -199,8 +200,10 @@ def _is_valid_profile_entry(entry):
     if entry["contract_version"] != _CONTRACT_VERSION:
         return False
     report_sha256 = entry["oracle_report_sha256"]
-    if (type(report_sha256) is not str or len(report_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in report_sha256)):
+    semantic_model_sha256 = entry["semantic_model_sha256"]
+    if any(type(digest) is not str or len(digest) != 64
+           or any(character not in "0123456789abcdef" for character in digest)
+           for digest in (report_sha256, semantic_model_sha256)):
         return False
     if entry["validated_seeds"] != list(range(20)) or entry["retry_validated"] is not True:
         return False

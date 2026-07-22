@@ -215,11 +215,14 @@ bool loadMatchingProfile(const py::handle &value,
         if (profile.contains("contract_version") &&
             requireString(profile, "contract_version") == "ttir-ub-lb-v1" &&
             profile.contains("oracle_report_sha256") &&
+            profile.contains("semantic_model_sha256") &&
             profile.contains("validated_seeds") &&
             profile.contains("retry_validated") &&
             profile.contains("auto_tile_and_bind_subblock_outcome")) {
           const std::string reportHash =
               requireString(profile, "oracle_report_sha256");
+          const std::string semanticModelHash =
+              requireString(profile, "semantic_model_sha256");
           py::list seeds = py::cast<py::list>(profile["validated_seeds"]);
           const py::handle autoTileOutcome =
               profile["auto_tile_and_bind_subblock_outcome"];
@@ -228,6 +231,12 @@ bool loadMatchingProfile(const py::handle &value,
                              return (character >= '0' && character <= '9') ||
                                     (character >= 'a' && character <= 'f');
                            });
+          bool validSemanticModelHash =
+              semanticModelHash.size() == 64 &&
+              llvm::all_of(semanticModelHash, [](char character) {
+                return (character >= '0' && character <= '9') ||
+                       (character >= 'a' && character <= 'f');
+              });
           bool validSeeds = seeds.size() == 20;
           for (size_t ordinal = 0; validSeeds && ordinal < seeds.size();
                ++ordinal) {
@@ -239,7 +248,8 @@ bool loadMatchingProfile(const py::handle &value,
           }
           const py::handle retry = profile["retry_validated"];
           matchedProfileIsCertified =
-              validHash && validSeeds && py::isinstance<py::bool_>(retry) &&
+              validHash && validSemanticModelHash && validSeeds &&
+              py::isinstance<py::bool_>(retry) &&
               py::cast<bool>(retry) &&
               py::isinstance<py::bool_>(autoTileOutcome);
         }

@@ -416,17 +416,18 @@ kernel.ttir.ub-lower-bound.json
 
 ### 10.1 目标
 
-单元测试只能证明模型内部一致，不能替代真实 compiler 对照。oracle 同时运行：
+单元测试只能证明模型内部一致，不能替代独立语义重放和真实 compiler 对照。oracle 同时运行三条路径：
 
 ```text
-canonical TTIR ─→ lower-bound analyzer ─→ LB / certificate
-        └───────→ TTIR→HIVM→PlanMemory ─→ actual peak / overflow
+canonical TTIR ─────────→ lower-bound analyzer ─→ LB / certificate
+before-CVPipelining IR ─→ cvpipeline_ub_model ───→ replay peak / overflow
+before-CVPipelining IR ─→ real suffix compiler ──→ PlanMemory peak / overflow
 ```
 
 必须满足：
 
 ```text
-LB_bits <= ActualUBPeak_bits
+LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 ```
 
 如果 analyzer 给出 reject，则每个 seed 的真实结果必须是 UB capacity failure，不能是 L1
@@ -445,12 +446,13 @@ LB_bits <= ActualUBPeak_bits
 - 严格 manifest schema 和 fixture 路径检查；
 - manifest 不能注入 pipeline identity；
 - 调用真实 `bishengir-cvpipeline-suffix-compile`；
+- 调用独立 `cvpipeline_ub_model_cpp` 语义重放，并要求 `precision=exact`；
 - 支持固定 seed 列表和 retry seed `-1`；
 - 通过完成标记关联真实 PlanMemory attempt ID；
 - 区分 UB、L1 等 memory scope；
 - 解析 `PLANMEM_PEAK` 和 `PLANMEM_REQUIRED`；
 - 输出机器可读 report；
-- report 记录 TTIR fixture、before-CVP snapshot 和 suffix compiler 二进制 SHA256；
+- report 记录 TTIR fixture、before-CVP snapshot、suffix compiler 和 semantic model 二进制 SHA256；
 - violation 返回码 1，oracle unavailable 返回码 2，完整通过返回码 0；
 - 只在完整、零违规且存在非空证书时生成 profile candidate；
 - oracle 使用 candidate-only analyzer 入口运行未安装的候选合同链，打破“空 profile 无法认证”的循环依赖；
@@ -458,6 +460,10 @@ LB_bits <= ActualUBPeak_bits
 - 严格解析配对 before-CVPipelining snapshot 中唯一的静态 1-D local allocation，先验证合同下界不超过 materialization boundary；
 - 只有 seeds `0..19`、retry 对该精确 TTIR identity 的实际 outcome 全部验证一致，且
   identity 唯一时才生成可安装 candidate；
+- 每个 seed 上语义重放与真实 suffix compiler 的 status、overflow scope、UB peak 和 capacity
+  必须精确一致；缺失、非 exact 或不一致均禁止生成 candidate；
+- candidate 携带 `semantic_model_sha256`；Python loader 和 C++ production binding 都要求该
+  指纹是合法的小写 SHA256，避免重放模型变化后误用旧认证；
 - 首个 direct-copy profile 只接受 `compile_mode=simd`、`multibuffer=false`；其他组合继续 defer；
 - 永远不自动编辑 packaged profile。
 - `--profile-candidate` 必须同时提供 `--report`，保证 profile 中的 report hash 可审计。
@@ -471,10 +477,11 @@ LB_bits <= ActualUBPeak_bits
 ### 10.4 当前验证结果
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
-- UB/策略/oracle 聚焦 Python 测试：267 项通过；
+- UB/策略/oracle 聚焦 Python 测试：276 项通过；
 - `TestAscendTTIRUBLowerBound` 原生 C++ GTest：70 项通过；
-- 完整 identity-bound analyzer + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
-- analyzer contract LB 为 `4096 bytes`，21 次 fixture UB peak 均为 `32768 bits`，满足边界相等；
+- 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
+- analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
+  `32768 bits`，逐次精确相等，且下界不超过两者；
 - 21 次均由真实 `post-TileAndBindSubBlock` snapshot 确认 auto-tile outcome 为 `false`；
 - 联合 oracle report：violations 0，unavailable 0，并成功生成未安装的 candidate；
 - 新 promotion gate 要求 suffix compiler 提供唯一的 `post-TileAndBindSubBlock` stage snapshot；缺失或歧义会明确 unavailable；
@@ -486,10 +493,11 @@ LB_bits <= ActualUBPeak_bits
 
 本次基线已执行：
 
-- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：267 项通过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：276 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
 - 普通 C++ GTest：70 项通过；
-- 真实 suffix compiler 联合 oracle：20 seeds + retry，0 violation / 0 unavailable；
+- analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
+  0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
   - p50 `0.002542 ms`
   - p95 `0.003334 ms`
@@ -522,6 +530,8 @@ LB_bits <= ActualUBPeak_bits
 - canonical TTIR 全文 SHA256 已进入 pipeline identity；
 - 参数化 `direct-copy-preserve@1` / `direct-copy-max-tiles@1` 候选合同及严格 source-fact 校验；
 - oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
+- oracle 已接入 `cvpipeline_ub_model_cpp` exact semantic replay；promotion 要求 replay 与真实
+  PlanMemory 逐 seed 一致，并把 semantic model SHA256 写入 profile；
 - oracle promotion 要求 singleton certificate 的 bytes/resource ID 合法，且
   `contract_trace` 精确等于 source matcher 与 ordered candidate contracts；
 - C++ pybind API 与 Python 结果二次校验；
@@ -551,7 +561,7 @@ Preserve/Transform 合同。因此：
 ### P1：为真实 pipeline 建立第一组有效合同
 
 当前已完成候选合同实现、canonical TTIR 绑定、可执行 oracle candidate chain，以及本机
-精确 LLVM 下的 analyzer + PlanMemory 联合验证。下一步是在具备真实 CANN toolkit 的目标环境
+精确 LLVM 下的 analyzer + semantic replay + PlanMemory 联合验证。下一步是在具备真实 CANN toolkit 的目标环境
 重跑相同 promotion gate，使 `cann_version_hash`、NPU compiler 内容 hash、libdevice 内容 hash
 都来自待发布环境，再人工审核 candidate。`TileAndBindSubBlock` 的 true 分支属于 split MIX AIV，
 应在未来 MIX profile 的独立 identity/fixture 中认证，不再阻塞 P1 的 false-outcome profile。
@@ -690,6 +700,7 @@ python -m pytest -q --noconftest \
 python third_party/ascend/tools/ttir_ub_oracle.py \
   --manifest third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json \
   --suffix-compiler /path/to/bishengir-cvpipeline-suffix-compile \
+  --semantic-model /path/to/cvpipeline_ub_model \
   --seeds 0-19 \
   --check-retry \
   --report /tmp/ttir-ub-oracle-report.json \

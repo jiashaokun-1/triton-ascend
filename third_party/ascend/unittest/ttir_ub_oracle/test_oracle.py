@@ -28,6 +28,17 @@ PLANMEM_RUN_RESULT\tfailure
 L1_RESULT = "L1 overflow, requires 5000000 bits while 4194304 bits available!"
 
 
+def _semantic_result(seed, *, status="success", peak=1024, capacity=196608 * 8):
+    return {
+        "status": status,
+        "overflow_scope": "UB" if status == "overflow" else None,
+        "actual_peak_bits": peak,
+        "capacity_bits": capacity,
+        "selected_seed": seed if seed >= 0 else 0,
+        "returncode": 2 if status == "overflow" else 0,
+    }
+
+
 def test_planmemory_parsers_are_scope_and_attempt_specific():
     assert oracle.parse_planmemory_peak(SUCCESS, attempt=0, scope="6") == 1572864
     assert oracle.parse_completed_attempt(SUCCESS) == 0
@@ -123,6 +134,60 @@ def test_suffix_runner_rejects_missing_auto_tile_snapshot(monkeypatch, tmp_path)
     )
     with pytest.raises(oracle.OracleUnavailable, match="snapshot"):
         oracle.run_suffix_compiler(compiler, input_path, 0)
+
+
+def test_semantic_model_runner_parses_exact_result(monkeypatch, tmp_path):
+    model = tmp_path / "semantic-model"
+    model.write_text("#!/bin/sh\n", encoding="utf-8")
+    model.chmod(0o755)
+    input_path = tmp_path / "before.mlir"
+    input_path.write_text("module {}", encoding="utf-8")
+    payload = {
+        "precision": "exact",
+        "oracle": "cvpipelining_to_plan_memory",
+        "status": "success",
+        "capacity_bits": 196608 * 8,
+        "ub_peak_bits": 32768,
+        "functions": [{"status": "success", "selected_seed": 7, "ub_peak_bits": 32768}],
+    }
+
+    def run(command, **_kwargs):
+        assert f"--before-cvpipelining-ir={input_path.resolve()}" in command
+        assert "--format=json" in command
+        assert "--random-seed=7" in command
+        return oracle.subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(oracle.subprocess, "run", run)
+    assert oracle.run_semantic_model(model, input_path, 7) == {
+        "status": "success",
+        "overflow_scope": None,
+        "actual_peak_bits": 32768,
+        "capacity_bits": 196608 * 8,
+        "selected_seed": 7,
+        "returncode": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"precision": "conservative"},
+        {"oracle": "different"},
+        {"functions": [{"status": "success", "selected_seed": 8, "ub_peak_bits": 32768}]},
+    ],
+)
+def test_semantic_model_rejects_non_exact_or_wrong_seed(update):
+    payload = {
+        "precision": "exact",
+        "oracle": "cvpipelining_to_plan_memory",
+        "status": "success",
+        "capacity_bits": 196608 * 8,
+        "ub_peak_bits": 32768,
+        "functions": [{"status": "success", "selected_seed": 7, "ub_peak_bits": 32768}],
+    }
+    payload.update(update)
+    with pytest.raises(oracle.OracleUnavailable):
+        oracle.parse_semantic_model_result(payload, 7)
 
 
 def test_failure_classification_keeps_memory_scopes_distinct():
@@ -291,7 +356,8 @@ def test_evaluate_accepts_available_defer_results(tmp_path):
 
     report = oracle.evaluate(manifest, Path("compiler"), [0, 1], True, lambda _case: _analysis(), run)
     assert report["summary"] == {
-        "cases": 1, "seeds": [0, 1], "retry_checked": True, "violations": 0, "unavailable": 0
+        "cases": 1, "seeds": [0, 1], "retry_checked": True,
+        "semantic_replay_checked": False, "violations": 0, "unavailable": 0
     }
     assert [item["seed"] for item in report["cases"][0]["runs"]] == [0, 1, -1]
 
@@ -309,6 +375,32 @@ def test_evaluate_detects_invalid_lower_bound_and_reject_result(tmp_path):
     report = oracle.evaluate(manifest, Path("compiler"), [0], False, lambda _case: _analysis("reject", 256), run)
     assert {item["kind"] for item in report["violations"]} == {
         "lower-bound-exceeds-actual", "reject-without-ub-capacity-result"
+    }
+
+
+def test_evaluate_requires_semantic_replay_to_match_real_suffix(tmp_path):
+    manifest = oracle.load_manifest(_write_manifest(tmp_path))
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed, "status": "success", "overflow_scope": None,
+            "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(
+        manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run,
+        Path("semantic-model"), lambda _model, _input, seed: _semantic_result(seed),
+    )
+    assert report["summary"]["semantic_replay_checked"] is True
+    assert report["violations"] == []
+    assert report["cases"][0]["runs"][0]["semantic_replay"] == _semantic_result(0)
+
+    mismatch = oracle.evaluate(
+        manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run,
+        Path("semantic-model"), lambda _model, _input, seed: _semantic_result(seed, peak=2048),
+    )
+    assert {item["kind"] for item in mismatch["violations"]} == {
+        "semantic-replay-result-mismatch"
     }
 
 
@@ -371,12 +463,15 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
         }
         for seed in list(range(20)) + [-1]
     ]
+    for run in runs_false:
+        run["semantic_replay"] = _semantic_result(run["seed"], status="overflow", peak=4096)
     runs_true = [
         {**run, "auto_tile_and_bind_subblock_outcome": True} for run in runs_false
     ]
     report = {
         "schema": "ttir-ub-oracle-report-v1",
         "suffix_compiler_sha256": "c" * 64,
+        "semantic_model_sha256": "d" * 64,
         "cases": [
             {"name": "false", "analysis": analysis_false, "runs": runs_false},
             {"name": "true", "analysis": analysis_true, "runs": runs_true},
@@ -387,6 +482,7 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
             "cases": 2,
             "seeds": list(range(20)),
             "retry_checked": True,
+            "semantic_replay_checked": True,
             "violations": 0,
             "unavailable": 0,
         },
@@ -395,6 +491,7 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
     assert candidate["profiles"][0]["pipeline_identity"]["sha256"] == "identity"
     assert candidate["profiles"][0]["validated_seeds"] == list(range(20))
     assert candidate["profiles"][0]["retry_validated"] is True
+    assert candidate["profiles"][0]["semantic_model_sha256"] == "d" * 64
     assert [profile["auto_tile_and_bind_subblock_outcome"] for profile in candidate["profiles"]] == [
         False, True
     ]
@@ -406,6 +503,21 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
     }
     false_only_candidate = oracle.build_profile_candidate(false_only_report)
     assert false_only_candidate["profiles"][0]["auto_tile_and_bind_subblock_outcome"] is False
+
+
+def test_profile_candidate_requires_semantic_replay():
+    report = {
+        "violations": [],
+        "unavailable": [],
+        "cases": [{}],
+        "suffix_compiler_sha256": "c" * 64,
+        "summary": {
+            "cases": 1, "seeds": list(range(20)), "retry_checked": True,
+            "semantic_replay_checked": False,
+        },
+    }
+    with pytest.raises(oracle.OracleUnavailable, match="semantic replay"):
+        oracle.build_profile_candidate(report)
 
 
 @pytest.mark.parametrize(

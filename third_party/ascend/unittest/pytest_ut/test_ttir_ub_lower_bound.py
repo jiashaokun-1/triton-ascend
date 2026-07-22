@@ -1228,6 +1228,7 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
         }],
         "contract_version": "ttir-ub-lb-v1",
         "oracle_report_sha256": "0" * 64,
+        "semantic_model_sha256": "1" * 64,
         "validated_seeds": list(range(20)),
         "retry_validated": True,
         "auto_tile_and_bind_subblock_outcome": False,
@@ -1278,6 +1279,7 @@ def _direct_copy_profile_entry(*, compile_mode="simd", multibuffer=False):
         }],
         "contract_version": "ttir-ub-lb-v1",
         "oracle_report_sha256": "b" * 64,
+        "semantic_model_sha256": "c" * 64,
         "validated_seeds": list(range(20)),
         "retry_validated": True,
         "auto_tile_and_bind_subblock_outcome": False,
@@ -1294,6 +1296,24 @@ def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_pa
     profile_path.write_text(json.dumps(document))
     monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
     assert load_contract_profiles() == document
+
+
+@pytest.mark.parametrize("value", [None, "x" * 64, "A" * 64])
+def test_profile_loader_rejects_invalid_semantic_model_hash(monkeypatch, tmp_path, value):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    if value is None:
+        entry.pop("semantic_model_sha256")
+    else:
+        entry["semantic_model_sha256"] = value
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
+        load_contract_profiles()
 
 
 def test_profile_loader_rejects_non_boolean_auto_tile_outcome(monkeypatch, tmp_path):
@@ -1581,6 +1601,11 @@ def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):
         "retry_validated": True,
         "auto_tile_and_bind_subblock_outcome": False,
     })
+    missing_semantic_model_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
+    assert missing_semantic_model_result["lower_bound_bytes"] == 0
+    assert missing_semantic_model_result["unsupported_reasons"] == ["unknown-pipeline-profile"]
+
+    profile["profiles"][0]["semantic_model_sha256"] = "b" * 64
     certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
     assert certified_result["lower_bound_bytes"] == 4096
     assert certified_result["unsupported_reasons"] == []

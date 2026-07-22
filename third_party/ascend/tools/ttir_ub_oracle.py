@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare TTIR UB lower-bound certificates with real PlanMemory results."""
+"""Cross-check TTIR UB certificates, semantic replay, and real PlanMemory."""
 
 from __future__ import annotations
 
@@ -391,6 +391,73 @@ def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: fl
     return result
 
 
+def parse_semantic_model_result(payload: object, requested_seed: int) -> dict:
+    """Normalize the replay model's exact before-CVPipelining result."""
+    if type(payload) is not dict:
+        raise OracleUnavailable("semantic replay output must be a JSON object")
+    if payload.get("precision") != "exact" or payload.get("oracle") != "cvpipelining_to_plan_memory":
+        raise OracleUnavailable("semantic replay did not provide an exact CVPipeline-to-PlanMemory result")
+    status = payload.get("status")
+    if status not in ("success", "overflow"):
+        raise OracleUnavailable("semantic replay returned an unsupported status")
+    capacity_bits = payload.get("capacity_bits")
+    if type(capacity_bits) is not int or capacity_bits <= 0:
+        raise OracleUnavailable("semantic replay omitted a positive UB capacity")
+    functions = payload.get("functions")
+    if type(functions) is not list or len(functions) != 1 or type(functions[0]) is not dict:
+        raise OracleUnavailable("P1 semantic replay requires exactly one function result")
+    function = functions[0]
+    if function.get("status") != status:
+        raise OracleUnavailable("semantic replay function status disagrees with the module status")
+    selected_seed = function.get("selected_seed")
+    if type(selected_seed) is not int or not 0 <= selected_seed < 20:
+        raise OracleUnavailable("semantic replay omitted a valid selected seed")
+    if requested_seed >= 0 and selected_seed != requested_seed:
+        raise OracleUnavailable("semantic replay selected a different fixed seed")
+    peak = payload.get("ub_peak_bits") if status == "success" else payload.get("required_bits")
+    if type(peak) is not int or peak <= 0:
+        raise OracleUnavailable("semantic replay omitted a positive UB result")
+    function_peak = function.get("ub_peak_bits") if status == "success" else function.get("required_bits")
+    if function_peak != peak:
+        raise OracleUnavailable("semantic replay function result disagrees with the module result")
+    return {
+        "status": status,
+        "overflow_scope": "UB" if status == "overflow" else None,
+        "actual_peak_bits": peak,
+        "capacity_bits": capacity_bits,
+        "selected_seed": selected_seed,
+    }
+
+
+def run_semantic_model(model: Path, input_path: Path, seed: int, timeout: float = 120.0) -> dict:
+    if not model.is_file() or not os.access(model, os.X_OK):
+        raise OracleUnavailable(f"semantic replay model is not executable: {model}")
+    command = [
+        str(model.resolve()),
+        f"--before-cvpipelining-ir={input_path.resolve()}",
+        "--format=json",
+    ]
+    if seed >= 0:
+        command.append(f"--random-seed={seed}")
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise OracleUnavailable(f"semantic replay model did not complete: {error}") from error
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise OracleUnavailable("semantic replay model did not emit valid JSON") from error
+    result = parse_semantic_model_result(payload, seed)
+    expected_returncode = 0 if result["status"] == "success" else 2
+    if completed.returncode != expected_returncode:
+        raise OracleUnavailable(
+            f"semantic replay status/returncode mismatch: status={result['status']} "
+            f"returncode={completed.returncode} stderr={completed.stderr.strip()}"
+        )
+    result["returncode"] = completed.returncode
+    return result
+
+
 def analyze_case(case: dict) -> dict:
     """Run the installed analyzer using identity data derived by the real backend."""
     try:
@@ -463,12 +530,17 @@ def evaluate(
     check_retry: bool,
     analyzer: Callable[[dict], dict] = analyze_case,
     suffix_runner: Callable[[Path, Path, int], dict] = run_suffix_compiler,
+    semantic_model: Path | None = None,
+    semantic_runner: Callable[[Path, Path, int], dict] = run_semantic_model,
 ) -> dict:
     seed_list = list(seeds)
     run_seeds = seed_list + ([-1] if check_retry and -1 not in seed_list else [])
     report = {
         "schema": "ttir-ub-oracle-report-v1",
         "suffix_compiler_sha256": file_sha256(compiler) if compiler.is_file() else None,
+        "semantic_model_sha256": (
+            file_sha256(semantic_model) if semantic_model is not None and semantic_model.is_file() else None
+        ),
         "cases": [],
         "violations": [],
         "unavailable": [],
@@ -537,11 +609,43 @@ def evaluate(
                 report["violations"].append({
                     "case": case["name"], "kind": "reject-without-ub-capacity-result", "seed": seed,
                 })
+            if semantic_model is not None:
+                try:
+                    replay = semantic_runner(semantic_model, case["before_cvpipelining"], seed)
+                    actual["semantic_replay"] = replay
+                except OracleUnavailable as error:
+                    report["unavailable"].append({
+                        "case": case["name"], "phase": "semantic-replay", "seed": seed,
+                        "reason": str(error),
+                    })
+                    continue
+                expected_capacity_bits = analysis.get("capacity_bytes")
+                expected_capacity_bits = (
+                    expected_capacity_bits * 8 if type(expected_capacity_bits) is int else None
+                )
+                if replay.get("capacity_bits") != expected_capacity_bits:
+                    report["violations"].append({
+                        "case": case["name"], "kind": "semantic-replay-capacity-mismatch", "seed": seed,
+                        "expected": expected_capacity_bits, "actual": replay.get("capacity_bits"),
+                    })
+                if (replay.get("status") != actual.get("status")
+                        or replay.get("overflow_scope") != actual.get("overflow_scope")
+                        or replay.get("actual_peak_bits") != actual.get("actual_peak_bits")):
+                    report["violations"].append({
+                        "case": case["name"], "kind": "semantic-replay-result-mismatch", "seed": seed,
+                        "compiler": {
+                            "status": actual.get("status"),
+                            "overflow_scope": actual.get("overflow_scope"),
+                            "actual_peak_bits": actual.get("actual_peak_bits"),
+                        },
+                        "semantic_replay": replay,
+                    })
         report["cases"].append(case_report)
     report["summary"] = {
         "cases": len(report["cases"]),
         "seeds": seed_list,
         "retry_checked": check_retry,
+        "semantic_replay_checked": semantic_model is not None,
         "violations": len(report["violations"]),
         "unavailable": len(report["unavailable"]),
     }
@@ -560,6 +664,9 @@ def build_profile_candidate(report: dict) -> dict:
         raise OracleUnavailable("profile candidate requires seeds 0..19 and retry")
     if not _is_sha256(report.get("suffix_compiler_sha256")):
         raise OracleUnavailable("profile candidate requires the suffix compiler hash")
+    if (not report.get("summary", {}).get("semantic_replay_checked")
+            or not _is_sha256(report.get("semantic_model_sha256"))):
+        raise OracleUnavailable("profile candidate requires semantic replay validation")
     report_sha256 = hashlib.sha256(
         json.dumps(report, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
@@ -591,11 +698,29 @@ def build_profile_candidate(report: dict) -> dict:
                 run.get("auto_tile_and_bind_subblock_outcome") is not expected_outcome
                 for run in case["runs"]):
             raise OracleUnavailable("profile candidate case has unverified auto-tile outcomes")
+        expected_capacity_bits = analysis.get("capacity_bytes")
+        expected_capacity_bits = expected_capacity_bits * 8 if type(expected_capacity_bits) is int else None
+        if any(
+                type(run.get("semantic_replay")) is not dict
+                or run["semantic_replay"].get("status") != run.get("status")
+                or run["semantic_replay"].get("overflow_scope") != run.get("overflow_scope")
+                or run["semantic_replay"].get("actual_peak_bits") != run.get("actual_peak_bits")
+                or run["semantic_replay"].get("capacity_bits") != expected_capacity_bits
+                or run["semantic_replay"].get("returncode") !=
+                (2 if run.get("status") == "overflow" else 0)
+                or (run["seed"] >= 0 and
+                    run["semantic_replay"].get("selected_seed") != run["seed"])
+                or (run["seed"] == -1 and
+                    (type(run["semantic_replay"].get("selected_seed")) is not int
+                     or not 0 <= run["semantic_replay"]["selected_seed"] < 20))
+                for run in case["runs"]):
+            raise OracleUnavailable("profile candidate case lacks exact semantic replay agreement")
         profiles.append({
             "pipeline_identity": identity,
             "pipeline_stages": stages,
             "contract_version": analysis.get("contract_version"),
             "oracle_report_sha256": report_sha256,
+            "semantic_model_sha256": report["semantic_model_sha256"],
             "validated_seeds": validated_seeds,
             "retry_validated": retry_validated,
             "auto_tile_and_bind_subblock_outcome": expected_outcome,
@@ -615,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--suffix-compiler", type=Path, required=True)
+    parser.add_argument("--semantic-model", type=Path)
     parser.add_argument("--seeds", type=parse_seeds, default=parse_seeds("0-19"))
     parser.add_argument("--check-retry", action="store_true")
     parser.add_argument("--report", type=Path)
@@ -629,7 +755,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         manifest = load_manifest(arguments.manifest)
         report = evaluate(
-            manifest, arguments.suffix_compiler.resolve(), arguments.seeds, arguments.check_retry
+            manifest, arguments.suffix_compiler.resolve(), arguments.seeds, arguments.check_retry,
+            semantic_model=(arguments.semantic_model.resolve() if arguments.semantic_model else None),
         )
         if arguments.report:
             _write_json(arguments.report, report)
