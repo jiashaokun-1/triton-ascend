@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+import hashlib
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -50,6 +51,24 @@ _RESULT_KEYS = frozenset({
     "contract_version",
 })
 _CERTIFICATE_KEYS = frozenset({"kind", "bytes", "resource_ids"})
+_PIPELINE_IDENTITY_KEYS = frozenset({
+    "open_source_pipeline",
+    "relevant_options_json",
+    "target_arch",
+    "triton_version",
+    "cann_version_hash",
+    "sha256",
+})
+_PROFILE_STAGE_KEYS = frozenset({"stage_name", "options", "contract_id", "contract_version"})
+_PROFILE_ENTRY_KEYS = frozenset({
+    "pipeline_identity",
+    "pipeline_stages",
+    "contract_version",
+    "oracle_report_sha256",
+    "validated_seeds",
+    "retry_validated",
+    "auto_tile_and_bind_subblock_outcomes",
+})
 
 
 @dataclass
@@ -98,11 +117,68 @@ def _record_telemetry(mode, result):
             stats.passed_to_backend += 1
 
 
+def _is_valid_profile_entry(entry):
+    if type(entry) is not dict or set(entry) != _PROFILE_ENTRY_KEYS:
+        return False
+    identity = entry.get("pipeline_identity")
+    if (type(identity) is not dict or set(identity) != _PIPELINE_IDENTITY_KEYS
+            or not all(type(value) is str and value for value in identity.values())):
+        return False
+    try:
+        relevant_options = json.loads(identity["relevant_options_json"])
+        if json.dumps(relevant_options, sort_keys=True, separators=(",", ":"), allow_nan=False) != \
+                identity["relevant_options_json"]:
+            return False
+    except (TypeError, ValueError):
+        return False
+    identity_payload = {
+        "cann_version_hash": identity["cann_version_hash"],
+        "open_source_pipeline": identity["open_source_pipeline"],
+        "relevant_options": relevant_options,
+        "target_arch": identity["target_arch"],
+        "triton_version": identity["triton_version"],
+    }
+    encoded_identity = json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest() != identity["sha256"]:
+        return False
+    stages = entry.get("pipeline_stages")
+    if type(stages) is not list or not stages:
+        return False
+    for stage in stages:
+        if type(stage) is not dict or set(stage) != _PROFILE_STAGE_KEYS:
+            return False
+        if type(stage["stage_name"]) is not str or not stage["stage_name"]:
+            return False
+        if type(stage["contract_id"]) is not str or not stage["contract_id"]:
+            return False
+        if type(stage["contract_version"]) is not str or not stage["contract_version"]:
+            return False
+        options = stage["options"]
+        if type(options) is not dict or not all(
+                type(name) is str and type(value) is str for name, value in options.items()):
+            return False
+    if entry["contract_version"] != _CONTRACT_VERSION:
+        return False
+    report_sha256 = entry["oracle_report_sha256"]
+    if (type(report_sha256) is not str or len(report_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in report_sha256)):
+        return False
+    if entry["validated_seeds"] != list(range(20)) or entry["retry_validated"] is not True:
+        return False
+    if entry["auto_tile_and_bind_subblock_outcomes"] != [False, True]:
+        return False
+    return True
+
+
 def load_contract_profiles():
     profile = json.loads(_PROFILE_PATH.read_text(encoding="utf-8"))
+    profiles = profile.get("profiles")
     if (profile.get("schema") != "ttir-ub-lb-profile-v1" or profile.get("identity_contract") != _IDENTITY_CONTRACT
-            or not isinstance(profile.get("profiles"), list)):
+            or type(profiles) is not list or not all(_is_valid_profile_entry(entry) for entry in profiles)):
         raise ValueError("invalid packaged TTIR UB contract profile")
+    fingerprints = [entry["pipeline_identity"]["sha256"] for entry in profiles]
+    if len(fingerprints) != len(set(fingerprints)):
+        raise ValueError("duplicate packaged TTIR UB pipeline identity")
     return profile
 
 
@@ -230,12 +306,14 @@ def _record_metadata(metadata, mode, result):
     })
 
 
-def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
+def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity, pipeline_stages=None):
     mode = getattr(opt, "ub_lower_bound_mode", "off")
     if mode == "off":
         return
 
     pipeline_fingerprint = _pipeline_fingerprint(pipeline_identity)
+    if pipeline_stages is None:
+        pipeline_stages = []
     if not pipeline_fingerprint:
         result = _defer_result("", "invalid-analysis-result")
     else:
@@ -253,7 +331,7 @@ def apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity):
                         "arch": opt.arch,
                         "compile_mode": _analysis_compile_mode(opt.compile_mode),
                         "pipeline_identity": pipeline_identity,
-                        "pipeline_stages": [],
+                        "pipeline_stages": pipeline_stages,
                         "contract_profile": load_contract_profiles(),
                     },
                 )

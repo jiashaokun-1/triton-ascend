@@ -153,6 +153,7 @@ UB_AFFECTING_OPTIONS = (
 )
 TTIR_UB_DIRECT_BISHENG_PIPELINE = "direct-bisheng-ttir"
 TTIR_UB_MODULE_DERIVED_AUTO_TILE = "module-derived-both-outcomes"
+TTIR_UB_BISHENG_SUFFIX_STAGE = "bisheng.ub-affecting-suffix"
 
 # Exact closure over every long option forwarded to BiSheng by the three codegen
 # paths below. A new flag must be classified here before the identity gate can
@@ -330,7 +331,21 @@ def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict) -> dict:
     }
 
 
-def _build_ttir_to_linalg_pass_manager(mod, metadata, opt, *, named_ops=False):
+def _stage_option(value) -> str:
+    """Serialize a stage option without losing its Python type."""
+    return _canonical_json(value)
+
+
+def _record_pipeline_stage(pipeline_stages, stage_name: str, **options):
+    if pipeline_stages is None:
+        return
+    pipeline_stages.append({
+        "stage_name": stage_name,
+        "options": {name: _stage_option(value) for name, value in sorted(options.items())},
+    })
+
+
+def _build_ttir_to_linalg_pass_manager(mod, metadata, opt, *, named_ops=False, pipeline_stages=None):
     enable_nd2nz_on_vector = metadata["enable_nd2nz_on_vector"]
     enable_select_analysis = metadata["enable_select_analysis"]
     compile_on_910_95 = metadata["compile_on_910_95"]
@@ -344,28 +359,81 @@ def _build_ttir_to_linalg_pass_manager(mod, metadata, opt, *, named_ops=False):
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     ascend.passes.ttir.add_auto_blockify(pm, auto_blockify_size)
+    _record_pipeline_stage(pipeline_stages, "ttir.auto-blockify", auto_blockify_size=auto_blockify_size)
     if metadata["add_auto_scheduling"]:
         ascend.passes.ttir.add_dag_sync(pm)
+        _record_pipeline_stage(pipeline_stages, "ttir.dag-sync")
         ascend.passes.ttir.add_dag_scope(pm)
+        _record_pipeline_stage(pipeline_stages, "ttir.dag-scope")
         passes.common.add_cse(pm)
+        _record_pipeline_stage(pipeline_stages, "common.cse")
         passes.common.add_canonicalizer(pm)
+        _record_pipeline_stage(pipeline_stages, "common.canonicalizer")
         ascend.passes.ttir.add_dag_ssbuffer(pm)
+        _record_pipeline_stage(pipeline_stages, "ttir.dag-ssbuffer")
         passes.common.add_cse(pm)
+        _record_pipeline_stage(pipeline_stages, "common.cse")
         passes.common.add_canonicalizer(pm)
+        _record_pipeline_stage(pipeline_stages, "common.canonicalizer")
 
     ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+    _record_pipeline_stage(
+        pipeline_stages,
+        "ttir.triton-to-structure",
+        enable_mask_fallback_conversion=enable_mask_fallback_conversion,
+        optimize_dynamic_offset=optimize_dynamic_offset,
+    )
     ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode, enable_sync_block_lock)
+    _record_pipeline_stage(
+        pipeline_stages,
+        "ttir.discrete-mask-access-conversion",
+        compile_on_910_95=compile_on_910_95,
+        compile_mode=compile_mode,
+        enable_sync_block_lock=enable_sync_block_lock,
+    )
     ascend.passes.ttir.add_triton_to_annotation(pm)
+    _record_pipeline_stage(pipeline_stages, "ttir.triton-to-annotation")
     ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
+    _record_pipeline_stage(
+        pipeline_stages,
+        "ttir.triton-to-unstructure",
+        compile_on_910_95=compile_on_910_95,
+        compile_mode=compile_mode,
+    )
     ascend.passes.ttir.add_triton_to_hivm(pm)
+    _record_pipeline_stage(pipeline_stages, "ttir.triton-to-hivm")
     ascend.passes.ttir.add_triton_to_hfusion(pm)
+    _record_pipeline_stage(pipeline_stages, "ttir.triton-to-hfusion")
     ascend.passes.ttir.add_triton_to_llvm(pm)
+    _record_pipeline_stage(pipeline_stages, "ttir.triton-to-llvm")
     ascend.passes.ttir.add_bubble_up_operation(pm)
+    _record_pipeline_stage(pipeline_stages, "ttir.bubble-up-operation")
     ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+    _record_pipeline_stage(
+        pipeline_stages,
+        "ttir.triton-to-structure",
+        enable_mask_fallback_conversion=enable_mask_fallback_conversion,
+        optimize_dynamic_offset=optimize_dynamic_offset,
+    )
     ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
                                             compile_on_910_95, compile_mode)
+    _record_pipeline_stage(
+        pipeline_stages,
+        "ttir.triton-to-linalg",
+        use_hfusion_ops=False,
+        named_ops=named_ops,
+        enable_nd2nz_on_vector=enable_nd2nz_on_vector,
+        enable_select_analysis=enable_select_analysis,
+        compile_on_910_95=compile_on_910_95,
+        compile_mode=compile_mode,
+    )
     if metadata["enable_dynamic_cv_pipeline"]:
         ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+        _record_pipeline_stage(
+            pipeline_stages,
+            "ttir.dynamic-cv-pipeline",
+            compile_on_910_95=compile_on_910_95,
+        )
     return pm
 
 
@@ -397,16 +465,22 @@ def make_ttir(mod, metadata, opt):
         dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
 
     if getattr(opt, "ub_lower_bound_mode", "off") != "off":
+        pipeline_stages = []
         try:
             if getattr(opt, "force_simt_only", False):
                 pipeline = TTIR_UB_DIRECT_BISHENG_PIPELINE
+                _record_pipeline_stage(pipeline_stages, "bisheng.direct-ttir-pipeline")
             else:
-                future_pm = _build_ttir_to_linalg_pass_manager(mod, metadata, opt, named_ops=True)
+                future_pm = _build_ttir_to_linalg_pass_manager(
+                    mod, metadata, opt, named_ops=True, pipeline_stages=pipeline_stages
+                )
                 pipeline = future_pm.get_pipeline_str()
+                _record_pipeline_stage(pipeline_stages, TTIR_UB_BISHENG_SUFFIX_STAGE)
             pipeline_identity = _ttir_ub_pipeline_identity(pipeline, metadata)
         except Exception:
             pipeline_identity = ""
-        apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity)
+            pipeline_stages = []
+        apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity, pipeline_stages)
 
     return mod
 

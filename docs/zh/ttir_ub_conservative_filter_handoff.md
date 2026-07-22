@@ -193,8 +193,10 @@ MURG 已定义：
 
 ### 5.4 当前实现状态
 
-目前 C++ registry 中只有测试用 fixed-tile/fixed-disposition 合同。生产 registry 为空。
-这意味着合同抽象、失败策略和测试能力已经建立，但尚未安装真实 pipeline 的生产合同。
+P0 已实现 production profile → ordered registry 装载。当前生产 allowlist 中只有
+`invalidate-unmodeled-stage@1`：它用于安全验证可执行链，会使资源失效，永远不能产生
+`reject`。测试用 fixed-tile/fixed-disposition 仍不会被 production loader 接受。尚未安装
+经 oracle 认证的 Preserve/Transform 合同。
 
 ## 6. TTIR matcher 与当前建模范围
 
@@ -288,13 +290,16 @@ profiles = []
 当前 binding 会：
 
 - 解析并检查 arch、compile mode、pipeline identity 和 stage schema；
-- 检查 packaged profile 的顶层结构；
+- 按完整 identity 选择唯一 profile；
+- 按 stage ordinal、stage name、全部 options、contract ID/version 构造只读 registry；
+- 拒绝 stage 删除、增加、调序、参数漂移、重复 identity 和未知 contract；
 - 调用 C++ analyzer；
 - 把结果序列化为 Python dict。
 
-但当前 binding **不会把 profile 内容加载为生产 `PipelineContractRegistry`**，而是显式创建
-空 registry。调用方也固定传入空 `pipeline_stages`。因此即使人工向 JSON 增加候选项，
-现有代码也不能直接启用生产拒绝。这是下一阶段 P0，不应通过绕过 identity 检查解决。
+Python 不再固定传空 `pipeline_stages`。真实 PassManager builder 在添加每个 pass 的同时
+记录 stage 及类型保持的 option 字符串，并在开源 lowering 之后加入由 compiler 内容哈希
+约束的 `bisheng.ub-affecting-suffix` 原子边界。packaged profile 仍为空，因此真实编译仍会
+得到 `unknown-pipeline-profile`；这是缺少已认证合同/profile，而不是执行链未接通。
 
 ## 8. Python policy 与运行模式
 
@@ -485,6 +490,10 @@ LB_bits <= ActualUBPeak_bits
 - direct static GM→UB load/copy matcher；
 - target UB capacity 单一 C++ 数据源；
 - pipeline identity 和 UB 相关选项闭包检查；
+- 与真实 PassManager builder 同源的 ordered pipeline stage manifest；
+- packaged profile 严格 schema、唯一 identity 和 oracle promotion gate；
+- profile → production registry 装载与 ordinal/id/version/options 精确匹配；
+- fail-closed `invalidate-unmodeled-stage@1` 可执行合同；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
 - debug certificate dump；
@@ -494,7 +503,8 @@ LB_bits <= ActualUBPeak_bits
 
 ### 12.2 尚未形成生产收益的原因
 
-虽然执行链路已经接通，但当前生产 profile 为空，binding 也未加载生产合同。因此：
+虽然 P0 执行链路和 loader 已接通，但当前生产 profile 为空，且没有经认证的有效
+Preserve/Transform 合同。因此：
 
 - `off`：完全保持旧行为；
 - `shadow`：调用分析器，但真实 pipeline identity 会得到 defer；
@@ -507,23 +517,7 @@ LB_bits <= ActualUBPeak_bits
 
 ## 13. 下一步工作
 
-### P0：让生产 profile 真正可加载、可认证
-
-1. 定义最终 packaged profile item schema，至少包含：
-   - 完整 `PipelineIdentity`；
-   - 精确有序 `pipeline_stages`；
-   - 每阶段 contract ID/version/options；
-   - target、CANN/compiler 内容摘要；
-   - oracle seed/retry 认证摘要。
-2. 在 C++ binding 中严格解析 profile item，构造只读生产 `PipelineContractRegistry`。
-3. Python 根据 identity 选择唯一 profile，并把 profile 的精确 stage list 传给 binding。
-4. 拒绝重复 identity、重复 stage contract、未知 contract ID/version 和 schema 多余字段。
-5. 在真实 CANN 环境运行同一 binary identity 的 analyzer 与 PlanMemory。
-6. 只有 seeds `0..19`、retry 以及 auto-subblock enabled/disabled 两种 outcome 全部通过，
-   才人工安装 candidate。
-7. 安装后增加真实 binding 测试，证明生产 identity 能形成证书，近似 identity 必须 defer。
-
-### P0：为真实 pipeline 建立第一组合同
+### P1：为真实 pipeline 建立第一组有效合同
 
 优先选择最小、可证明且能产生收益的路径，不要直接声明整个 pipeline Preserve。
 
@@ -709,9 +703,9 @@ identity、policy、telemetry、异步过滤以及真实 PlanMemory oracle 都�
 保守失败策略。
 
 但当前版本仍是生产 profile 上线前的基础阶段。它不会对真实生产 config 给出有效
-reject，原因是生产合同尚未认证、profile 为空且 binding 尚未加载生产 registry。
+reject，原因是生产合同尚未认证且 profile 为空；P0 registry loader 已经接通。
 
-后续最重要的工作不是继续放宽 matcher，而是先完成 P0：在真实 CANN/compiler identity
-环境中建立第一条端到端可认证 pipeline contract，严格加载 profile，并用逐 seed
+后续最重要的工作不是继续放宽 matcher，而是完成 P1：在真实 CANN/compiler identity
+环境中建立第一条端到端可认证 materialization/tiling contract，并用逐 seed
 PlanMemory 证明该 profile 可以启用。完成这一步后，`enforce` 才真正开始产生早期过滤
 收益。

@@ -84,8 +84,14 @@ protected:
   TTIRUBLowerBoundAnalysisTest() {
     context.loadDialect<arith::ArithDialect, scf::SCFDialect,
                         triton::TritonDialect>();
-    registry.addForTesting(std::make_unique<FixedDispositionContract>(
-        "preserve", ContractDisposition::Preserve));
+    TTIRUBAnalysisOptions analysisOptions = options();
+    registry.setProfileIdentity(analysisOptions.pipelineIdentity);
+    EXPECT_TRUE(succeeded(registry.addProfileContract(
+        {.stage = {.stageName = "preserve"},
+         .contractId = "fixed-disposition",
+         .contractVersion = "1"},
+        std::make_unique<FixedDispositionContract>(
+            "preserve", ContractDisposition::Preserve))));
   }
 
   OwningOpRef<ModuleOp> parse(StringRef source = kDirectLoadCopy) {
@@ -858,8 +864,9 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, InvalidSSAPlacementDefersAsMalformedIR) {
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,
        RegistryExposesExactSyntheticContractProfile) {
-  EXPECT_TRUE(registry.hasExactlyOneMatchingContract(
-      {.stageName = "preserve"}, "fixed-disposition", "1"));
+  TTIRUBAnalysisOptions analysisOptions = options();
+  EXPECT_TRUE(registry.matchesProfile(analysisOptions.pipelineIdentity,
+                                      analysisOptions.stages));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest, OmittedStageDefersAsUnknownProfile) {
@@ -914,12 +921,18 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, StageOptionsDeferAsUnknownProfile) {
 
 TEST_F(TTIRUBLowerBoundAnalysisTest, ContractIdMismatchDefersAsUnknownProfile) {
   PipelineContractRegistry mismatchedRegistry;
-  mismatchedRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
-      "preserve", ContractDisposition::Preserve, "other", "1"));
+  TTIRUBAnalysisOptions analysisOptions = options();
+  mismatchedRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  EXPECT_TRUE(failed(mismatchedRegistry.addProfileContract(
+      {.stage = {.stageName = "preserve"},
+       .contractId = "fixed-disposition",
+       .contractVersion = "1"},
+      std::make_unique<FixedDispositionContract>(
+          "preserve", ContractDisposition::Preserve, "other", "1"))));
   OwningOpRef<ModuleOp> module = parse();
   ASSERT_TRUE(module);
-  TTIRUBAnalysisResult result =
-      analyzeTTIRUBLowerBound(*module, options(), mismatchedRegistry);
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, mismatchedRegistry);
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
 }
@@ -927,12 +940,19 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, ContractIdMismatchDefersAsUnknownProfile) {
 TEST_F(TTIRUBLowerBoundAnalysisTest,
        ContractVersionMismatchDefersAsUnknownProfile) {
   PipelineContractRegistry mismatchedRegistry;
-  mismatchedRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
-      "preserve", ContractDisposition::Preserve, "fixed-disposition", "2"));
+  TTIRUBAnalysisOptions analysisOptions = options();
+  mismatchedRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  EXPECT_TRUE(failed(mismatchedRegistry.addProfileContract(
+      {.stage = {.stageName = "preserve"},
+       .contractId = "fixed-disposition",
+       .contractVersion = "1"},
+      std::make_unique<FixedDispositionContract>(
+          "preserve", ContractDisposition::Preserve, "fixed-disposition",
+          "2"))));
   OwningOpRef<ModuleOp> module = parse();
   ASSERT_TRUE(module);
-  TTIRUBAnalysisResult result =
-      analyzeTTIRUBLowerBound(*module, options(), mismatchedRegistry);
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, mismatchedRegistry);
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
 }
@@ -940,14 +960,24 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
 TEST_F(TTIRUBLowerBoundAnalysisTest,
        DuplicateContractsDeferAsUnknownProfile) {
   PipelineContractRegistry duplicateRegistry;
-  duplicateRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
-      "preserve", ContractDisposition::Preserve));
-  duplicateRegistry.addForTesting(std::make_unique<FixedDispositionContract>(
-      "preserve", ContractDisposition::Preserve));
+  TTIRUBAnalysisOptions analysisOptions = options();
+  duplicateRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  EXPECT_TRUE(succeeded(duplicateRegistry.addProfileContract(
+      {.stage = {.stageName = "preserve"},
+       .contractId = "fixed-disposition",
+       .contractVersion = "1"},
+      std::make_unique<FixedDispositionContract>(
+          "preserve", ContractDisposition::Preserve))));
+  EXPECT_TRUE(succeeded(duplicateRegistry.addProfileContract(
+      {.stage = {.stageName = "preserve"},
+       .contractId = "fixed-disposition",
+       .contractVersion = "1"},
+      std::make_unique<FixedDispositionContract>(
+          "preserve", ContractDisposition::Preserve))));
   OwningOpRef<ModuleOp> module = parse();
   ASSERT_TRUE(module);
-  TTIRUBAnalysisResult result =
-      analyzeTTIRUBLowerBound(*module, options(), duplicateRegistry);
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, duplicateRegistry);
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unknown-pipeline-profile"));
 }

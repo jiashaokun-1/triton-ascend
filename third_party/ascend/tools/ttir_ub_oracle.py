@@ -210,16 +210,6 @@ def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: fl
     return result
 
 
-def _profile_stages(profile: dict, pipeline_identity: dict) -> list[dict]:
-    fingerprint = pipeline_identity.get("sha256")
-    for item in profile.get("profiles", []):
-        identity = item.get("pipeline_identity", {}) if type(item) is dict else {}
-        if type(identity) is dict and identity.get("sha256") == fingerprint:
-            stages = item.get("pipeline_stages", [])
-            return stages if type(stages) is list else []
-    return []
-
-
 def analyze_case(case: dict) -> dict:
     """Run the installed analyzer using identity data derived by the real backend."""
     try:
@@ -244,8 +234,13 @@ def analyze_case(case: dict) -> dict:
         # The pybind Module wrapper does not expose its context on every
         # supported build.  Pipeline construction only needs that context, so
         # use the context that parsed this exact module.
+        pipeline_stages = []
         pipeline = ascend_compiler._build_ttir_to_linalg_pass_manager(
-            SimpleNamespace(context=context), metadata, options, named_ops=True
+            SimpleNamespace(context=context), metadata, options, named_ops=True,
+            pipeline_stages=pipeline_stages,
+        )
+        ascend_compiler._record_pipeline_stage(
+            pipeline_stages, ascend_compiler.TTIR_UB_BISHENG_SUFFIX_STAGE
         )
         identity = ascend_compiler._ttir_ub_pipeline_identity(pipeline.get_pipeline_str(), metadata)
         profile = load_contract_profiles()
@@ -255,7 +250,7 @@ def analyze_case(case: dict) -> dict:
                 "arch": case["arch"],
                 "compile_mode": "aiv" if options.compile_mode == "simd" else options.compile_mode,
                 "pipeline_identity": identity,
-                "pipeline_stages": _profile_stages(profile, identity),
+                "pipeline_stages": pipeline_stages,
                 "contract_profile": profile,
             },
         )

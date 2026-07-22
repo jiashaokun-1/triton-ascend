@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TTIR UB 保守建模：行业方法、LLVM TTI 与全量方案</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #59657a;
+      --line: #d9dfeb;
+      --paper: #ffffff;
+      --page: #eef2f7;
+      --navy: #123a67;
+      --blue: #1d6fd8;
+      --blue-soft: #eaf3ff;
+      --green: #147d64;
+      --green-soft: #e7f6f1;
+      --amber: #a45b05;
+      --amber-soft: #fff3df;
+      --red: #b43b40;
+      --red-soft: #ffebec;
+      --violet: #6548b5;
+      --violet-soft: #f0ebff;
+      --shadow: 0 12px 34px rgba(23, 32, 51, .10);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--page);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.62;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    .shell { display: grid; grid-template-columns: 250px minmax(0, 1120px); gap: 28px; justify-content: center; padding: 26px; }
+    .toc {
+      position: sticky; top: 20px; align-self: start; max-height: calc(100vh - 40px); overflow: auto;
+      background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 18px; box-shadow: var(--shadow);
+    }
+    .toc h2 { margin: 0 0 10px; font-size: 15px; color: var(--navy); }
+    .toc a { display: block; padding: 6px 8px; color: var(--muted); border-left: 2px solid transparent; font-size: 13px; }
+    .toc a:hover { color: var(--blue); border-left-color: var(--blue); text-decoration: none; background: var(--blue-soft); }
+    .toc .print { width: 100%; margin-top: 14px; border: 0; border-radius: 9px; padding: 9px 12px; background: var(--navy); color: white; cursor: pointer; }
+    main { min-width: 0; }
+    .sheet {
+      background: var(--paper); border: 1px solid var(--line); border-radius: 18px; padding: 42px 48px; margin-bottom: 24px; box-shadow: var(--shadow);
+    }
+    .hero { padding-top: 54px; background: linear-gradient(135deg, #fff 0%, #f5f9ff 58%, #eaf3ff 100%); }
+    .eyebrow { color: var(--blue); font-weight: 700; letter-spacing: .08em; font-size: 13px; text-transform: uppercase; }
+    h1 { font-size: 38px; line-height: 1.18; color: var(--navy); margin: 12px 0 16px; }
+    h2 { font-size: 27px; line-height: 1.25; color: var(--navy); margin: 0 0 20px; }
+    h3 { font-size: 19px; color: var(--navy); margin: 26px 0 10px; }
+    h4 { font-size: 16px; margin: 20px 0 8px; }
+    p { margin: 8px 0 12px; }
+    .lead { font-size: 19px; color: #33435d; max-width: 900px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; color: var(--muted); font-size: 13px; }
+    .pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 5px 10px; background: #fff; border: 1px solid var(--line); }
+    .callout { border-left: 5px solid var(--blue); background: var(--blue-soft); padding: 14px 18px; border-radius: 10px; margin: 16px 0; }
+    .callout.green { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.amber { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.red { border-left-color: var(--red); background: var(--red-soft); }
+    .grid-2, .grid-3, .grid-4 { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card { border: 1px solid var(--line); border-radius: 14px; padding: 18px; background: #fff; }
+    .card h3, .card h4 { margin-top: 0; }
+    .card.blue { background: var(--blue-soft); border-color: #c8ddfb; }
+    .card.green { background: var(--green-soft); border-color: #bee7da; }
+    .card.amber { background: var(--amber-soft); border-color: #f2d7ac; }
+    .card.violet { background: var(--violet-soft); border-color: #d9cef9; }
+    .tag { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; margin-bottom: 8px; }
+    .tag.fact { color: var(--green); background: var(--green-soft); }
+    .tag.target { color: var(--blue); background: var(--blue-soft); }
+    .tag.gap { color: var(--red); background: var(--red-soft); }
+    .tag.plan { color: var(--violet); background: var(--violet-soft); }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0 20px; font-size: 14px; }
+    th, td { text-align: left; vertical-align: top; padding: 11px 12px; border-bottom: 1px solid var(--line); }
+    th { color: var(--navy); background: #f5f7fb; font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+    .table-wrap table { margin: 0; min-width: 760px; }
+    ul, ol { margin: 8px 0 12px; padding-left: 22px; }
+    li { margin: 4px 0; }
+    .flow { display: flex; align-items: stretch; gap: 9px; margin: 18px 0; overflow-x: auto; padding-bottom: 4px; }
+    .flow .node { min-width: 150px; flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 13px; background: #fff; }
+    .flow .node strong { display: block; color: var(--navy); margin-bottom: 4px; }
+    .flow .arrow { align-self: center; color: var(--blue); font-size: 23px; font-weight: 700; }
+    .formula { padding: 14px 16px; background: #111a2c; color: #f4f7fb; border-radius: 12px; font-family: "SFMono-Regular", Consolas, monospace; overflow-x: auto; }
+    .architecture { border: 1px solid var(--line); border-radius: 16px; padding: 20px; background: #f9fbfe; }
+    .lane { display: grid; grid-template-columns: 190px 1fr; gap: 14px; margin: 10px 0; align-items: stretch; }
+    .lane-label { border-radius: 10px; padding: 13px; font-weight: 700; color: white; background: var(--navy); }
+    .lane-body { border: 1px solid var(--line); border-radius: 10px; padding: 13px; background: white; }
+    .contract { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) 110px; gap: 14px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .contract > * { min-width: 0; }
+    .contract:last-child { border-bottom: 0; }
+    .contract code { color: var(--violet); font-weight: 700; overflow-wrap: anywhere; word-break: break-word; }
+    .status { font-size: 12px; font-weight: 700; border-radius: 999px; padding: 3px 8px; justify-self: start; }
+    .status.now { color: var(--green); background: var(--green-soft); }
+    .status.todo { color: var(--amber); background: var(--amber-soft); }
+    .status.test { color: var(--violet); background: var(--violet-soft); }
+    .timeline { position: relative; margin-left: 14px; padding-left: 28px; border-left: 3px solid #cbd7e8; }
+    .phase { position: relative; margin-bottom: 22px; }
+    .phase::before { content: ""; position: absolute; left: -37px; top: 5px; width: 15px; height: 15px; border-radius: 50%; background: var(--blue); border: 3px solid white; box-shadow: 0 0 0 2px var(--blue); }
+    .phase h3 { margin: 0 0 4px; }
+    .small { color: var(--muted); font-size: 13px; }
+    .sources li { margin-bottom: 7px; }
+    .footer { color: var(--muted); font-size: 12px; text-align: center; margin: 18px 0 4px; }
+    @media (max-width: 1000px) {
+      .shell { grid-template-columns: 1fr; padding: 14px; }
+      .toc { position: static; max-height: none; }
+      .grid-3, .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .contract { grid-template-columns: 1fr; }
+      .lane { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 650px) {
+      .sheet { padding: 28px 20px; border-radius: 12px; }
+      h1 { font-size: 30px; }
+      h2 { font-size: 23px; }
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      .flow { flex-direction: column; }
+      .flow .arrow { transform: rotate(90deg); align-self: center; }
+    }
+    @media print {
+      @page { size: A4; margin: 13mm; }
+      body { background: white; font-size: 10.5pt; }
+      .shell { display: block; padding: 0; }
+      .toc { display: none; }
+      .sheet { border: 0; box-shadow: none; border-radius: 0; padding: 0; margin: 0; break-after: page; }
+      .sheet:last-child { break-after: auto; }
+      .hero { min-height: 250mm; padding-top: 45mm; }
+      .card, .callout, .architecture, .table-wrap { break-inside: avoid; }
+      a { color: inherit; }
+      .flow { overflow: visible; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav class="toc" aria-label="目录">
+      <h2>汇报目录</h2>
+      <a href="#summary">0. 结论先行</a>
+      <a href="#modeling">1. 编译器建模三分类</a>
+      <a href="#tti">2. LLVM TTI 是什么</a>
+      <a href="#tti-impl">3. LLVM TTI 如何实现</a>
+      <a href="#position">4. 我们的方案定位</a>
+      <a href="#architecture">5. 整体架构</a>
+      <a href="#identity">6. PipelineIdentity</a>
+      <a href="#murg">7. Matcher 与 MURG</a>
+      <a href="#operations">8. Operation 全量覆盖</a>
+      <a href="#contracts">9. Contract 全量清单</a>
+      <a href="#solver">10. 下界与证书</a>
+      <a href="#status">11. 当前实现状态</a>
+      <a href="#plan">12. 落地计划</a>
+      <a href="#risks">13. 风险与验收</a>
+      <a href="#sources">14. 参考资料</a>
+      <button class="print" type="button" onclick="window.print()">打印 / 导出 PDF</button>
+    </nav>
+
+    <main>
+      <section class="sheet hero" id="summary">
+        <div class="eyebrow">Triton-Ascend · UB Early Pruning</div>
+        <h1>TTIR UB 保守建模<br>行业方法、LLVM TTI 与全量落地方案</h1>
+        <p class="lead">目标不是预测完整 UB peak，而是在 canonical TTIR 阶段构造一条可审计的下界证据链：只有证据链得到的 UB 下界严格超过目标芯片容量，才提前淘汰 autotune config。</p>
+        <div class="callout green">
+          <strong>一句话方案：</strong>每个 config 生成一份完整 TTIR；用 matcher 提取“必然 UB 物化”的资源；用与真实 pipeline 绑定的 <span class="mono">UBResourceContract</span> 逐阶段传递资源下界；最终生成 certificate，并与硬件容量比较。
+        </div>
+        <div class="grid-3">
+          <div class="card blue"><h3>模型定位</h3><p>以抽象解释/语义事实传播为主，辅以解析公式；不是统计回归，也不是完整后端模拟器。</p></div>
+          <div class="card violet"><h3>核心资产</h3><p><span class="mono">MURG</span> 保存资源下界事实；<span class="mono">UBResourceContract</span> 负责逐 lowering stage 更新这些事实。</p></div>
+          <div class="card amber"><h3>当前事实</h3><p>P0 可执行合同链已接通，direct-copy matcher 已实现；但 packaged profile 仍为空，且尚无经 oracle 认证的 Preserve/Transform 合同，所以真实运行仍会安全 <span class="mono">defer</span>。</p></div>
+        </div>
+        <div class="meta">
+          <span class="pill">分支：codex/ttir-ub-conservative-filter</span>
+          <span class="pill">日期：2026-07-22</span>
+          <span class="pill">策略：fail-open / zero false rejection</span>
+        </div>
+      </section>
+
+      <section class="sheet" id="modeling">
+        <h2>1. 编译器领域的三类建模</h2>
+        <p>“建模”不是特指机器学习。一个模型通常包含四部分：现实对象、关注的可观测量、被省略的状态、从输入推导目标性质的规则。编译器领域常见三类方法：</p>
+        <div class="grid-3">
+          <article class="card blue">
+            <h3>Analytical / Formula Model</h3>
+            <p><strong>做法：</strong>根据 workload shape、循环、mapping 和硬件参数，用闭式公式或组合算法计算 working set、访存、性能或能耗。</p>
+            <p><strong>典型：</strong>Timeloop 对 tensor algebra mapping 和分层存储 working set 做快速解析建模。</p>
+            <p><strong>优势：</strong>快、可解释、适合大规模设计空间搜索。</p>
+            <p><strong>限制：</strong>公式适用条件必须明确；复杂 compiler rewrite 容易使公式失真。</p>
+          </article>
+          <article class="card violet">
+            <h3>Cost Model</h3>
+            <p><strong>做法：</strong>对候选 IR 操作或 transformation 返回 target-aware cost，供 vectorization、unrolling、inlining 等优化比较方案。</p>
+            <p><strong>典型：</strong>LLVM <span class="mono">TargetTransformInfo</span>。</p>
+            <p><strong>优势：</strong>接口稳定、查询粒度细、易嵌入优化决策。</p>
+            <p><strong>限制：</strong>通常是相对代价或估计，不是资源安全证明。</p>
+          </article>
+          <article class="card green">
+            <h3>Semantic Model / Simulator</h3>
+            <p><strong>做法：</strong>在简化状态空间中执行语义或事件规则，传播状态并观察最终性质。</p>
+            <p><strong>典型：</strong>抽象解释、数据流分析；更详细的一端是 gem5 的事件驱动系统模拟。</p>
+            <p><strong>优势：</strong>能表达 alias、liveness、control flow 和阶段性状态变化。</p>
+            <p><strong>限制：</strong>状态越细，复杂度和维护成本越高。</p>
+          </article>
+        </div>
+        <div class="callout">
+          <strong>我们的定位：</strong>不是 TTI 式“某个 op 大概多贵”，也不是 gem5/PlanMemory 的完整重放；而是一个保守的 abstract resource interpretation：MURG 是抽象状态，contracts 是 transfer functions，公式只用于 shape bytes、tile 下界和资源求和。
+        </div>
+      </section>
+
+      <section class="sheet" id="tti">
+        <h2>2. LLVM TargetTransformInfo 是什么</h2>
+        <p><span class="mono">TargetTransformInfo</span>（TTI）是 LLVM 中连接“目标无关 IR 优化”与“目标相关 codegen 信息”的查询接口。IR pass 不需要执行完整机器码生成，就可以询问目标后端：</p>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Cost queries</h3>
+            <ul>
+              <li><span class="mono">getInstructionCost</span></li>
+              <li><span class="mono">getArithmeticInstrCost</span></li>
+              <li><span class="mono">getMemoryOpCost</span></li>
+              <li><span class="mono">getCastInstrCost</span></li>
+              <li><span class="mono">getCmpSelInstrCost</span></li>
+              <li><span class="mono">getIntrinsicInstrCost</span></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Legality / preference queries</h3>
+            <ul>
+              <li>vector width、register width、legalization cost</li>
+              <li>unrolling / peeling preferences</li>
+              <li>masked/interleaved memory access legality</li>
+              <li>address-space alias capability</li>
+              <li>hardware-loop、reduction、intrinsic 能力</li>
+            </ul>
+          </div>
+        </div>
+        <p>Cost 通过 <span class="mono">InstructionCost</span> 返回，并区分 reciprocal throughput、latency、code size、size-and-latency 等 <span class="mono">TargetCostKind</span>。这些值用于比较 transformation 是否值得做，不是“最终机器程序一定耗费多少周期”的证明。</p>
+        <div class="flow">
+          <div class="node"><strong>IR optimization</strong>LoopVectorize / SLP / Unroll 等准备多个候选</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>TTI query</strong>询问每个候选在当前 target/subtarget 的代价与合法性</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Decision</strong>比较 scalar/vector、不同 VF 或 transformation 方案</div>
+        </div>
+        <div class="callout amber"><strong>关键区别：</strong>TTI 的主要任务是“优化收益决策”；我们的 UB 模型的任务是“形成可用于 hard rejection 的安全下界”。前者允许近似，后者不能高估。</div>
+      </section>
+
+      <section class="sheet" id="tti-impl">
+        <h2>3. LLVM TTI 如何实现</h2>
+        <div class="architecture">
+          <div class="lane"><div class="lane-label">Consumer</div><div class="lane-body">目标无关优化 pass 从 FunctionAnalysisManager 获取 <span class="mono">TargetIRAnalysis</span> 的结果，并调用统一的 <span class="mono">TargetTransformInfo</span> API。</div></div>
+          <div class="lane"><div class="lane-label">Facade / type erasure</div><div class="lane-body"><span class="mono">TargetTransformInfo</span> 持有实现对象，通过统一接口转发查询；调用方不依赖 X86/AArch64 等具体类型。</div></div>
+          <div class="lane"><div class="lane-label">Generic fallback</div><div class="lane-body"><span class="mono">TargetTransformInfoImplBase</span>、<span class="mono">TargetTransformInfoImplCRTPBase&lt;T&gt;</span> 与 <span class="mono">BasicTTIImplBase&lt;T&gt;</span> 提供 DataLayout、type legalization 和通用默认实现。</div></div>
+          <div class="lane"><div class="lane-label">Target implementation</div><div class="lane-body"><span class="mono">AArch64TTIImpl</span>、<span class="mono">X86TTIImpl</span> 等只覆盖需要更精确 target knowledge 的 hooks，其余回退到 base。</div></div>
+          <div class="lane"><div class="lane-label">Target knowledge</div><div class="lane-body">Subtarget features、TargetLowering、legal type/action、scheduler model、指令 cost tables、ISA 特殊模式。</div></div>
+        </div>
+        <h3>典型调用链</h3>
+        <div class="formula">Optimization Pass
+  → FAM.getResult&lt;TargetIRAnalysis&gt;(Function)
+  → TargetTransformInfo::get*Cost(...)
+  → target-specific TTIImpl override
+  → generic BasicTTI fallback when not overridden
+  → InstructionCost / legality / preference</div>
+        <h3>值得借鉴的工程模式</h3>
+        <div class="grid-3">
+          <div class="card"><h4>Stable query facade</h4><p>优化 pass 面向稳定接口，不直接依赖具体 target 实现。</p></div>
+          <div class="card"><h4>Generic + target overrides</h4><p>通用规则集中复用，目标后端只覆盖差异。</p></div>
+          <div class="card"><h4>Invalid / unknown handling</h4><p>无法可靠定价时返回 invalid 或保守默认，调用方决定回退。</p></div>
+        </div>
+        <div class="callout green"><strong>对我们的启发：</strong>可以把 UB 分析也设计为稳定 query facade + generic MURG solver + pipeline/target-specific contract implementation；但必须保留“未知即 defer”，不能照搬 cost model 的近似策略。</div>
+      </section>
+
+      <section class="sheet" id="position">
+        <h2>4. 我们的方案属于哪一类模型</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>维度</th><th>LLVM TTI</th><th>Timeloop</th><th>gem5</th><th>TTIR UB Lower-Bound Model</th></tr></thead>
+          <tbody>
+            <tr><td>主要类型</td><td>Cost model</td><td>Analytical model</td><td>Detailed simulator</td><td>Abstract resource interpretation + analytical transfer</td></tr>
+            <tr><td>输入</td><td>IR op/type + target</td><td>workload/mapping/architecture</td><td>程序 + 系统配置</td><td>完整 canonical TTIR + config + pipeline identity</td></tr>
+            <tr><td>输出</td><td>相对 cost / legality</td><td>working set / traffic / perf / energy</td><td>事件级统计</td><td>UB peak 的可证明下界 + certificate</td></tr>
+            <tr><td>是否执行完整后端</td><td>否</td><td>否</td><td>模拟执行</td><td>否</td></tr>
+            <tr><td>可否 hard reject</td><td>通常不用于资源安全证明</td><td>取决于公式合同</td><td>可作为详细 oracle</td><td>只有 LB &gt; capacity 才 reject</td></tr>
+            <tr><td>未知处理</td><td>fallback / invalid cost</td><td>模型外</td><td>缺少组件则无法模拟</td><td>defer，继续真实编译</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout"><strong>不是“operation → identity → 查 UB 使用率表”。</strong>真实流程是：identity 只选择一套已认证 contracts；资源字节数由 TTIR shape 和 contracts 现场计算；表中只保存 profile/contract 绑定以及硬件容量。</div>
+      </section>
+
+      <section class="sheet" id="architecture">
+        <h2>5. 整体建模架构</h2>
+        <div class="flow">
+          <div class="node"><strong>1. Per-config TTIR</strong>完整 ModuleOp；constexpr tile 已实例化</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>2. PipelineIdentity</strong>真实 pass 顺序、选项、target、版本、compiler hash</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>3. Source Matcher</strong>按 SSA 子图识别受支持语义模式</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>4. MURG</strong>资源下界证据图：记录“至少需要多少”的事实及其来源</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>5. Contract Chain</strong>逐 stage Preserve / Transform / Invalidate</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>6. Solver</strong>singleton / coexistence 下界与 certificate</div>
+        </div>
+        <div class="grid-2">
+          <div class="card green">
+            <h3>正确性合同</h3>
+            <div class="formula">LB(config) ≤ ActualUBPeak(config)
+
+Reject ⇔ Proven(LB) ∧ LB &gt; Capacity(target)</div>
+          </div>
+          <div class="card amber">
+            <h3>失败封闭</h3>
+            <p>未知 op、dynamic shape、unknown target、identity mismatch、缺失 contract、算术溢出、alias/lifetime 不确定，全部返回 <span class="mono">defer</span>。</p>
+          </div>
+        </div>
+        <h3>对象粒度</h3>
+        <div class="formula">one autotune config
+  └─ one canonical TTIR ModuleOp
+      ├─ one PipelineIdentity value (may equal another config's value)
+      └─ one MURG
+          └─ zero or more resources from supported operation patterns</div>
+      </section>
+
+      <section class="sheet" id="identity">
+        <h2>6. PipelineIdentity 与 profile 的真实作用</h2>
+        <p><span class="mono">PipelineIdentity</span> 不记录 TTIR 文本，也不计算 UB。它是“合同适用环境的指纹”。当前代码从与真实编译相同的 PassManager builder 调用 <span class="mono">get_pipeline_str()</span>，并加入影响 UB 的选项、target、Triton/CANN 版本、实际 NPU compiler 类型与文件内容 SHA256。</p>
+        <div class="flow">
+          <div class="node"><strong>Validated pipeline P1</strong>固定 pass 顺序、参数、target 和 compiler 版本</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Profile P1</strong>记录每个 stage 应使用的 contract id/version</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Current compile</strong>重新计算 identity；完全相等才允许装载 P1 contracts</div>
+        </div>
+        <div class="grid-2">
+          <div class="card blue"><h3>Identity 命中</h3><p>当前 pipeline 与验证环境一致，按 profile 顺序应用 contracts。</p></div>
+          <div class="card amber"><h3>Identity 不命中</h3><p>可能有 pass/参数/版本漂移，旧 contracts 禁止复用，立即 defer。</p></div>
+        </div>
+        <div class="callout green"><strong>P0 已接通：</strong>共享 PassManager builder 在添加 pass 时同步记录有序 <span class="mono">pipeline_stages</span> 及类型保持的 options；binding 可按完整 identity、stage ordinal、options、contract id/version 把 profile 装载成只读 registry。packaged profiles 仍为空，因此尚不会启用真实 reject。</div>
+      </section>
+
+      <section class="sheet" id="murg">
+        <h2>7. Matcher 与 MURG：如何从完整 TTIR 得到资源</h2>
+        <p>matcher 遍历完整 ModuleOp，并沿 SSA use-def graph 匹配语义子图；不是按文本行切割，也不是每个 operation 都生成资源。</p>
+        <div class="callout blue"><strong>“证明”不是定理证明器。</strong>这里更准确的说法是<strong>可审计的下界证据链</strong>：matcher 先提出一个带前置条件的资源事实，后续每个 stage 要么确认该事实仍成立，要么把它保守地改小，要么宣布无法继续保证并 Invalidate。只有证据链没有断，solver 才能使用这个资源。MURG 因而也可以直观地叫作“资源下界证据图”。</div>
+        <div class="grid-2">
+          <div class="card">
+            <h3>当前 V1 pattern</h3>
+            <div class="formula">make_range(0, N)
+  + splat(GM pointer)
+  + addptr
+  + unmasked tt.load
+  → single-use unmasked tt.store</div>
+            <p>要求单 public function、单 block、静态一维 shape、连续 GM pointer、无额外 use、无未知 op。</p>
+          </div>
+          <div class="card">
+            <h3>生成的资源</h3>
+            <div class="formula">R0.kind = GMToUBLoad
+R0.minPayloadBytes = N × element_bytes
+R0.minInstances = 1
+R0.trace = ["ttir-direct-load-v1"]</div>
+            <p>它只是 source candidate；只有后续 materialization 和所有 stage contracts 都保留证明，才能进入 solver。</p>
+          </div>
+        </div>
+        <h3>MURG 字段与来源</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>字段/关系</th><th>目标来源</th><th>当前实现</th></tr></thead>
+          <tbody>
+            <tr><td><span class="mono">minPayloadBytes</span></td><td>TTIR static shape × element bytes；后续由 tiling/materialization contracts 单调转换</td><td>direct load 已实现</td></tr>
+            <tr><td><span class="mono">minInstances</span></td><td>pipeline depth、loop、CV/multibuffer contracts</td><td>固定为 1</td></tr>
+            <tr><td><span class="mono">birth / lastRequiredUse</span></td><td>SSA liveness 候选 + lowering/bufferization 后置保证</td><td>字段存在，未有效填充</td></tr>
+            <tr><td><span class="mono">mustAlias / mayAlias</span></td><td>view/inplace 语义、bufferization alias contract</td><td>图 API 存在，matcher 未填充</td></tr>
+            <tr><td><span class="mono">mustDistinct</span></td><td>独立 allocation 或语义上不可复用的证明</td><td>图 API 存在，生产未使用</td></tr>
+            <tr><td><span class="mono">CoexistenceWitness</span></td><td>同一 program point 的 liveness/operation 输入需求与 contract trace</td><td>solver 已实现，生产未启用</td></tr>
+            <tr><td><span class="mono">validity / trace</span></td><td>matcher + 每个 stage contract</td><td>基础能力已实现</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+
+      <section class="sheet" id="operations">
+        <h2>8. Operation 全量覆盖范围</h2>
+        <div class="callout amber"><strong>边界说明：</strong>“全量 operation”应定义为需要进入 coverage matrix 的语义族，不代表每个 op 都创建一个资源，也不代表首版全部支持。只有必然物化 UB 的 pattern 才创建 MURG resource；其余 op 可能 Preserve、建立关系，或使分析 defer。</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>语义族</th><th>仓库中的代表 operation / converter</th><th>需要建模的 UB 问题</th><th>建议阶段</th></tr></thead>
+          <tbody>
+            <tr><td>Direct memory</td><td><span class="mono">tt.load</span>, <span class="mono">tt.store</span>, <span class="mono">tt.addptr</span></td><td>GM→UB materialization、输出是否独立、mask/padding、连续性</td><td>P1</td></tr>
+            <tr><td>Pointer / descriptor</td><td><span class="mono">make_tensor_ptr</span>, <span class="mono">advance</span>, descriptor load/store/gather/scatter/reduce</td><td>block pointer、boundary、descriptor lowering、动态 tile</td><td>P4</td></tr>
+            <tr><td>Irregular memory</td><td>gather/scatter, index_select/index_put, unstructured load/store</td><td>非连续 working set、临时 index/mask、实际物化 shape</td><td>P4</td></tr>
+            <tr><td>Atomic</td><td><span class="mono">atomic_rmw</span>, <span class="mono">atomic_cas</span></td><td>read-modify-write、临时 buffer、不可合并副作用</td><td>P5/defer-first</td></tr>
+            <tr><td>Elementwise</td><td>arith/math elementwise, clamp, precise_div/sqrt, mulhi, extern elementwise</td><td>融合还是中间物化；多输入是否 distinct/coexist</td><td>P2</td></tr>
+            <tr><td>Shape / view</td><td>reshape, expand_dims, broadcast, bitcast, split, join, cat</td><td>view/mustAlias 还是新 allocation；广播是否物化</td><td>P2–P3</td></tr>
+            <tr><td>Layout transform</td><td>transpose, flip, sort</td><td>layout conversion scratch、copy、inplace 可能性</td><td>P4</td></tr>
+            <tr><td>Reduction / scan</td><td>reduce, argmin, argmax, scan</td><td>accumulator、init、scratch、分层 reduction</td><td>P3</td></tr>
+            <tr><td>Dot / matmul</td><td>dot, dot_scaled</td><td>A/B tile、accumulator、workspace；Cube 资源边界</td><td>P5；首版 defer</td></tr>
+            <tr><td>Control flow</td><td><span class="mono">scf.for</span>, <span class="mono">scf.while</span>, yield, if-derived rewrites</td><td>loop-carried resource、跨迭代 liveness、pipeline instances</td><td>P3</td></tr>
+            <tr><td>Constants / indexing</td><td>make_range, splat, unsplat, dense constant, ptr_to_int</td><td>通常不独立物化；为 pointer/shape proof 提供事实</td><td>P1–P2</td></tr>
+            <tr><td>Launch / diagnostics</td><td>get_program_id, get_num_programs, assert, print</td><td>控制/诊断影响；通常不是 UB resource，未知副作用需 defer</td><td>P4</td></tr>
+            <tr><td>Custom ops</td><td>hivm custom op、Ascend-specific ops</td><td>必须逐 op 提供 explicit materialization contract</td><td>P5/defer-first</td></tr>
+          </tbody>
+        </table></div>
+        <h3>优先级原则</h3>
+        <ol>
+          <li>先覆盖 autotune 高频且 UB overflow 收益最大的 pattern，不追求一次性接受所有 TTIR。</li>
+          <li>每扩一个 operation family，必须同时补 source matcher、MURG resource/relations、全 stage contracts 和 PlanMemory oracle fixture。</li>
+          <li>只扩大 matcher、不补合同，是禁止的；它会把 TTIR logical tensor 错当成最终 physical buffer。</li>
+        </ol>
+      </section>
+
+      <section class="sheet" id="contracts">
+        <h2>9. UBResourceContract 全量清单</h2>
+        <p>Contract 是一个 stage 的<strong>资源事实更新规则</strong>：输入是 stage 之前的 MURG，输出是该 stage 之后仍然成立的最小资源事实；不能保证时必须返回 <span class="mono">Invalidate</span>。数据流分析里把这种“状态经过一步后如何变化”的函数称为 <span class="mono">transfer function</span>。</p>
+
+        <div class="grid-2">
+          <div class="card blue">
+            <h3>真实 pass 与 Contract 的关系</h3>
+            <div class="formula">真实 pass:  Fstage(IRbefore) → IRafter
+
+资源摘要:   Tstage(MURGbefore) → MURGafter | Invalidate</div>
+            <p><span class="mono">Tstage</span> 不需要生成 <span class="mono">IRafter</span>；但它输出的每一条资源事实，都必须对真实 <span class="mono">Fstage</span> 的结果成立。</p>
+          </div>
+          <div class="card green">
+            <h3>一条证据链示例</h3>
+            <div class="formula">TTIR: N 个 fp16 必须被读取
+→ materialize: 必须出现一个 UB buffer
+→ 最多切成 4 块: 至少一块 ≥ ceil(2N/4) bytes
+→ 后续 Preserve
+→ ActualUBPeak ≥ 该块大小</div>
+            <p>任一步只能说“可能如此”而不能说“必然如此”，证据链就在该步终止，最终结果 defer。</p>
+          </div>
+        </div>
+
+        <h3>9.1 ResourceContract 到底如何实现</h3>
+        <p><strong>它不是纯公式表，也不应该重新实现一套完整 pass 模拟器。</strong>生产实现应允许四类合同；具体 stage 选最小且足够可靠的一类：</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>合同实现类型</th><th>做什么</th><th>例子</th></tr></thead>
+          <tbody>
+            <tr><td><span class="mono">PreserveContract</span></td><td>在严格前置条件下，确认资源大小、实例数和关系都不变</td><td>只增加 annotation，且验证不会改变 UB materialization</td></tr>
+            <tr><td><span class="mono">FormulaContract</span></td><td>用 pass 的确定性参数更新数值下界</td><td>最多切成 K 个 tile，则最大 tile 至少为 <span class="mono">ceil(B/K)</span></td></tr>
+            <tr><td><span class="mono">SemanticRelationContract</span></td><td>按 pass 语义更新资源身份和关系，而不重建完整 IR</td><td>view 建立 mustAlias；multibuffer 更新 minInstances；code motion 更新 lifetime/witness</td></tr>
+            <tr><td><span class="mono">ReplayBackedContract</span></td><td>在输入边界兼容且开销可接受时，复用已有语义重放，再把结果投影成 MURG 事实</td><td>复用 CV/Bufferization/PlanMemory 前后的 allocation、alias、liveness 结果</td></tr>
+            <tr><td><span class="mono">InvalidateContract</span></td><td>前置条件、版本或语义覆盖不足时终止该资源证据链</td><td>未知 op、动态 shape、未覆盖的 SplitMix 分支</td></tr>
+          </tbody>
+        </table></div>
+
+        <h3>9.2 与现有 <span class="mono">cvpipeline_ub_model_cpp</span> 的区别</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>维度</th><th>现有语义重放模型</th><th>本方案 ResourceContract</th></tr></thead>
+          <tbody>
+            <tr><td>回答的问题</td><td>“这些 UB-affecting passes 执行后会得到哪些 allocation、lifetime、alias、offset 和 peak？”</td><td>“经过这个 stage 后，先前哪条最小资源事实仍然必然成立？”</td></tr>
+            <tr><td>状态</td><td>完整度较高的 <span class="mono">GenericModule</span>：operation、region、block、type、attribute、effect；之后还有 SemanticIR/PlanMemory 状态</td><td>稀疏 MURG：只保留 hard reject 所需的 payload、instances、alias、lifetime、witness 和 trace</td></tr>
+            <tr><td>执行方式</td><td>按真实顺序改写 GenericModule，bufferize，构造 gen/kill 与 inplace/multibuffer，最后执行 PlanMemory</td><td>逐 stage Preserve / Transform / Invalidate；通常不生成 lowering 后 IR，也不规划 offset</td></tr>
+            <tr><td>输出精度</td><td>支持范围内追求 <span class="mono">Exact</span>；不精确路径为 <span class="mono">Incomplete</span></td><td>只输出安全下界；信息不足即丢弃该条事实并 defer</td></tr>
+            <tr><td>代价与维护</td><td>精度高，但接近维护一个轻量后端副本，成本较高</td><td>运行轻、适合 autotune 前置过滤，但更保守、覆盖率较低</td></tr>
+          </tbody>
+        </table></div>
+
+        <div class="callout amber"><strong>关键边界：</strong>现有模型的主入口是 before/after CVPipelining 的 Generic IR，而当前过滤器入口是 canonical TTIR。二者不是同一 IR 边界，不能把现有模型直接当作 TTIR contract 调用；否则必须先完成 TTIR→HIVM/Generic IR lowering，可能失去“提前过滤”的收益。</div>
+
+        <h3>9.3 推荐的组合方案：复用，不复制</h3>
+        <div class="flow">
+          <div class="node"><strong>Runtime fast path</strong>TTIR matcher + 小型 ResourceContracts<br>只计算安全下界</div>
+          <div class="arrow">↔</div>
+          <div class="node"><strong>Shared semantics</strong>复用前置条件、op semantics、alias/lifetime helper<br>避免两份规则漂移</div>
+          <div class="arrow">↔</div>
+          <div class="node"><strong>Offline / shadow oracle</strong>现有完整语义重放 + PlanMemory<br>验证 contracts 与真实编译快照</div>
+        </div>
+        <ol>
+          <li>先定义两个模型的 IR boundary 和字段映射；不要按 pass 名字机械地重复写一份公式。</li>
+          <li>对简单 stage，从现有 pass 语义提炼 <span class="mono">Preserve</span>、公式或关系摘要，并把严格前置条件写进 contract。</li>
+          <li>对 CVPipelining、SplitMix、bufferization、multibuffer 等复杂 stage，优先抽取/共享现有语义 helper；若无法在 TTIR 入口安全摘要，就 Invalidate/defer。</li>
+          <li>现有重放模型和真实编译 snapshot 用作 contract 的认证 oracle；样本通过是必要测试证据，但不能代替代码级前置条件和 fail-closed 逻辑。</li>
+        </ol>
+
+        <div class="callout green"><strong>实现结论：</strong><span class="mono">ResourceContract = 已有 pass 语义的保守摘要</span>。有时表现为公式，有时是 alias/lifetime 等结构规则；只有边界匹配时才调用语义重放。它不是“operation → UB 使用率查表”，也不是第二套完整模拟器。</div>
+
+        <h3>9.4 建议的生产 contract inventory</h3>
+        <p>下面的名称使用英文，便于与代码接口和 profile 对齐。清单表达的是必须覆盖的语义职责，不表示每一项都要成为互相独立的 C++ class；能由共享语义模块统一实现的应当合并。</p>
+
+        <h3>A. Applicability &amp; source materialization</h3>
+        <div class="contract"><code>PipelineApplicabilityContract</code><span>绑定 identity、target、compile mode、版本、stage order；任一不匹配即拒绝使用整套 profile。</span><span class="status todo">Proposed</span></div>
+        <div class="contract"><code>DirectTensorLoadSourceContract</code><span>定义 direct contiguous load/store source pattern，产生 GMToUBLoad candidate。</span><span class="status now">Matcher exists</span></div>
+        <div class="contract"><code>TritonToLinalgLoadMaterializationContract</code><span>证明 candidate 在 TTIR→Linalg/HIVM 中真正成为 local/UB allocation 与 GM→local copy。</span><span class="status todo">P0/P1</span></div>
+        <div class="contract"><code>TritonToLinalgStoreMaterializationContract</code><span>定义输出是否物化、是否通过 DPS/inplace 复用输入。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>IntermediateMaterializationContract</code><span>elementwise/layout/reduction 中间 tensor 是融合、view 还是独立 buffer。</span><span class="status todo">P2+</span></div>
+
+        <h3>B. Open-source TTIR pipeline contracts</h3>
+        <div class="contract"><code>AutoBlockifyContract</code><span>根据 auto_blockify_size 推导 block/tile 下界；未知分割规则则 Invalidate。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>AutoSchedulingContract</code><span>覆盖 DAG sync/scope/SSBuffer 及其 canonicalize/CSE 对资源、scope 和 liveness 的影响。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>TritonToStructureContract</code><span>覆盖 structure conversion 对 pointer、mask、control flow 和 resource identity 的保持/变换。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>DiscreteMaskAccessContract</code><span>描述 discrete/masked access 产生的 mask、padding 或访问缩减；首版通常 Invalidate。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>TritonToAnnotationContract</code><span>证明 annotation-only 阶段是否 Preserve，或记录会影响后续 materialization 的标记。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>TritonToUnstructureContract</code><span>控制结构还原后资源 identity/liveness 的传递。</span><span class="status todo">P3</span></div>
+        <div class="contract"><code>TritonToHIVMContract</code><span>确认 HIVM materialization、memory space 与临时资源。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>TritonToHFusionContract</code><span>描述 fusion 消除/合并中间资源的条件。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>TritonToLLVMBridgeContract</code><span>覆盖桥接阶段对证书相关资源的保持；不做泛化“默认 Preserve”。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>BubbleUpOperationContract</code><span>描述 operation 移动对 program point、liveness 与 coexistence witness 的影响。</span><span class="status todo">P3</span></div>
+
+        <h3>C. Operation-family contracts</h3>
+        <div class="contract"><code>ElementwiseFusionContract</code><span>判断 elementwise chain 是否零中间物化，并为多输入建立/拒绝 coexistence。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>ViewAliasContract</code><span>为 reshape/expand_dims/bitcast/view 建立 mustAlias；不能证明时只允许 mayAlias。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>LayoutConversionContract</code><span>transpose/broadcast/cat 等是否产生新 allocation 或 scratch。</span><span class="status todo">P3/P4</span></div>
+        <div class="contract"><code>ReductionMaterializationContract</code><span>建立 accumulator、init 和 scratch resources 及其最小 shape。</span><span class="status todo">P3</span></div>
+        <div class="contract"><code>DotMaterializationContract</code><span>描述 A/B tile、accumulator 和 Cube/AIV memory-space 边界。</span><span class="status todo">P5</span></div>
+        <div class="contract"><code>DescriptorMemoryContract</code><span>descriptor load/store/gather/scatter/reduce 的物化、mask 和 boundary 规则。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>IrregularMemoryContract</code><span>gather/scatter/index/unstructured 访问的 working-set 下界和临时 index/mask。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>AtomicMemoryContract</code><span>atomic 副作用、读写共存与临时资源；未证明路径 Invalidate。</span><span class="status todo">P5</span></div>
+
+        <h3>D. Dynamic CV / MIX contracts</h3>
+        <div class="contract"><code>DynamicCVPipelineContract</code><span>顶层组合合同，绑定以下内部 pass 的精确顺序与选项。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>PlanComputeBlockContract</code><span>资源归属到 AIV/AIC compute block，并更新 program points。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>SplitDataflowContract</code><span>跨 core 拆分、transfer/sync 和资源复制关系。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>SeparateMemoryFromComputeContract</code><span>memory/compute 分离后 load buffer、loop 和 liveness 的变换。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>AllocMultiCacheContract</code><span>inner/outer multibuffer 的最小实例数、独立性与共存。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>AddControlFlowConditionContract</code><span>新增控制流后证书适用路径和 witness 的保守传递。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>SplitMixContract</code><span>MIX 拆分后的 AIV 投影、跨 core buffer 与 address-space 变化。</span><span class="status todo">P4</span></div>
+
+        <h3>E. BiSheng / downstream memory contracts</h3>
+        <div class="contract"><code>BiShengTilingContract</code><span>外部 tiling 对最小 tile payload 的单调传递；必须绑定 compiler hash/options。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>TileAndBindSubBlockContract</code><span>sub-block 切分的最大 tile 数或最小 tile shape 证明。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>CanonicalizationEliminationContract</code><span>DCE/fusion/canonicalization 是否消除或缩小 resource。</span><span class="status todo">P1/P2</span></div>
+        <div class="contract"><code>BufferizationContract</code><span>逻辑 tensor 到 allocation 的映射与 memory space；是后续 alias/lifetime 的基础。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>InPlaceAliasContract</code><span>建立 mustAlias/mayAlias，禁止把可能 inplace 的输出作为独立资源相加。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness。</span><span class="status todo">P2/P3</span></div>
+        <div class="contract"><code>AlignmentContract</code><span>证明 planner 强制 alignment 的最小 padding；首版可忽略以保持更小下界。</span><span class="status todo">P5</span></div>
+        <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存。</span><span class="status todo">P3/P4</span></div>
+        <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status todo">P0</span></div>
+
+        <div class="callout amber"><strong>当前可装载生产合同：</strong>P0 新增 <span class="mono">invalidate-unmodeled-stage@1</span>，只用于证明 profile→registry→ordered chain 能安全执行；它必然终止证据链，不可能产生 reject。经 oracle 认证的 Preserve/Transform 合同仍为 0。</div>
+      </section>
+
+      <section class="sheet" id="solver">
+        <h2>10. Contract 如何作用于资源，以及如何求下界</h2>
+        <h3>单资源示例</h3>
+        <div class="flow">
+          <div class="node"><strong>Matcher</strong><span class="mono">tensor&lt;131072xfp16&gt;</span><br>R0 ≥ 256 KiB</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>MaterializationContract</strong>证明 GM→UB allocation<br>R0 ≥ 256 KiB</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>TileContract</strong>最多 4 tiles<br>R0 ≥ ceil(256/4)=64 KiB</div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>BufferizationContract</strong>Preserve<br>R0 ≥ 64 KiB</div>
+        </div>
+        <p>如果中间任一 stage 可能进一步缩小/消除资源却没有 transfer function，则 R0 失效，结果 defer。</p>
+        <h3>多资源求解</h3>
+        <div class="grid-2">
+          <div class="card"><h4>Singleton certificate</h4><div class="formula">LBsingle = max(bytes(r) × minInstances(r))</div><p>当前生产分析只启用这一类。</p></div>
+          <div class="card"><h4>Coexistence certificate</h4><div class="formula">LBwitness = Σ bytes(r) × minInstances(r)</div><p>只有同一 witness 中所有资源有效、两两 mustDistinct，且不存在 mayAlias 才能求和。</p></div>
+        </div>
+        <div class="callout"><strong>没有“fit”结论：</strong><span class="mono">LB ≤ capacity</span> 只能说明当前证明不足以拒绝，真实 peak 仍可能更高，因此必须 defer。</div>
+      </section>
+
+      <section class="sheet" id="status">
+        <h2>11. 当前实现状态：能做什么，不能做什么</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>能力</th><th>状态</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>Per-config canonical TTIR 接入</td><td><span class="tag fact">已实现</span></td><td>make_ttir canonicalization 后调用 policy</td></tr>
+            <tr><td>PipelineIdentity 构造</td><td><span class="tag fact">已实现</span></td><td>pipeline string + UB options + target/version/compiler hash</td></tr>
+            <tr><td>Direct-copy strict matcher</td><td><span class="tag fact">已实现</span></td><td>只接受单函数/单 block/静态一维/无 mask load→store</td></tr>
+            <tr><td>MURG resource/alias/witness API</td><td><span class="tag fact">基础已实现</span></td><td>关系 API 和 solver 存在，但 matcher 只填单资源</td></tr>
+            <tr><td>Singleton lower-bound solver</td><td><span class="tag fact">已实现</span></td><td>取最大有效资源 bytes × instances</td></tr>
+            <tr><td>Witness solver</td><td><span class="tag plan">代码存在</span></td><td>生产决策未启用</td></tr>
+            <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
+            <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
+            <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复或漂移均 defer</td></tr>
+            <tr><td>Production contracts</td><td><span class="tag gap">安全合同 1 / 有效合同 0</span></td><td>只有 fail-closed invalidate scaffold；尚无经 oracle 认证的 Preserve/Transform</td></tr>
+            <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout amber"><strong>汇报口径：</strong>当前交付是“proof framework + V1 source matcher + policy skeleton”，不是已经可在生产过滤真实 configs 的完整 UB model。</div>
+      </section>
+
+      <section class="sheet" id="plan">
+        <h2>12. 建议落地计划</h2>
+        <div class="timeline">
+          <div class="phase">
+            <h3>P0 · 打通可执行合同链 <span class="tag fact">Implemented</span></h3>
+            <p>已把真实 pass builder 同步记录为 ordered stage contexts，实现严格 packaged schema、profile → registry 装载、contract id/version 绑定和 identity/stage golden；BiSheng 未公开的内部 pipeline 作为由 compiler 内容哈希约束的原子 suffix stage。</p>
+            <p class="small"><strong>已覆盖：</strong>人工 profile 可运行 fail-closed contract；pass/order/option/version/identity 任一漂移稳定 defer。canonical TTIR → before CVPipelining 的语义字段映射随 P1 首个 materialization contract 落地。</p>
+          </div>
+          <div class="phase">
+            <h3>P1 · Direct-copy 生产闭环</h3>
+            <p>从真实 pass 和现有语义模型提炼 direct-copy 所需的 Preserve/Formula/SemanticRelation 摘要；实现 TTIR→HIVM materialization bridge、tiling、bufferization 与 PlanMemory interpretation 的最小合同链，不重写完整 lowering。</p>
+            <p class="small"><strong>验收：</strong>direct-copy fixtures 同时经过真实 compiler snapshot、现有语义重放和 contracts；seed 0..19 上满足 LB ≤ min actual peak，且 reject 的 config 全部真实 overflow。</p>
+          </div>
+          <div class="phase">
+            <h3>P2 · Elementwise 与 alias/coexistence</h3>
+            <p>支持双输入 elementwise、view/reshape/broadcast；实现 InPlaceAlias、DistinctAllocation、Lifetime contracts；启用双资源 witness。</p>
+            <p class="small"><strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加；真实可编译误拒绝数为 0。</p>
+          </div>
+          <div class="phase">
+            <h3>P3 · Reduction、loop 与 multibuffer</h3>
+            <p>增加 accumulator/scratch resources、loop-carried liveness、minInstances 和 multi-buffer coexistence。</p>
+            <p class="small"><strong>验收：</strong>num_stages、loop depth、buffer count 的边界组合全部有 oracle fixtures。</p>
+          </div>
+          <div class="phase">
+            <h3>P4 · Dynamic CV / MIX / irregular memory</h3>
+            <p>对 DynamicCVPipeline、SplitMix、AIV/AIC 投影和 multibuffer，优先抽取并共享 <span class="mono">cvpipeline_ub_model_cpp</span> 的 pass semantics、alias/liveness helpers；不能形成小型安全摘要的路径保留 replay-backed shadow 或直接 defer。再扩展 descriptor、gather/scatter/index/unstructured memory。</p>
+            <p class="small"><strong>验收：</strong>共享语义只有一个事实来源；core projection、跨 core copy、inner/outer multibuffer 的 contract trace 均能回链到 replay/snapshot fixture。</p>
+          </div>
+          <div class="phase">
+            <h3>P5 · Dot、alignment 与长尾</h3>
+            <p>明确 Cube 资源非目标边界；只在 UB/AIV 部分有完备合同后支持 dot；补 alignment、atomic、custom ops。</p>
+            <p class="small"><strong>验收：</strong>各 operation family 均有 coverage matrix：supported / deliberate-defer / unsupported-reason。</p>
+          </div>
+          <div class="phase">
+            <h3>Rollout · off → shadow → enforce</h3>
+            <p>默认 off；CI/代表性 workload 开 shadow；任何下界违规立即撤销对应 profile；零违规门禁后才允许显式 enforce。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="sheet" id="risks">
+        <h2>13. 风险、验证与决策门禁</h2>
+        <div class="grid-2">
+          <div class="card amber">
+            <h3>主要风险</h3>
+            <ul>
+              <li>把 logical tensor size 错当 physical buffer size。</li>
+              <li>遗漏外部 BiSheng/CANN 内部 tiling 或 elimination。</li>
+              <li>把两个不同 SSA value 错当 mustDistinct。</li>
+              <li>两两 overlap 被错误提升为多资源共同 coexist。</li>
+              <li>版本或 option 漂移后继续复用旧 contracts。</li>
+              <li>oracle 只覆盖样本，合同本身缺少代码级前置条件。</li>
+            </ul>
+          </div>
+          <div class="card green">
+            <h3>硬门禁</h3>
+            <div class="formula">LB(config) ≤ min ActualUBPeak(config, seed)
+                   seed = 0..19</div>
+            <ul>
+              <li>模型下界违规数必须为 0。</li>
+              <li>每个 analyzer reject 必须由真实 PlanMemory 证明 overflow。</li>
+              <li>真实可编译 config 被拒绝数必须为 0。</li>
+              <li>profile 只能人工审核加入，不由 oracle 工具自动发布。</li>
+            </ul>
+          </div>
+        </div>
+        <h3>建议度量</h3>
+        <div class="grid-4">
+          <div class="card"><h4>Safety</h4><p>LB violation = 0<br>false reject = 0</p></div>
+          <div class="card"><h4>Coverage</h4><p>analyzed / defer reason 分布<br>profile hit rate</p></div>
+          <div class="card"><h4>Benefit</h4><p>提前拒绝数<br>节省后端编译时间</p></div>
+          <div class="card"><h4>Overhead</h4><p>分析 p95 &lt; 5 ms<br>cache 命中不重复分析</p></div>
+        </div>
+      </section>
+
+      <section class="sheet" id="sources">
+        <h2>14. 参考资料与代码依据</h2>
+        <h3>行业与 LLVM 官方资料</h3>
+        <ul class="sources">
+          <li><a href="https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/Analysis/TargetTransformInfo.h">LLVM TargetTransformInfo public interface</a> — 官方源码说明 TTI 是 IR transformation 查询 codegen 信息的接口，并定义 cost kinds 与 query APIs。</li>
+          <li><a href="https://llvm.org/doxygen/TargetTransformInfoImpl_8h.html">LLVM TargetTransformInfoImpl helpers</a> — ImplBase / CRTP helper 的官方 API 文档。</li>
+          <li><a href="https://www.llvm.org/doxygen/classllvm_1_1AArch64TTIImpl.html">LLVM AArch64TTIImpl</a> — target-specific TTI implementation 示例。</li>
+          <li><a href="https://timeloop.csail.mit.edu/">Timeloop/Accelergy overview</a> — tensor algebra workload、mapping、architecture 与 working-set 的解析建模。</li>
+          <li><a href="https://www.gem5.org/about/">gem5 official overview</a> — 模块化、事件驱动的系统与存储层次模拟。</li>
+          <li><a href="https://clang.llvm.org/docs/DataFlowAnalysisIntro.html">Clang data-flow analysis introduction</a> — 数据流分析作为抽象解释、使用 lattice 与 transfer function 传播程序事实。</li>
+        </ul>
+        <h3>本分支代码与设计依据</h3>
+        <ul class="sources">
+          <li><span class="mono">docs/superpowers/specs/2026-07-21-ttir-ub-conservative-filter-design.md</span></li>
+          <li><span class="mono">third_party/ascend/backend/compiler.py</span> — canonical TTIR 接入、真实 pass builder、PipelineIdentity。</li>
+          <li><span class="mono">third_party/ascend/backend/ub_lower_bound.py</span> — policy、schema revalidation、off/shadow/enforce。</li>
+          <li><span class="mono">third_party/ascend/lib/Analysis/TTIRUBLowerBound/DirectTensorLoadMaterialization.cpp</span></li>
+          <li><span class="mono">third_party/ascend/lib/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.cpp</span></li>
+          <li><span class="mono">third_party/ascend/lib/Analysis/TTIRUBLowerBound/UBResourceContract.cpp</span></li>
+          <li><span class="mono">third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp</span> — converter operation inventory。</li>
+          <li><span class="mono">third_party/ascend/lib/DynamicCVPipeline/AddDynamicCVPipeline.cpp</span> — CV pipeline 内部 pass chain。</li>
+        </ul>
+        <h3>现有语义重放模型依据</h3>
+        <ul class="sources">
+          <li><span class="mono">AscendNPU-IR/.worktrees/cvpipeline-ub-post-model/cvpipeline_ub_model_cpp/src/ir/generic_ir.hpp</span> — GenericModule 的 operation/region/block 结构与解析。</li>
+          <li><span class="mono">.../src/pipeline/cvpipelining_ub_pipeline.hpp</span> — UB-affecting passes 的真实顺序式语义重放，非 Exact stage fail closed。</li>
+          <li><span class="mono">.../src/pipeline/modeling_result.hpp</span> — Exact/Incomplete 与 OracleExact/Partial/UBInvariant/Unsupported 覆盖语义。</li>
+          <li><span class="mono">.../src/ir/semantic_ir.hpp</span> — allocation、gen/kill、lifetime、inplace、multibuffer 与 PlanMemory 结果。</li>
+        </ul>
+        <div class="callout green"><strong>最终建议：</strong>下一阶段不要继续扩大 matcher，也不要另写一套 CV pass 模拟。优先完成 P0 与 P1：明确两个模型的 IR boundary，把 direct-copy 从真实 identity、小型 contract summary、现有语义重放/PlanMemory oracle 到 enforce 打通，再以 coverage matrix 横向扩展 operation families。</div>
+        <p class="footer">TTIR UB Conservative Lower-Bound Modeling · Internal Technical Brief</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

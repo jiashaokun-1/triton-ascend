@@ -263,8 +263,27 @@ def test_ttir_to_linalg_builder_preserves_default_pipeline_byte_for_byte(monkeyp
     module = SimpleNamespace(context=context)
     metadata = _compiler_metadata()
     options = ascend_compiler.NPUOptions(compile_on_910_95=False)
-    pm = ascend_compiler._build_ttir_to_linalg_pass_manager(module, metadata, options, named_ops=False)
+    pipeline_stages = []
+    pm = ascend_compiler._build_ttir_to_linalg_pass_manager(
+        module, metadata, options, named_ops=False, pipeline_stages=pipeline_stages
+    )
     assert pm.get_pipeline_str() == EXPECTED_TTIR_TO_LINALG_PIPELINE
+    assert [stage["stage_name"] for stage in pipeline_stages] == [
+        "ttir.auto-blockify",
+        "ttir.triton-to-structure",
+        "ttir.discrete-mask-access-conversion",
+        "ttir.triton-to-annotation",
+        "ttir.triton-to-unstructure",
+        "ttir.triton-to-hivm",
+        "ttir.triton-to-hfusion",
+        "ttir.triton-to-llvm",
+        "ttir.bubble-up-operation",
+        "ttir.triton-to-structure",
+        "ttir.triton-to-linalg",
+    ]
+    assert pipeline_stages[0]["options"] == {"auto_blockify_size": "1"}
+    assert pipeline_stages[-1]["options"]["compile_mode"] == '"simd"'
+    assert pipeline_stages[-1]["options"]["named_ops"] == "false"
 
 
 def test_pipeline_identity_is_canonical_json_and_contains_complete_payload(monkeypatch):
@@ -422,12 +441,12 @@ def test_selected_compiler_read_failure_makes_policy_identity_fail_open(monkeypa
     monkeypatch.setattr(
         ascend_compiler,
         "apply_ub_lower_bound_policy",
-        lambda _mod, _metadata, _options, identity: captured.append(identity),
+        lambda _mod, _metadata, _options, identity, stages: captured.append((identity, stages)),
     )
     options = ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow", compile_on_910_95=False)
     module = SimpleNamespace(context=object(), __str__=lambda: "module")
     ascend_compiler.make_ttir(module, _compiler_metadata(), options)
-    assert captured == [""]
+    assert captured == [("", [])]
 
 
 def test_pipeline_identity_changes_for_effective_environment_lowering_switches(monkeypatch):
@@ -546,9 +565,10 @@ def test_make_ttir_calls_policy_after_canonicalization_and_does_not_run_future_p
     )
     _identity_runtime(monkeypatch)
 
-    def policy(_mod, _metadata, _options, identity):
+    def policy(_mod, _metadata, _options, identity, stages):
         calls.append("policy")
         assert identity["open_source_pipeline"] == "pipeline"
+        assert stages == [{"stage_name": ascend_compiler.TTIR_UB_BISHENG_SUFFIX_STAGE, "options": {}}]
 
     monkeypatch.setattr(ascend_compiler, "apply_ub_lower_bound_policy", policy, raising=False)
     options = ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow", compile_on_910_95=False)
@@ -609,12 +629,12 @@ def test_make_ttir_identity_error_fails_open_to_policy(monkeypatch):
     monkeypatch.setattr(
         ascend_compiler,
         "apply_ub_lower_bound_policy",
-        lambda _mod, _metadata, _options, identity: captured.append(identity),
+        lambda _mod, _metadata, _options, identity, stages: captured.append((identity, stages)),
     )
     options = ascend_compiler.NPUOptions(ub_lower_bound_mode="shadow", compile_on_910_95=False)
     module = SimpleNamespace(context=object(), __str__=lambda: "module")
     ascend_compiler.make_ttir(module, _compiler_metadata(), options)
-    assert captured == [""]
+    assert captured == [("", [])]
 
 
 def test_make_ttir_simt_identity_uses_real_direct_pipeline_without_future_pm(monkeypatch):
@@ -627,12 +647,17 @@ def test_make_ttir_simt_identity_uses_real_direct_pipeline_without_future_pm(mon
         lambda *_args, **_kwargs: pytest.fail("direct SIMT path built an unused TTIR-to-Linalg pipeline"),
     )
     captured = []
+    captured_stages = []
     monkeypatch.setattr(
         ascend_compiler,
         "_ttir_ub_pipeline_identity",
         lambda pipeline, _metadata: captured.append(pipeline) or {"sha256": "direct-id"},
     )
-    monkeypatch.setattr(ascend_compiler, "apply_ub_lower_bound_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        ascend_compiler,
+        "apply_ub_lower_bound_policy",
+        lambda _mod, _metadata, _options, _identity, stages: captured_stages.extend(stages),
+    )
     options = ascend_compiler.NPUOptions(
         ub_lower_bound_mode="shadow",
         compile_on_910_95=True,
@@ -641,6 +666,7 @@ def test_make_ttir_simt_identity_uses_real_direct_pipeline_without_future_pm(mon
     module = SimpleNamespace(context=object(), __str__=lambda: "module")
     ascend_compiler.make_ttir(module, _compiler_metadata(compile_on_910_95=True), options)
     assert captured == [ascend_compiler.TTIR_UB_DIRECT_BISHENG_PIPELINE]
+    assert captured_stages == [{"stage_name": "bisheng.direct-ttir-pipeline", "options": {}}]
 
 
 def test_direct_simt_libdevice_toggle_changes_command_and_identity(monkeypatch):
@@ -1007,7 +1033,7 @@ def test_analyzer_exception_fails_open(monkeypatch):
     assert metadata["ub_lower_bound_unsupported_reasons"] == ["internal-error: bad"]
 
 
-def test_policy_passes_only_packaged_empty_profile(monkeypatch):
+def test_policy_passes_packaged_profile_and_real_pipeline_stages(monkeypatch):
     captured = {}
 
     def analyze(_mod, options):
@@ -1015,7 +1041,8 @@ def test_policy_passes_only_packaged_empty_profile(monkeypatch):
         return _analysis_result("defer")
 
     monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", analyze)
-    apply_ub_lower_bound_policy(object(), {}, Options("shadow"), "test-id")
+    pipeline_stages = [{"stage_name": "ttir.auto-blockify", "options": {"auto_blockify_size": "1"}}]
+    apply_ub_lower_bound_policy(object(), {}, Options("shadow"), "test-id", pipeline_stages)
     assert captured["contract_profile"] == {
         "schema": "ttir-ub-lb-profile-v1",
         "identity_contract": {
@@ -1028,6 +1055,7 @@ def test_policy_passes_only_packaged_empty_profile(monkeypatch):
     }
     assert "allow_unvalidated" not in captured
     assert captured["compile_mode"] == "aiv"
+    assert captured["pipeline_stages"] == pipeline_stages
 
 
 def test_non_vector_compile_mode_is_not_reclassified(monkeypatch):
@@ -1086,6 +1114,73 @@ def test_packaged_contract_profiles_start_empty():
         },
         "profiles": [],
     }
+
+
+def test_profile_loader_rejects_missing_contract_version(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [{
+            "pipeline_identity": {
+                "open_source_pipeline": "pipeline",
+                "relevant_options_json": "{}",
+                "target_arch": "Ascend910B",
+                "triton_version": "test",
+                "cann_version_hash": "test",
+                "sha256": "identity",
+            },
+            "pipeline_stages": [{
+                "stage_name": "stage",
+                "options": {},
+                "contract_id": "invalidate-unmodeled-stage",
+            }],
+        }],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
+        load_contract_profiles()
+
+
+def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    identity = {
+        "open_source_pipeline": "pipeline",
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "",
+    }
+    identity["sha256"] = hashlib.sha256(json.dumps({
+        "cann_version_hash": "test",
+        "open_source_pipeline": "pipeline",
+        "relevant_options": {},
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    entry = {
+        "pipeline_identity": identity,
+        "pipeline_stages": [{
+            "stage_name": "stage",
+            "options": {},
+            "contract_id": "invalidate-unmodeled-stage",
+            "contract_version": "1",
+        }],
+        "contract_version": "ttir-ub-lb-v1",
+        "oracle_report_sha256": "0" * 64,
+        "validated_seeds": list(range(20)),
+        "retry_validated": True,
+        "auto_tile_and_bind_subblock_outcomes": [False, True],
+    }
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry, entry],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="duplicate packaged"):
+        load_contract_profiles()
 
 
 @pytest.mark.parametrize(
@@ -1195,6 +1290,90 @@ def test_caller_supplied_contract_profile_cannot_enable_rejection(tmp_path):
                 "schema": "ttir-ub-lb-profile-v1",
                 "profiles": [{"contract": "fixed-disposition", "disposition": "preserve"}],
             },
+        },
+    )
+    assert result["decision"] == "defer"
+    assert result["unsupported_reasons"] == ["unknown-pipeline-profile"]
+
+
+def test_binding_loads_exact_ordered_fail_closed_profile(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p0-test-pipeline",
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p0-test-identity",
+    }
+    stages = [{"stage_name": "ttir.auto-blockify", "options": {"auto_blockify_size": "1"}}]
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [{
+                **stages[0],
+                "contract_id": "invalidate-unmodeled-stage",
+                "contract_version": "1",
+            }],
+        }],
+    }
+    result = ascend.analysis.ttir_ub_lower_bound(
+        module,
+        {
+            "arch": "Ascend910B",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+    assert result["decision"] == "defer"
+    assert result["unsupported_reasons"] == ["invalidate-unmodeled-stage"]
+    assert result["certificates"] == []
+
+
+def test_binding_rejects_stage_option_drift_from_profile(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p0-test-pipeline",
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p0-test-identity",
+    }
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [{
+                "stage_name": "ttir.auto-blockify",
+                "options": {"auto_blockify_size": "1"},
+                "contract_id": "invalidate-unmodeled-stage",
+                "contract_version": "1",
+            }],
+        }],
+    }
+    result = ascend.analysis.ttir_ub_lower_bound(
+        module,
+        {
+            "arch": "Ascend910B",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": [{
+                "stage_name": "ttir.auto-blockify",
+                "options": {"auto_blockify_size": "2"},
+            }],
+            "contract_profile": profile,
         },
     )
     assert result["decision"] == "defer"

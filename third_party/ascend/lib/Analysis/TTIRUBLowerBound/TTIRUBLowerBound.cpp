@@ -182,21 +182,8 @@ StringRef getVerifierPreflightFailure(Operation *root) {
 
 bool hasKnownPipelineProfile(const TTIRUBAnalysisOptions &options,
                              const PipelineContractRegistry &registry) {
-  const PipelineIdentity &identity = options.pipelineIdentity;
-  // Task 2 deliberately ships no production profiles. The only V1 identity
-  // accepted here is the explicit synthetic profile used with testing-only
-  // contracts; arbitrary non-empty fingerprints must not become proof.
-  return identity.openSourcePipeline == "synthetic-all-preserve" &&
-         identity.relevantOptionsJson == "{}" &&
-         identity.tritonVersion == "test" &&
-         identity.cannVersionHash == "test" &&
-         identity.sha256 == "synthetic-all-preserve-v1" &&
-         identity.targetArch == options.targetArch &&
-         options.stages.size() == 1 &&
-         options.stages.front().stageName == "preserve" &&
-         options.stages.front().options.empty() &&
-         registry.hasExactlyOneMatchingContract(
-             options.stages.front(), "fixed-disposition", "1");
+  return options.pipelineIdentity.targetArch == options.targetArch &&
+         registry.matchesProfile(options.pipelineIdentity, options.stages);
 }
 
 } // namespace
@@ -238,8 +225,9 @@ analyzeTTIRUBLowerBound(ModuleOp module, const TTIRUBAnalysisOptions &options,
                                           result.unsupportedReasons)))
     return result;
 
-  for (const PipelineStageContext &stage : options.stages) {
-    if (failed(registry.applyOrInvalidateAll(graph, stage))) {
+  for (size_t ordinal = 0; ordinal < options.stages.size(); ++ordinal) {
+    if (failed(registry.applyProfileStage(graph, options.stages[ordinal],
+                                          ordinal))) {
       addReason(result.unsupportedReasons, "pipeline-contract-internal-error");
       return result;
     }

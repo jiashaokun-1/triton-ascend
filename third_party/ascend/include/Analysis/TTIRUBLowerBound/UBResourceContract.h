@@ -3,6 +3,7 @@
 
 #include "Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
@@ -31,6 +32,12 @@ struct PipelineStageContext {
   StringMap<std::string> options;
 };
 
+struct PipelineContractBinding {
+  PipelineStageContext stage;
+  std::string contractId;
+  std::string contractVersion;
+};
+
 class UBResourceContract {
 public:
   virtual ~UBResourceContract() = default;
@@ -44,6 +51,16 @@ public:
 
 class PipelineContractRegistry {
 public:
+  void setProfileIdentity(PipelineIdentity identity);
+  LogicalResult addProfileContract(
+      PipelineContractBinding binding,
+      std::unique_ptr<UBResourceContract> contract);
+  bool matchesProfile(const PipelineIdentity &identity,
+                      ArrayRef<PipelineStageContext> stages) const;
+  LogicalResult applyProfileStage(MandatoryUBResourceGraph &graph,
+                                  const PipelineStageContext &context,
+                                  size_t stageOrdinal) const;
+
   void addForTesting(std::unique_ptr<UBResourceContract> contract);
   bool hasExactlyOneMatchingContract(const PipelineStageContext &context,
                                      StringRef expectedId,
@@ -53,11 +70,20 @@ public:
                        const PipelineStageContext &context) const;
 
 private:
+  struct ProfileContractEntry {
+    PipelineContractBinding binding;
+    std::unique_ptr<UBResourceContract> contract;
+  };
+
+  std::optional<PipelineIdentity> profileIdentity;
+  std::vector<ProfileContractEntry> profileContracts;
   std::vector<std::unique_ptr<UBResourceContract>> contracts;
 };
 
 std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
                                                           int64_t maxTiles);
+std::unique_ptr<UBResourceContract>
+makeInvalidateContract(const PipelineStageContext &stage);
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch);
 

@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <optional>
 #include <string>
 
 namespace py = pybind11;
@@ -56,6 +57,100 @@ SmallVector<PipelineStageContext> parsePipelineStages(const py::handle &value) {
     stages.push_back(std::move(stage));
   }
   return stages;
+}
+
+bool sameIdentity(const PipelineIdentity &lhs, const PipelineIdentity &rhs) {
+  return lhs.openSourcePipeline == rhs.openSourcePipeline &&
+         lhs.relevantOptionsJson == rhs.relevantOptionsJson &&
+         lhs.targetArch == rhs.targetArch &&
+         lhs.tritonVersion == rhs.tritonVersion &&
+         lhs.cannVersionHash == rhs.cannVersionHash &&
+         lhs.sha256 == rhs.sha256;
+}
+
+std::optional<PipelineContractBinding>
+parseProfileBinding(const py::handle &value) {
+  try {
+    if (!py::isinstance<py::dict>(value))
+      return std::nullopt;
+    py::dict mapping = py::cast<py::dict>(value);
+    if (!mapping.contains("stage_name") || !mapping.contains("options") ||
+        !mapping.contains("contract_id") ||
+        !mapping.contains("contract_version"))
+      return std::nullopt;
+    py::list oneStage;
+    py::dict stage;
+    stage["stage_name"] = mapping["stage_name"];
+    stage["options"] = mapping["options"];
+    oneStage.append(std::move(stage));
+    SmallVector<PipelineStageContext> parsedStages =
+        parsePipelineStages(oneStage);
+    PipelineContractBinding binding;
+    binding.stage = std::move(parsedStages.front());
+    binding.contractId = requireString(mapping, "contract_id");
+    binding.contractVersion = requireString(mapping, "contract_version");
+    return binding;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
+bool loadMatchingProfile(const py::handle &value,
+                         const PipelineIdentity &identity,
+                         ArrayRef<PipelineStageContext> actualStages,
+                         PipelineContractRegistry &registry) {
+  py::dict document = py::cast<py::dict>(value);
+  py::list profiles = py::cast<py::list>(document["profiles"]);
+  std::optional<SmallVector<PipelineContractBinding>> matchedBindings;
+  for (const py::handle item : profiles) {
+    try {
+      if (!py::isinstance<py::dict>(item))
+        continue;
+      py::dict profile = py::cast<py::dict>(item);
+      if (!profile.contains("pipeline_identity") ||
+          !profile.contains("pipeline_stages") ||
+          !py::isinstance<py::list>(profile["pipeline_stages"]))
+        continue;
+      PipelineIdentity profileIdentity = parsePipelineIdentity(
+          profile["pipeline_identity"], identity.targetArch);
+      if (!sameIdentity(profileIdentity, identity))
+        continue;
+      if (matchedBindings)
+        return false;
+
+      SmallVector<PipelineContractBinding> bindings;
+      for (const py::handle rawBinding :
+           py::cast<py::list>(profile["pipeline_stages"])) {
+        std::optional<PipelineContractBinding> binding =
+            parseProfileBinding(rawBinding);
+        if (!binding)
+          return false;
+        bindings.push_back(std::move(*binding));
+      }
+      matchedBindings = std::move(bindings);
+    } catch (const std::exception &) {
+      continue;
+    }
+  }
+  if (!matchedBindings || matchedBindings->size() != actualStages.size())
+    return false;
+
+  registry.setProfileIdentity(identity);
+  for (PipelineContractBinding &binding : *matchedBindings) {
+    std::unique_ptr<UBResourceContract> contract;
+    // P0 deliberately exposes only a fail-closed production constructor.
+    // Preserve/Transform constructors must be added here only after their
+    // packaged profiles pass the oracle promotion gate.
+    if (binding.contractId == "invalidate-unmodeled-stage" &&
+        binding.contractVersion == "1")
+      contract = makeInvalidateContract(binding.stage);
+    else
+      return false;
+    if (failed(registry.addProfileContract(std::move(binding),
+                                           std::move(contract))))
+      return false;
+  }
+  return registry.matchesProfile(identity, actualStages);
 }
 
 void validatePackagedProfileShape(const py::handle &value) {
@@ -142,11 +237,10 @@ void initTTIRUBLowerBoundBindings(py::module_ &module) {
   module.def("ttir_ub_lower_bound",
              [](ModuleOp &module, const py::dict &rawOptions) {
                TTIRUBAnalysisOptions options = parseOptions(rawOptions);
-               // Production contracts are intentionally unavailable until an
-               // oracle-certified packaged profile is implemented. Caller
-               // dictionaries are shape-checked but never populate this
-               // testing-only registry.
                PipelineContractRegistry registry;
+               loadMatchingProfile(rawOptions["contract_profile"],
+                                   options.pipelineIdentity, options.stages,
+                                   registry);
                TTIRUBAnalysisResult analysis =
                    analyzeTTIRUBLowerBound(module, options, registry);
                return serializeResult(analysis, options.pipelineIdentity);

@@ -13,6 +13,74 @@ void invalidateAll(MandatoryUBResourceGraph &graph, StringRef reason) {
   }
 }
 
+bool haveEqualOptions(const StringMap<std::string> &lhs,
+                      const StringMap<std::string> &rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (const auto &option : lhs) {
+    auto other = rhs.find(option.getKey());
+    if (other == rhs.end() || other->second != option.getValue())
+      return false;
+  }
+  return true;
+}
+
+bool areEqual(const PipelineStageContext &lhs,
+              const PipelineStageContext &rhs) {
+  return lhs.stageName == rhs.stageName &&
+         haveEqualOptions(lhs.options, rhs.options);
+}
+
+bool areEqual(const PipelineIdentity &lhs, const PipelineIdentity &rhs) {
+  return lhs.openSourcePipeline == rhs.openSourcePipeline &&
+         lhs.relevantOptionsJson == rhs.relevantOptionsJson &&
+         lhs.targetArch == rhs.targetArch &&
+         lhs.tritonVersion == rhs.tritonVersion &&
+         lhs.cannVersionHash == rhs.cannVersionHash &&
+         lhs.sha256 == rhs.sha256;
+}
+
+LogicalResult applyDisposition(MandatoryUBResourceGraph &graph,
+                               const UBResourceContract &contract,
+                               const PipelineStageContext &context) {
+  switch (contract.apply(graph, context)) {
+  case ContractDisposition::Preserve:
+  case ContractDisposition::Transform:
+    return success();
+  case ContractDisposition::Invalidate:
+    invalidateAll(graph, contract.id());
+    return success();
+  case ContractDisposition::InternalError:
+    return failure();
+  }
+  return failure();
+}
+
+class InvalidateContract final : public UBResourceContract {
+public:
+  explicit InvalidateContract(const PipelineStageContext &stage)
+      : stageName(stage.stageName) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef id() const override { return "invalidate-unmodeled-stage"; }
+  StringRef version() const override { return "1"; }
+  bool matches(const PipelineStageContext &context) const override {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &,
+        const PipelineStageContext &) const override {
+    return ContractDisposition::Invalidate;
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+};
+
 class FixedTileContract final : public UBResourceContract {
 public:
   FixedTileContract(StringRef stageName, int64_t maxTiles)
@@ -51,6 +119,53 @@ private:
 
 } // namespace
 
+void PipelineContractRegistry::setProfileIdentity(PipelineIdentity identity) {
+  profileIdentity = std::move(identity);
+  profileContracts.clear();
+}
+
+LogicalResult PipelineContractRegistry::addProfileContract(
+    PipelineContractBinding binding,
+    std::unique_ptr<UBResourceContract> contract) {
+  if (!profileIdentity || !contract ||
+      contract->id() != binding.contractId ||
+      contract->version() != binding.contractVersion ||
+      !contract->matches(binding.stage))
+    return failure();
+  profileContracts.push_back(
+      {.binding = std::move(binding), .contract = std::move(contract)});
+  return success();
+}
+
+bool PipelineContractRegistry::matchesProfile(
+    const PipelineIdentity &identity,
+    ArrayRef<PipelineStageContext> stages) const {
+  if (!profileIdentity || !areEqual(*profileIdentity, identity) ||
+      profileContracts.size() != stages.size())
+    return false;
+  for (size_t ordinal = 0; ordinal < stages.size(); ++ordinal) {
+    const ProfileContractEntry &entry = profileContracts[ordinal];
+    if (!areEqual(entry.binding.stage, stages[ordinal]) ||
+        entry.contract->id() != entry.binding.contractId ||
+        entry.contract->version() != entry.binding.contractVersion ||
+        !entry.contract->matches(stages[ordinal]))
+      return false;
+  }
+  return true;
+}
+
+LogicalResult PipelineContractRegistry::applyProfileStage(
+    MandatoryUBResourceGraph &graph, const PipelineStageContext &context,
+    size_t stageOrdinal) const {
+  if (stageOrdinal >= profileContracts.size())
+    return failure();
+  const ProfileContractEntry &entry = profileContracts[stageOrdinal];
+  if (!areEqual(entry.binding.stage, context) ||
+      !entry.contract->matches(context))
+    return failure();
+  return applyDisposition(graph, *entry.contract, context);
+}
+
 void PipelineContractRegistry::addForTesting(
     std::unique_ptr<UBResourceContract> contract) {
   contracts.push_back(std::move(contract));
@@ -83,22 +198,17 @@ LogicalResult PipelineContractRegistry::applyOrInvalidateAll(
     return success();
   }
 
-  switch (matchedContract->apply(graph, context)) {
-  case ContractDisposition::Preserve:
-  case ContractDisposition::Transform:
-    return success();
-  case ContractDisposition::Invalidate:
-    invalidateAll(graph, matchedContract->id());
-    return success();
-  case ContractDisposition::InternalError:
-    return failure();
-  }
-  return failure();
+  return applyDisposition(graph, *matchedContract, context);
 }
 
 std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
                                                           int64_t maxTiles) {
   return std::make_unique<FixedTileContract>(stageName, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract>
+makeInvalidateContract(const PipelineStageContext &stage) {
+  return std::make_unique<InvalidateContract>(stage);
 }
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {
