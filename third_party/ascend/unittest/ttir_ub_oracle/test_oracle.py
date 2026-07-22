@@ -340,6 +340,25 @@ def test_profile_candidate_requires_complete_certificate(tmp_path):
         oracle.build_profile_candidate(report)
 
 
+def test_profile_candidate_rejects_an_empty_case_set():
+    report = {
+        "schema": "ttir-ub-oracle-report-v1",
+        "suffix_compiler_sha256": "c" * 64,
+        "cases": [],
+        "violations": [],
+        "unavailable": [],
+        "summary": {
+            "cases": 0,
+            "seeds": list(range(20)),
+            "retry_checked": True,
+            "violations": 0,
+            "unavailable": 0,
+        },
+    }
+    with pytest.raises(oracle.OracleUnavailable, match="non-empty"):
+        oracle.build_profile_candidate(report)
+
+
 def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
     analysis_false = _analysis("reject", 256)
     analysis_true = _analysis("reject", 256)
@@ -376,6 +395,17 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
     assert candidate["profiles"][0]["pipeline_identity"]["sha256"] == "identity"
     assert candidate["profiles"][0]["validated_seeds"] == list(range(20))
     assert candidate["profiles"][0]["retry_validated"] is True
+    assert [profile["auto_tile_and_bind_subblock_outcome"] for profile in candidate["profiles"]] == [
+        False, True
+    ]
+
+    false_only_report = {
+        **report,
+        "cases": report["cases"][:1],
+        "summary": {**report["summary"], "cases": 1},
+    }
+    false_only_candidate = oracle.build_profile_candidate(false_only_report)
+    assert false_only_candidate["profiles"][0]["auto_tile_and_bind_subblock_outcome"] is False
 
 
 @pytest.mark.parametrize(

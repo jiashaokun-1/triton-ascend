@@ -502,7 +502,7 @@ def test_pipeline_identity_changes_for_every_ub_affecting_option(monkeypatch, op
     assert before != after, option_name
 
 
-def test_module_derived_auto_tile_placeholder_does_not_change_identity(monkeypatch):
+def test_module_derived_auto_tile_placeholder_is_bound_by_exact_ttir_identity(monkeypatch):
     _identity_runtime(monkeypatch)
     enabled = _compiler_metadata(auto_tile_and_bind_subblock=True)
     disabled = _compiler_metadata(auto_tile_and_bind_subblock=False)
@@ -510,8 +510,8 @@ def test_module_derived_auto_tile_placeholder_does_not_change_identity(monkeypat
     disabled_identity = ascend_compiler._ttir_ub_pipeline_identity("pipeline", disabled)
     enabled_options = json.loads(enabled_identity["relevant_options_json"])
     disabled_options = json.loads(disabled_identity["relevant_options_json"])
-    assert enabled_options["auto_tile_and_bind_subblock"] == "module-derived-both-outcomes"
-    assert disabled_options["auto_tile_and_bind_subblock"] == "module-derived-both-outcomes"
+    assert enabled_options["auto_tile_and_bind_subblock"] == "module-derived-per-exact-ttir"
+    assert disabled_options["auto_tile_and_bind_subblock"] == "module-derived-per-exact-ttir"
     assert enabled_identity["sha256"] == disabled_identity["sha256"]
 
 
@@ -532,8 +532,8 @@ module attributes {mix_mode = "aiv", parallel_mode = "mix_simd_simt",
     contract = load_contract_profiles()["identity_contract"]["auto_tile_and_bind_subblock"]
     assert identity_options["auto_tile_and_bind_subblock"] == contract["identity_value"]
     assert contract == {
-        "identity_value": "module-derived-both-outcomes",
-        "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+        "identity_value": "module-derived-per-exact-ttir",
+        "profile_promotion_requires": "oracle-validates-exact-profile-outcome",
     }
 
 
@@ -1072,8 +1072,8 @@ def test_policy_passes_packaged_profile_and_real_pipeline_stages(monkeypatch):
         "schema": "ttir-ub-lb-profile-v1",
         "identity_contract": {
             "auto_tile_and_bind_subblock": {
-                "identity_value": "module-derived-both-outcomes",
-                "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+                "identity_value": "module-derived-per-exact-ttir",
+                "profile_promotion_requires": "oracle-validates-exact-profile-outcome",
             },
         },
         "profiles": [],
@@ -1133,8 +1133,8 @@ def test_packaged_contract_profiles_start_empty():
         "schema": "ttir-ub-lb-profile-v1",
         "identity_contract": {
             "auto_tile_and_bind_subblock": {
-                "identity_value": "module-derived-both-outcomes",
-                "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+                "identity_value": "module-derived-per-exact-ttir",
+                "profile_promotion_requires": "oracle-validates-exact-profile-outcome",
             },
         },
         "profiles": [],
@@ -1200,7 +1200,7 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
         "oracle_report_sha256": "0" * 64,
         "validated_seeds": list(range(20)),
         "retry_validated": True,
-        "auto_tile_and_bind_subblock_outcomes": [False, True],
+        "auto_tile_and_bind_subblock_outcome": False,
     }
     profile_path.write_text(json.dumps({
         "schema": "ttir-ub-lb-profile-v1",
@@ -1250,7 +1250,7 @@ def _direct_copy_profile_entry(*, compile_mode="simd", multibuffer=False):
         "oracle_report_sha256": "b" * 64,
         "validated_seeds": list(range(20)),
         "retry_validated": True,
-        "auto_tile_and_bind_subblock_outcomes": [False, True],
+        "auto_tile_and_bind_subblock_outcome": False,
     }
 
 
@@ -1264,6 +1264,20 @@ def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_pa
     profile_path.write_text(json.dumps(document))
     monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
     assert load_contract_profiles() == document
+
+
+def test_profile_loader_rejects_non_boolean_auto_tile_outcome(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    entry["auto_tile_and_bind_subblock_outcome"] = [False, True]
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
+        load_contract_profiles()
 
 
 @pytest.mark.parametrize(
@@ -1535,7 +1549,7 @@ def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):
         "oracle_report_sha256": "a" * 64,
         "validated_seeds": list(range(20)),
         "retry_validated": True,
-        "auto_tile_and_bind_subblock_outcomes": [False, True],
+        "auto_tile_and_bind_subblock_outcome": False,
     })
     certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
     assert certified_result["lower_bound_bytes"] == 4096

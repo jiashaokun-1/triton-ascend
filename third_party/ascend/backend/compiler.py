@@ -152,7 +152,7 @@ UB_AFFECTING_OPTIONS = (
     "warp_size",
 )
 TTIR_UB_DIRECT_BISHENG_PIPELINE = "direct-bisheng-ttir"
-TTIR_UB_MODULE_DERIVED_AUTO_TILE = "module-derived-both-outcomes"
+TTIR_UB_MODULE_DERIVED_AUTO_TILE = "module-derived-per-exact-ttir"
 TTIR_UB_BISHENG_SUFFIX_STAGE = "bisheng.ub-affecting-suffix"
 
 # Exact closure over every long option forwarded to BiSheng by the three codegen

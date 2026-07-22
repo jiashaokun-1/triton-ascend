@@ -456,7 +456,8 @@ LB_bits <= ActualUBPeak_bits
 - oracle 使用 candidate-only analyzer 入口运行未安装的候选合同链，打破“空 profile 无法认证”的循环依赖；
 - oracle 从真实 `post-TileAndBindSubBlock` stage snapshot 检测 `get_sub_block_idx`，manifest 标签本身不算 outcome 证据；
 - 严格解析配对 before-CVPipelining snapshot 中唯一的静态 1-D local allocation，先验证合同下界不超过 materialization boundary；
-- 只有 seeds `0..19`、retry、两种 outcome 均验证且 identity 唯一时才生成可安装 candidate；
+- 只有 seeds `0..19`、retry 对该精确 TTIR identity 的实际 outcome 全部验证一致，且
+  identity 唯一时才生成可安装 candidate；
 - 首个 direct-copy profile 只接受 `compile_mode=simd`、`multibuffer=false`；其他组合继续 defer；
 - 永远不自动编辑 packaged profile。
 - `--profile-candidate` 必须同时提供 `--report`，保证 profile 中的 report hash 可审计。
@@ -547,8 +548,10 @@ Preserve/Transform 合同。因此：
 ### P1：为真实 pipeline 建立第一组有效合同
 
 当前已完成候选合同实现、canonical TTIR 绑定和 oracle candidate chain；尚未完成真实认证。
-下一步应补齐 enabled/disabled 两类真实 fixture，并在具备 suffix compiler 与 Triton/CANN
-identity 的环境运行完整 promotion gate。packaged profile 在此之前必须保持为空。
+下一步应在具备 suffix compiler 与可导入 Triton/CANN identity 的环境运行纯 AIV
+direct-copy 的完整 promotion gate。`TileAndBindSubBlock` 的 true 分支属于 split MIX AIV，
+应在未来 MIX profile 的独立 identity/fixture 中认证，不再阻塞 P1 的 false-outcome profile。
+packaged profile 在完整 report 生成前必须保持为空。
 
 优先选择最小、可证明且能产生收益的路径，不要直接声明整个 pipeline Preserve。
 

@@ -38,8 +38,8 @@ _CONTRACT_PROPOSAL_KEYS = frozenset({
 })
 _IDENTITY_CONTRACT = {
     "auto_tile_and_bind_subblock": {
-        "identity_value": "module-derived-both-outcomes",
-        "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+        "identity_value": "module-derived-per-exact-ttir",
+        "profile_promotion_requires": "oracle-validates-exact-profile-outcome",
     },
 }
 _PEAK_RE = re.compile(r"^PLANMEM_PEAK\t(-?\d+)\t(\d+)\t(\d+)$", re.MULTILINE)
@@ -551,15 +551,13 @@ def evaluate(
 def build_profile_candidate(report: dict) -> dict:
     if report["violations"] or report["unavailable"]:
         raise OracleUnavailable("profile candidate requires a complete zero-violation report")
+    cases = report.get("cases")
+    if (type(cases) is not list or not cases
+            or report.get("summary", {}).get("cases") != len(cases)):
+        raise OracleUnavailable("profile candidate requires a non-empty complete case set")
     if report.get("summary", {}).get("seeds") != list(range(20)) or not report.get("summary", {}).get(
             "retry_checked"):
         raise OracleUnavailable("profile candidate requires seeds 0..19 and retry")
-    outcomes = {
-        case.get("analysis", {}).get("auto_tile_and_bind_subblock_outcome")
-        for case in report["cases"]
-    }
-    if outcomes != {False, True}:
-        raise OracleUnavailable("profile candidate requires both auto-tile outcomes")
     if not _is_sha256(report.get("suffix_compiler_sha256")):
         raise OracleUnavailable("profile candidate requires the suffix compiler hash")
     report_sha256 = hashlib.sha256(
@@ -567,7 +565,7 @@ def build_profile_candidate(report: dict) -> dict:
     ).hexdigest()
     profiles = []
     fingerprints = set()
-    for case in report["cases"]:
+    for case in cases:
         analysis = case.get("analysis", {})
         identity = analysis.get("pipeline_identity_detail")
         stages = analysis.get("pipeline_stages_detail")
@@ -600,7 +598,7 @@ def build_profile_candidate(report: dict) -> dict:
             "oracle_report_sha256": report_sha256,
             "validated_seeds": validated_seeds,
             "retry_validated": retry_validated,
-            "auto_tile_and_bind_subblock_outcomes": [False, True],
+            "auto_tile_and_bind_subblock_outcome": expected_outcome,
         })
     return {
         "schema": "ttir-ub-lb-profile-v1",

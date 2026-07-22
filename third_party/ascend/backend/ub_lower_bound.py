@@ -37,8 +37,8 @@ _INVALID_RESOURCE_ID = (1 << 32) - 1
 _CONTRACT_VERSION = "ttir-ub-lb-v1"
 _IDENTITY_CONTRACT = {
     "auto_tile_and_bind_subblock": {
-        "identity_value": "module-derived-both-outcomes",
-        "profile_promotion_requires": "task7-oracle-validates-enabled-and-disabled-outcomes",
+        "identity_value": "module-derived-per-exact-ttir",
+        "profile_promotion_requires": "oracle-validates-exact-profile-outcome",
     },
 }
 _RESULT_KEYS = frozenset({
@@ -74,7 +74,7 @@ _PROFILE_ENTRY_KEYS = frozenset({
     "oracle_report_sha256",
     "validated_seeds",
     "retry_validated",
-    "auto_tile_and_bind_subblock_outcomes",
+    "auto_tile_and_bind_subblock_outcome",
 })
 _DIRECT_COPY_PARAMETER_KEYS = frozenset({
     "expected_resource_count",
@@ -204,7 +204,7 @@ def _is_valid_profile_entry(entry):
         return False
     if entry["validated_seeds"] != list(range(20)) or entry["retry_validated"] is not True:
         return False
-    if entry["auto_tile_and_bind_subblock_outcomes"] != [False, True]:
+    if type(entry["auto_tile_and_bind_subblock_outcome"]) is not bool:
         return False
     return True
 

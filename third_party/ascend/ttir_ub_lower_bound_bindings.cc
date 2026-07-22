@@ -217,12 +217,12 @@ bool loadMatchingProfile(const py::handle &value,
             profile.contains("oracle_report_sha256") &&
             profile.contains("validated_seeds") &&
             profile.contains("retry_validated") &&
-            profile.contains("auto_tile_and_bind_subblock_outcomes")) {
+            profile.contains("auto_tile_and_bind_subblock_outcome")) {
           const std::string reportHash =
               requireString(profile, "oracle_report_sha256");
           py::list seeds = py::cast<py::list>(profile["validated_seeds"]);
-          py::list outcomes = py::cast<py::list>(
-              profile["auto_tile_and_bind_subblock_outcomes"]);
+          const py::handle autoTileOutcome =
+              profile["auto_tile_and_bind_subblock_outcome"];
           bool validHash = reportHash.size() == 64 &&
                            llvm::all_of(reportHash, [](char character) {
                              return (character >= '0' && character <= '9') ||
@@ -241,10 +241,7 @@ bool loadMatchingProfile(const py::handle &value,
           matchedProfileIsCertified =
               validHash && validSeeds && py::isinstance<py::bool_>(retry) &&
               py::cast<bool>(retry) &&
-              outcomes.size() == 2 &&
-              py::isinstance<py::bool_>(outcomes[0]) &&
-              py::isinstance<py::bool_>(outcomes[1]) &&
-              !py::cast<bool>(outcomes[0]) && py::cast<bool>(outcomes[1]);
+              py::isinstance<py::bool_>(autoTileOutcome);
         }
       } catch (const std::exception &) {
         matchedProfileIsCertified = false;
