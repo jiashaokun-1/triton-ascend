@@ -87,6 +87,25 @@ _REDUCTION_PARAMETER_KEYS = _DIRECT_COPY_PARAMETER_KEYS | {
     "expected_scratch_payload_bytes",
     "expected_accumulator_payload_bytes",
 }
+_DYNAMIC_CV_PARAMETER_KEYS = frozenset({
+    "expected_resource_count",
+    "expected_output_elements",
+    "expected_element_bit_width",
+    "expected_source_payload_bytes",
+    "projected_payload_bytes",
+    "fixpipe_min_instances",
+    "vector_min_instances",
+})
+_IRREGULAR_MEMORY_PARAMETER_KEYS = frozenset({
+    "expected_resource_count",
+    "expected_elements",
+    "expected_index_bit_width",
+    "expected_value_bit_width",
+    "expected_index_payload_bytes",
+    "expected_value_payload_bytes",
+    "max_tiles",
+    "materialized_allocation_count",
+})
 
 
 def _has_positive_decimal_parameters(parameters, expected_keys):
@@ -138,6 +157,25 @@ def _is_valid_profile_stage(stage):
         return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS | {"max_tiles"})
     if contract_id == "reduction-sum-extra-buffer":
         return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS)
+    if contract_id in {
+        "dynamic-cv-source-preserve",
+        "dynamic-cv-replay",
+        "dynamic-cv-result-preserve",
+    }:
+        return _has_positive_decimal_parameters(
+            parameters, _DYNAMIC_CV_PARAMETER_KEYS
+        )
+    if contract_id in {
+        "irregular-memory-source-preserve",
+        "irregular-memory-replay",
+        "irregular-memory-result-preserve",
+    }:
+        return (
+            _has_positive_decimal_parameters(
+                parameters, _IRREGULAR_MEMORY_PARAMETER_KEYS
+            )
+            and parameters["materialized_allocation_count"] == "1"
+        )
     return False
 
 
@@ -225,11 +263,31 @@ def _is_valid_profile_entry(entry):
         stage["contract_id"] for stage in stages
         if stage["contract_id"].startswith(
             ("direct-copy-", "binary-add-", "loop-carried-add-",
-             "reshape-copy-", "reduction-sum-")
+             "reshape-copy-", "reduction-sum-", "dynamic-cv-",
+             "irregular-memory-")
         )
     ]
     if active_contract_ids:
-        if relevant_options.get("compile_mode") != "simd":
+        dynamic_contracts = [
+            contract_id for contract_id in active_contract_ids
+            if contract_id.startswith("dynamic-cv-")
+        ]
+        irregular_contracts = [
+            contract_id for contract_id in active_contract_ids
+            if contract_id.startswith("irregular-memory-")
+        ]
+        if dynamic_contracts:
+            if (len(dynamic_contracts) != len(active_contract_ids)
+                    or relevant_options.get("compile_mode") != "simd"
+                    or relevant_options.get("enable_dynamic_cv_pipeline") is not True):
+                return False
+        elif irregular_contracts:
+            if (len(irregular_contracts) != len(active_contract_ids)
+                    or relevant_options.get("compile_mode") != "simd_simt"
+                    or relevant_options.get("enable_dynamic_cv_pipeline") is True
+                    or relevant_options.get("multibuffer") is True):
+                return False
+        elif relevant_options.get("compile_mode") != "simd":
             return False
         effective_multibuffer = (
             relevant_options.get("multibuffer") is True
@@ -238,7 +296,9 @@ def _is_valid_profile_entry(entry):
         has_multibuffer_contract = (
             "loop-carried-add-multibuffer" in active_contract_ids
         )
-        if has_multibuffer_contract:
+        if dynamic_contracts or irregular_contracts:
+            pass
+        elif has_multibuffer_contract:
             if not effective_multibuffer or any(
                     not contract_id.startswith("loop-carried-add-")
                     for contract_id in active_contract_ids):
@@ -284,7 +344,7 @@ def _pipeline_fingerprint(pipeline_identity):
 
 def _analysis_compile_mode(compile_mode):
     """Map backend mode names to the core-kind vocabulary used by MURG."""
-    return "aiv" if compile_mode == "simd" else compile_mode
+    return "aiv" if compile_mode in ("simd", "simd_simt") else compile_mode
 
 
 def _defer_result(pipeline_fingerprint, reason):

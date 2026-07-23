@@ -20,8 +20,8 @@
       "family": "irregular-memory",
       "phase": "P4",
       "operations": ["tt.gather", "tt.scatter", "tt.index_select", "tt.index_put", "tt.load_unstructured", "tt.store_unstructured"],
-      "status": "deliberate-defer",
-      "evidence": "unsupported-op-irregular-memory"
+      "status": "replay-shadow",
+      "evidence": "exact simd_simt indirect-index load/add fixture has an executable source-preserve -> irregular-memory-replay -> result-preserve chain; all unmatched irregular forms retain unsupported-op-irregular-memory"
     },
     {
       "family": "elementwise",
@@ -118,8 +118,8 @@
       "family": "dynamic-cv-mix",
       "phase": "P4",
       "operations": ["DynamicCVPipeline", "PlanComputeBlock", "SplitDataflow", "SeparateMemoryFromCompute", "AllocMultiCache", "AddControlFlowCondition", "SplitMix"],
-      "status": "deliberate-defer",
-      "evidence": "exact PipelineIdentity and boundary audit; semantic replay and PlanMemory promotion are forbidden until producer/consumer schemas match"
+      "status": "replay-shadow",
+      "evidence": "exact MIX dot-exp fixture has an executable source-preserve -> dynamic-cv-replay -> result-preserve chain and 20-seed semantic lower-bound validation; production promotion remains forbidden until a same-schema suffix oracle is available"
     }
   ],
   "contracts": [
@@ -143,8 +143,8 @@
     {"name": "LayoutConversionContract", "phase": "P4", "status": "deliberate-defer"},
     {"name": "ReductionMaterializationContract", "phase": "P3", "status": "implemented-slice"},
     {"name": "DescriptorMemoryContract", "phase": "P4", "status": "deliberate-defer"},
-    {"name": "IrregularMemoryContract", "phase": "P4", "status": "deliberate-defer"},
-    {"name": "DynamicCVPipelineContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "IrregularMemoryContract", "phase": "P4", "status": "replay-shadow"},
+    {"name": "DynamicCVPipelineContract", "phase": "P4", "status": "replay-shadow"},
     {"name": "PlanComputeBlockContract", "phase": "P4", "status": "deliberate-defer"},
     {"name": "SplitDataflowContract", "phase": "P4", "status": "deliberate-defer"},
     {"name": "SeparateMemoryFromComputeContract", "phase": "P4", "status": "deliberate-defer"},

@@ -4,6 +4,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -57,6 +58,39 @@ FailureOr<int64_t> getPayloadBytes(RankedTensorType type,
     return failure();
   }
   return numElements * bytesPerElement;
+}
+
+FailureOr<int64_t>
+getStaticTensorPayloadBytes(RankedTensorType type, unsigned expectedRank,
+                            SmallVectorImpl<std::string> &reasons) {
+  if (!type || !type.hasStaticShape()) {
+    addReason(reasons, "dynamic-shape");
+    return failure();
+  }
+  if (type.getRank() != expectedRank) {
+    addReason(reasons, "unsupported-shape");
+    return failure();
+  }
+  Type elementType = type.getElementType();
+  if (!isa<IntegerType, FloatType>(elementType)) {
+    addReason(reasons, "unsupported-element-type");
+    return failure();
+  }
+  const unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+  if (bitWidth < 8 || (bitWidth != 8 && bitWidth != 16 && bitWidth != 32 &&
+                       bitWidth != 64)) {
+    addReason(reasons, bitWidth < 8 ? "sub-byte-element-type"
+                                   : "unsupported-element-type");
+    return failure();
+  }
+  const int64_t elements = type.getNumElements();
+  const int64_t bytesPerElement = llvm::divideCeil(bitWidth, 8u);
+  if (elements < 0 ||
+      (bytesPerElement != 0 && elements > INT64_MAX / bytesPerElement)) {
+    addReason(reasons, "arithmetic-overflow");
+    return failure();
+  }
+  return elements * bytesPerElement;
 }
 
 struct ContiguousPointerChain {
@@ -166,10 +200,19 @@ LogicalResult rejectUnsupportedOperations(
       addReason(reasons, "nested-region");
       return WalkResult::interrupt();
     }
+    if (!matched.contains(operation) &&
+        isa<triton::ExpandDimsOp, triton::BroadcastOp>(operation)) {
+      addReason(reasons, isa<triton::ExpandDimsOp>(operation)
+                             ? "unsupported-op-expand-dims"
+                             : "unsupported-op-broadcast");
+      return WalkResult::interrupt();
+    }
     if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp,
             triton::LoadOp, triton::StoreOp, triton::ReshapeOp,
+            triton::ExpandDimsOp, triton::BroadcastOp, triton::DotOp,
             triton::ReduceOp, triton::ReduceReturnOp, arith::AddFOp,
-            arith::ConstantOp, scf::ForOp, scf::YieldOp>(operation)) {
+            arith::MulIOp, arith::ConstantOp, math::ExpOp, scf::ForOp,
+            scf::YieldOp>(operation)) {
       triton::FuncOp function = operation->getParentOfType<triton::FuncOp>();
       const bool isReduction = isa<triton::ReduceOp>(operation);
       const bool isReductionBody =
@@ -394,8 +437,19 @@ LogicalResult materializeLoad(triton::LoadOp load,
 
   if (load.getResult().use_empty())
     return defer(reasons, "load-not-reaching-store");
-  if (!load.getResult().hasOneUse())
+  if (!load.getResult().hasOneUse()) {
+    for (Operation *user : load.getResult().getUsers()) {
+      auto expand = dyn_cast<triton::ExpandDimsOp>(user);
+      if (!expand)
+        continue;
+      if (llvm::any_of(expand.getResult().getUsers(), [](Operation *nested) {
+            return isa<triton::BroadcastOp>(nested);
+          }))
+        return defer(reasons, "unsupported-op-broadcast");
+      return defer(reasons, "unsupported-op-expand-dims");
+    }
     return defer(reasons, "load-has-extra-use");
+  }
   Operation *user = *load.getResult().getUsers().begin();
   if (isa<triton::ReduceOp>(user))
     return defer(reasons, "unsupported-op-reduction");
@@ -956,6 +1010,329 @@ LogicalResult materializeLoopCarriedAdd(
   return success();
 }
 
+BlockArgument tracePointerBase(Value pointer) {
+  llvm::DenseSet<Value> visited;
+  while (pointer && visited.insert(pointer).second) {
+    if (auto argument = dyn_cast<BlockArgument>(pointer))
+      return argument;
+    if (auto addPtr = pointer.getDefiningOp<triton::AddPtrOp>()) {
+      pointer = addPtr.getPtr();
+      continue;
+    }
+    if (auto broadcast = pointer.getDefiningOp<triton::BroadcastOp>()) {
+      pointer = broadcast.getSrc();
+      continue;
+    }
+    if (auto splat = pointer.getDefiningOp<triton::SplatOp>()) {
+      pointer = splat.getSrc();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+bool hasPlainLoadSemantics(triton::LoadOp load) {
+  return load && load->getNumOperands() == 1 &&
+         load->getNumResults() == 1 && load->getNumRegions() == 0 &&
+         load->getNumSuccessors() == 0 && !load.getOther() &&
+         load.getBoundaryCheck().empty() && !load.getPadding() &&
+         !load.getIsVolatile() &&
+         load.getCache() == triton::CacheModifier::NONE &&
+         load.getEvict() == triton::EvictionPolicy::NORMAL;
+}
+
+bool hasPlainStoreSemantics(triton::StoreOp store) {
+  return store && store->getNumOperands() == 2 &&
+         store->getNumResults() == 0 && store->getNumRegions() == 0 &&
+         store->getNumSuccessors() == 0 &&
+         store.getBoundaryCheck().empty() &&
+         store.getCache() == triton::CacheModifier::NONE &&
+         store.getEvict() == triton::EvictionPolicy::NORMAL;
+}
+
+template <typename OpTy>
+SmallVector<OpTy> collectOperations(ModuleOp module) {
+  SmallVector<OpTy> result;
+  module.walk([&](OpTy operation) { result.push_back(operation); });
+  return result;
+}
+
+LogicalResult materializeDynamicCVDotExp(
+    ModuleOp module, triton::DotOp dot, MandatoryUBResourceGraph &graph,
+    llvm::DenseSet<Operation *> &matched,
+    SmallVectorImpl<std::string> &reasons) {
+  triton::FuncOp function = dot->getParentOfType<triton::FuncOp>();
+  if (!function || !isDirectlyInEntryBlock(dot, function) ||
+      function.getBody().front().getNumArguments() != 3 ||
+      dot->getNumOperands() != 3 || dot->getNumResults() != 1 ||
+      dot->getNumRegions() != 0 || dot->getNumSuccessors() != 0)
+    return defer(reasons, "unsupported-dynamic-cv-shape");
+
+  auto aType = dyn_cast<RankedTensorType>(dot->getOperand(0).getType());
+  auto bType = dyn_cast<RankedTensorType>(dot->getOperand(1).getType());
+  auto cType = dyn_cast<RankedTensorType>(dot->getOperand(2).getType());
+  auto outputType = dyn_cast<RankedTensorType>(dot->getResult(0).getType());
+  if (!aType || !bType || !cType || !outputType ||
+      !aType.hasStaticShape() || !bType.hasStaticShape() ||
+      !cType.hasStaticShape() || !outputType.hasStaticShape() ||
+      aType.getRank() != 2 || bType.getRank() != 2 ||
+      cType.getRank() != 2 || outputType.getRank() != 2 ||
+      !aType.getElementType().isF32() || !bType.getElementType().isF32() ||
+      !cType.getElementType().isF32() ||
+      !outputType.getElementType().isF32() ||
+      aType.getDimSize(0) != outputType.getDimSize(0) ||
+      bType.getDimSize(1) != outputType.getDimSize(1) ||
+      aType.getDimSize(1) != bType.getDimSize(0) ||
+      cType != outputType)
+    return defer(reasons, "unsupported-dynamic-cv-shape");
+  FailureOr<int64_t> payload =
+      getStaticTensorPayloadBytes(outputType, 2, reasons);
+  if (failed(payload))
+    return failure();
+
+  auto lhsLoad = dot->getOperand(0).getDefiningOp<triton::LoadOp>();
+  auto rhsLoad = dot->getOperand(1).getDefiningOp<triton::LoadOp>();
+  auto accumulator =
+      dot->getOperand(2).getDefiningOp<arith::ConstantOp>();
+  if (!lhsLoad || !rhsLoad || lhsLoad == rhsLoad ||
+      !hasPlainLoadSemantics(lhsLoad) ||
+      !hasPlainLoadSemantics(rhsLoad) ||
+      lhsLoad.getType() != aType || rhsLoad.getType() != bType ||
+      !lhsLoad.getResult().hasOneUse() || !rhsLoad.getResult().hasOneUse() ||
+      !accumulator || accumulator.getType() != cType)
+    return defer(reasons, "unsupported-dynamic-cv-dataflow");
+
+  auto denseAccumulator =
+      dyn_cast<DenseElementsAttr>(accumulator.getValue());
+  if (!denseAccumulator || !denseAccumulator.isSplat() ||
+      !denseAccumulator.getSplatValue<APFloat>().isZero())
+    return defer(reasons, "unsupported-dynamic-cv-accumulator");
+
+  if (!dot.getResult().hasOneUse())
+    return defer(reasons, "unsupported-dynamic-cv-dataflow");
+  auto exp = dyn_cast<math::ExpOp>(*dot.getResult().getUsers().begin());
+  if (!exp || !isDirectlyInEntryBlock(exp, function) ||
+      exp->getNumOperands() != 1 || exp->getNumResults() != 1 ||
+      exp->getNumRegions() != 0 || exp->getNumSuccessors() != 0 ||
+      exp.getOperand().getType() != outputType ||
+      exp.getResult().getType() != outputType ||
+      exp.getFastmath() != arith::FastMathFlags::none ||
+      !exp.getResult().hasOneUse())
+    return defer(reasons, "unsupported-dynamic-cv-vector-stage");
+  auto store = dyn_cast<triton::StoreOp>(*exp.getResult().getUsers().begin());
+  if (!hasPlainStoreSemantics(store) || store.getValue() != exp.getResult() ||
+      !isDirectlyInEntryBlock(store, function) ||
+      !exp->isBeforeInBlock(store))
+    return defer(reasons, "unsupported-dynamic-cv-store");
+
+  Block &entry = function.getBody().front();
+  BlockArgument lhsBase = tracePointerBase(lhsLoad.getPtr());
+  BlockArgument rhsBase = tracePointerBase(rhsLoad.getPtr());
+  BlockArgument destinationBase = tracePointerBase(store.getPtr());
+  if (!lhsBase || !rhsBase || !destinationBase ||
+      lhsBase != entry.getArgument(0) || rhsBase != entry.getArgument(1) ||
+      destinationBase != entry.getArgument(2))
+    return defer(reasons, "unsupported-dynamic-cv-pointer");
+
+  const auto constants = collectOperations<arith::ConstantOp>(module);
+  const auto ranges = collectOperations<triton::MakeRangeOp>(module);
+  const auto expands = collectOperations<triton::ExpandDimsOp>(module);
+  const auto multiplies = collectOperations<arith::MulIOp>(module);
+  const auto splats = collectOperations<triton::SplatOp>(module);
+  const auto broadcasts = collectOperations<triton::BroadcastOp>(module);
+  const auto addPtrs = collectOperations<triton::AddPtrOp>(module);
+  const auto loads = collectOperations<triton::LoadOp>(module);
+  const auto dots = collectOperations<triton::DotOp>(module);
+  const auto exps = collectOperations<math::ExpOp>(module);
+  const auto stores = collectOperations<triton::StoreOp>(module);
+  if (constants.size() != 2 || ranges.size() != 1 || expands.size() != 2 ||
+      multiplies.size() != 1 || splats.size() != 3 ||
+      broadcasts.size() != 4 || addPtrs.size() != 6 || loads.size() != 2 ||
+      dots.size() != 1 || exps.size() != 1 || stores.size() != 1)
+    return defer(reasons, "unsupported-dynamic-cv-structure");
+
+  for (Operation &operation : entry.without_terminator()) {
+    if (!isDirectlyInEntryBlock(&operation, function))
+      return defer(reasons, "unsupported-dynamic-cv-structure");
+    matched.insert(&operation);
+  }
+
+  const uint64_t dotOrdinal =
+      std::distance(entry.begin(), dot->getIterator());
+  const uint64_t expOrdinal =
+      std::distance(entry.begin(), exp->getIterator());
+  const uint64_t storeOrdinal =
+      std::distance(entry.begin(), store->getIterator());
+  MandatoryUBResource fixpipe;
+  fixpipe.debugName = "dynamic-cv-fixpipe-output";
+  fixpipe.minPayloadBytes = *payload;
+  fixpipe.minInstances = 1;
+  fixpipe.origin = "tt.dot";
+  fixpipe.kind = MaterializationKind::DynamicCVFixpipeOutput;
+  fixpipe.birth.ordinal = dotOrdinal;
+  fixpipe.lastRequiredUse.ordinal = expOrdinal;
+  fixpipe.sourceElements = outputType.getNumElements();
+  fixpipe.elementBitWidth = 32;
+  fixpipe.consumer = "math.exp";
+  fixpipe.contractTrace.push_back("ttir-dynamic-cv-dot-exp-v1");
+  ResourceId fixpipeId = graph.addResource(std::move(fixpipe));
+
+  MandatoryUBResource vector;
+  vector.debugName = "dynamic-cv-vector-output";
+  vector.minPayloadBytes = *payload;
+  vector.minInstances = 1;
+  vector.origin = "math.exp";
+  vector.kind = MaterializationKind::DynamicCVVectorOutput;
+  vector.birth.ordinal = expOrdinal;
+  vector.lastRequiredUse.ordinal = storeOrdinal;
+  vector.sourceElements = outputType.getNumElements();
+  vector.elementBitWidth = 32;
+  vector.consumer = "tt.store";
+  vector.contractTrace.push_back("ttir-dynamic-cv-dot-exp-v1");
+  ResourceId vectorId = graph.addResource(std::move(vector));
+  if (fixpipeId == InvalidResourceId || vectorId == InvalidResourceId)
+    return defer(reasons, "malformed-resource-graph");
+  graph.addMayAlias(fixpipeId, vectorId);
+  CoexistenceWitness witness;
+  witness.resources = {fixpipeId, vectorId};
+  witness.contractTrace.push_back("ttir-dynamic-cv-dot-exp-v1");
+  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
+    return defer(reasons, "malformed-resource-graph");
+  return success();
+}
+
+LogicalResult materializeIrregularIndirectAdd(
+    ModuleOp module, ArrayRef<triton::LoadOp> loads, arith::AddFOp add,
+    MandatoryUBResourceGraph &graph, llvm::DenseSet<Operation *> &matched,
+    SmallVectorImpl<std::string> &reasons) {
+  triton::FuncOp function = add->getParentOfType<triton::FuncOp>();
+  if (!function || !isDirectlyInEntryBlock(add, function) ||
+      function.getBody().front().getNumArguments() != 4 ||
+      loads.size() != 2 || add->getNumOperands() != 2 ||
+      add->getNumResults() != 1 || add->getNumRegions() != 0 ||
+      add->getNumSuccessors() != 0 ||
+      add.getFastmath() != arith::FastMathFlags::none)
+    return defer(reasons, "unsupported-irregular-shape");
+
+  triton::LoadOp indexLoad;
+  triton::LoadOp valueLoad;
+  for (triton::LoadOp load : loads) {
+    auto type = dyn_cast<RankedTensorType>(load.getType());
+    if (type && type.hasStaticShape() && type.getRank() == 1 &&
+        type.getElementType().isInteger(64))
+      indexLoad = load;
+    else if (type && type.hasStaticShape() && type.getRank() == 1 &&
+             type.getElementType().isF32())
+      valueLoad = load;
+  }
+  if (!indexLoad || !valueLoad || !hasPlainLoadSemantics(indexLoad) ||
+      !hasPlainLoadSemantics(valueLoad))
+    return defer(reasons, "unsupported-irregular-load");
+  auto indexType = cast<RankedTensorType>(indexLoad.getType());
+  auto valueType = cast<RankedTensorType>(valueLoad.getType());
+  if (indexType.getNumElements() != valueType.getNumElements())
+    return defer(reasons, "unsupported-irregular-shape");
+  FailureOr<int64_t> indexPayload =
+      getStaticTensorPayloadBytes(indexType, 1, reasons);
+  FailureOr<int64_t> valuePayload =
+      getStaticTensorPayloadBytes(valueType, 1, reasons);
+  if (failed(indexPayload) || failed(valuePayload))
+    return failure();
+
+  auto indirect = valueLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
+  auto valueBaseSplat =
+      indirect ? indirect.getPtr().getDefiningOp<triton::SplatOp>()
+               : triton::SplatOp();
+  Block &entry = function.getBody().front();
+  if (!indirect || !valueBaseSplat ||
+      indirect.getOffset() != indexLoad.getResult() ||
+      !indexLoad.getResult().hasOneUse() ||
+      !indirect.getResult().hasOneUse() ||
+      !valueLoad.getResult().hasOneUse() ||
+      valueBaseSplat.getSrc() != entry.getArgument(0))
+    return defer(reasons, "unsupported-irregular-pointer");
+
+  Value scalarValue;
+  Value gatheredValue = valueLoad.getResult();
+  if (add.getLhs() == gatheredValue)
+    scalarValue = add.getRhs();
+  else if (add.getRhs() == gatheredValue)
+    scalarValue = add.getLhs();
+  else
+    return defer(reasons, "unsupported-irregular-dataflow");
+  auto scalarSplat = scalarValue.getDefiningOp<triton::SplatOp>();
+  if (!scalarSplat || scalarSplat.getSrc() != entry.getArgument(3) ||
+      !scalarSplat.getResult().hasOneUse() || !add.getResult().hasOneUse())
+    return defer(reasons, "unsupported-irregular-dataflow");
+
+  auto store = dyn_cast<triton::StoreOp>(*add.getResult().getUsers().begin());
+  if (!hasPlainStoreSemantics(store) || store.getValue() != add.getResult() ||
+      !isDirectlyInEntryBlock(store, function))
+    return defer(reasons, "unsupported-irregular-store");
+  BlockArgument indexBase = tracePointerBase(indexLoad.getPtr());
+  BlockArgument destinationBase = tracePointerBase(store.getPtr());
+  if (!indexBase || !destinationBase ||
+      indexBase != entry.getArgument(1) ||
+      destinationBase != entry.getArgument(2))
+    return defer(reasons, "unsupported-irregular-pointer");
+
+  const auto ranges = collectOperations<triton::MakeRangeOp>(module);
+  const auto splats = collectOperations<triton::SplatOp>(module);
+  const auto addPtrs = collectOperations<triton::AddPtrOp>(module);
+  const auto adds = collectOperations<arith::AddFOp>(module);
+  const auto stores = collectOperations<triton::StoreOp>(module);
+  if (ranges.size() != 1 || splats.size() != 4 ||
+      addPtrs.size() != 3 || loads.size() != 2 || adds.size() != 1 ||
+      stores.size() != 1)
+    return defer(reasons, "unsupported-irregular-structure");
+  for (Operation &operation : entry.without_terminator())
+    matched.insert(&operation);
+
+  const uint64_t indexOrdinal =
+      std::distance(entry.begin(), indexLoad->getIterator());
+  const uint64_t valueOrdinal =
+      std::distance(entry.begin(), valueLoad->getIterator());
+  const uint64_t addOrdinal =
+      std::distance(entry.begin(), add->getIterator());
+  MandatoryUBResource index;
+  index.debugName = "irregular-index";
+  index.minPayloadBytes = *indexPayload;
+  index.minInstances = 1;
+  index.origin = "tt.load";
+  index.kind = MaterializationKind::IrregularIndex;
+  index.birth.ordinal = indexOrdinal;
+  index.lastRequiredUse.ordinal = valueOrdinal;
+  index.sourceElements = indexType.getNumElements();
+  index.elementBitWidth = 64;
+  index.consumer = "tt.addptr";
+  index.contractTrace.push_back("ttir-irregular-indirect-add-v1");
+  ResourceId indexId = graph.addResource(std::move(index));
+
+  MandatoryUBResource value;
+  value.debugName = "irregular-gather";
+  value.minPayloadBytes = *valuePayload;
+  value.minInstances = 1;
+  value.origin = "tt.load";
+  value.kind = MaterializationKind::IrregularGather;
+  value.birth.ordinal = valueOrdinal;
+  value.lastRequiredUse.ordinal = addOrdinal;
+  value.sourceElements = valueType.getNumElements();
+  value.elementBitWidth = 32;
+  value.consumer = "arith.addf";
+  value.contractTrace.push_back("ttir-irregular-indirect-add-v1");
+  ResourceId valueId = graph.addResource(std::move(value));
+  if (indexId == InvalidResourceId || valueId == InvalidResourceId)
+    return defer(reasons, "malformed-resource-graph");
+  graph.addMayAlias(indexId, valueId);
+  CoexistenceWitness witness;
+  witness.resources = {indexId, valueId};
+  witness.contractTrace.push_back("ttir-irregular-indirect-add-v1");
+  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
+    return defer(reasons, "malformed-resource-graph");
+  return success();
+}
+
 } // namespace
 
 LogicalResult materializeDirectTensorLoads(
@@ -991,7 +1368,22 @@ LogicalResult materializeDirectTensorLoads(
   module.walk([&](arith::AddFOp add) { adds.push_back(add); });
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp loop) { loops.push_back(loop); });
-  if (!loops.empty()) {
+  SmallVector<triton::DotOp> dots;
+  module.walk([&](triton::DotOp dot) { dots.push_back(dot); });
+  const bool irregular =
+      llvm::any_of(loads, [](triton::LoadOp load) {
+        auto addPtr = load.getPtr().getDefiningOp<triton::AddPtrOp>();
+        return addPtr &&
+               static_cast<bool>(
+                   addPtr.getOffset().getDefiningOp<triton::LoadOp>());
+      });
+  if (!dots.empty()) {
+    if (dots.size() != 1 || loops.size() != 0 || reductions.size() != 0 ||
+        adds.size() != 0 ||
+        failed(materializeDynamicCVDotExp(module, dots.front(), graph, matched,
+                                          unsupportedReasons)))
+      return failure();
+  } else if (!loops.empty()) {
     if (loops.size() != 1 || reductions.size() != 0 || adds.size() != 1 ||
         failed(materializeLoopCarriedAdd(loads, loops.front(), graph, matched,
                                          unsupportedReasons)))
@@ -1002,9 +1394,16 @@ LogicalResult materializeDirectTensorLoads(
                                        graph, matched, unsupportedReasons)))
       return failure();
   } else if (!adds.empty()) {
-    if (adds.size() != 1 ||
-        failed(materializeBinaryAdd(loads, adds.front(), graph, matched,
-                                    unsupportedReasons)))
+    if (adds.size() != 1)
+      return failure();
+    LogicalResult result =
+        irregular
+            ? materializeIrregularIndirectAdd(module, loads, adds.front(),
+                                              graph, matched,
+                                              unsupportedReasons)
+            : materializeBinaryAdd(loads, adds.front(), graph, matched,
+                                   unsupportedReasons);
+    if (failed(result))
       return failure();
   } else {
     for (triton::LoadOp load : loads) {

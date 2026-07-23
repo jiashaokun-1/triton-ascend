@@ -98,6 +98,18 @@ def test_binary_add_boundary_extracts_two_static_local_allocations():
     assert oracle.parse_boundary_allocation_bytes(text) == [4096, 4096]
 
 
+def test_dynamic_cv_boundary_extracts_ranked_explicit_ub_allocations():
+    text = (
+        '%0 = "memref.alloc"() : () -> '
+        'memref<16x16xf32, #hivm.address_space<ub>>\n'
+        '%1 = "memref.alloc"() : () -> memref<16x16xf32>\n'
+        '%2 = "memref.alloc"() : () -> '
+        'memref<16x16xf32, #hivm.address_space<ub>>\n'
+    )
+    assert oracle.parse_boundary_allocation_bytes(text) == [1024, 1024, 1024]
+    assert oracle.parse_explicit_ub_allocation_bytes(text) == [1024, 1024]
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -463,6 +475,70 @@ def test_dynamic_cv_stage_is_always_explicit_fail_closed():
     assert bindings[1]["contract_parameters"] == {}
 
 
+def test_dynamic_cv_contract_chain_replays_then_preserves_result():
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_output_elements": 256,
+        "expected_element_bit_width": 32,
+        "expected_source_payload_bytes": 1024,
+        "projected_payload_bytes": 1024,
+        "fixpipe_min_instances": 1,
+        "vector_min_instances": 1,
+        "materialization_stage": "ttir.dynamic-cv-pipeline",
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.auto-blockify", "options": {}},
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "ttir.dynamic-cv-pipeline", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal, "dynamic-cv"
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+    assert [binding["contract_id"] for binding in bindings] == [
+        "dynamic-cv-source-preserve",
+        "dynamic-cv-source-preserve",
+        "dynamic-cv-replay",
+        "dynamic-cv-result-preserve",
+    ]
+    assert bindings[2]["contract_parameters"]["projected_payload_bytes"] == \
+        "1024"
+
+
+def test_irregular_memory_contract_chain_replays_at_linalg():
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_elements": 8,
+        "expected_index_bit_width": 64,
+        "expected_value_bit_width": 32,
+        "expected_index_payload_bytes": 64,
+        "expected_value_payload_bytes": 32,
+        "max_tiles": 1,
+        "materialized_allocation_count": 1,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.auto-blockify", "options": {}},
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal, "irregular-memory"
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+    assert [binding["contract_id"] for binding in bindings] == [
+        "irregular-memory-source-preserve",
+        "irregular-memory-replay",
+        "irregular-memory-result-preserve",
+    ]
+    assert bindings[1]["contract_parameters"][
+        "materialized_allocation_count"
+    ] == "1"
+
+
 def test_binary_add_contract_chain_uses_binary_contracts():
     identity = {"sha256": "identity"}
     stages = [
@@ -800,6 +876,46 @@ def test_evaluate_accepts_available_defer_results(tmp_path):
         "semantic_replay_checked": False, "violations": 0, "unavailable": 0
     }
     assert [item["seed"] for item in report["cases"][0]["runs"]] == [0, 1, -1]
+
+
+def test_evaluate_allows_irregular_replay_to_add_gather_value_resource(
+        monkeypatch):
+    manifest = oracle.load_manifest(
+        Path(__file__).parent / "fixtures" / "manifest.json"
+    )
+    manifest["cases"] = [
+        case for case in manifest["cases"]
+        if case["operation_family"] == "irregular-memory"
+    ]
+    analysis = {
+        "operation_family": "irregular-memory",
+        "decision": "defer",
+        "lower_bound_bytes": 96,
+        "capacity_bytes": 262144,
+        "before_cvpipelining_allocation_bytes": 64,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    monkeypatch.setattr(
+        oracle, "has_valid_materialization_bridge", lambda _analysis: True
+    )
+    monkeypatch.setattr(
+        oracle, "has_valid_certificate", lambda _analysis: True
+    )
+
+    def run(_compiler, _input, seed, _pipeline_arguments):
+        return {
+            "seed": seed,
+            "status": "success",
+            "overflow_scope": None,
+            "actual_peak_bits": 1024,
+            "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(
+        manifest, Path("compiler"), [0], False, lambda _case: analysis, run
+    )
+    assert report["violations"] == []
+    assert report["unavailable"] == []
 
 
 def test_evaluate_derives_one_consistent_auto_tile_outcome(tmp_path):

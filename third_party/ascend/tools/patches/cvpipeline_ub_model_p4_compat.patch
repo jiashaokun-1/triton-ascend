@@ -1,0 +1,138 @@
+diff --git a/cvpipeline_ub_model_cpp/src/ir/generic_op_semantics.hpp b/cvpipeline_ub_model_cpp/src/ir/generic_op_semantics.hpp
+--- a/cvpipeline_ub_model_cpp/src/ir/generic_op_semantics.hpp
++++ b/cvpipeline_ub_model_cpp/src/ir/generic_op_semantics.hpp
+@@ -12,3 +12,4 @@ inline bool HasModeledOperationSemantics(const std::string &name) {
+       "affine.apply", "affine.max", "affine.min", "annotation.mark",
+-      "bufferization.alloc_tensor",
++      "bufferization.alloc_tensor",
++      "bufferization.materialize_in_destination",
+       "bufferization.to_tensor", "builtin.module", "cf.br", "cf.cond_br",
+@@ -33,6 +34,8 @@ inline bool HasModeledOperationSemantics(const std::string &name) {
+       "hivm.hir.vsqrt", "hivm.hir.vsub", "hivm.hir.vtranspose",
+       "hivm.hir.vxor",
++      "hfusion.gather_load", "linalg.fill", "linalg.matmul",
++      "linalg.yield", "math.exp",
+       "llvm.inline_asm", "llvm.intr.assume", "memref.alloc",
+-      "memref.collapse_shape", "memref.load", "memref.store",
+-      "memref.reinterpret_cast",
++      "memref.collapse_shape", "memref.copy", "memref.load",
++      "memref.memory_space_cast", "memref.store", "memref.reinterpret_cast",
+       "memref.subview", "memref.view", "memref_ext.alloc_workspace", "scf.condition",
+@@ -75,5 +78,5 @@ inline bool HasNoMemoryEffect(const std::string &name) {
+       "affine.apply", "affine.max", "affine.min", "cf.br", "cf.cond_br",
+-      "func.return", "llvm.inline_asm",
+-      "memref.collapse_shape", "memref.reinterpret_cast", "memref.subview",
+-      "memref.view",
++      "func.return", "linalg.yield", "llvm.inline_asm", "math.exp",
++      "memref.collapse_shape", "memref.memory_space_cast",
++      "memref.reinterpret_cast", "memref.subview", "memref.view",
+       "scf.condition", "scf.yield", "tensor.collapse_shape", "tensor.empty",
+@@ -100,5 +103,6 @@ inline std::vector<size_t> DpsInitOperandIndices(
+   else if (name == "hivm.hir.mmadL1")
+     destinationSegment = 6;
+-  else if (name == "hivm.hir.vconcat")
++  else if (name == "hivm.hir.vconcat" ||
++           name == "hfusion.gather_load")
+     return operandCount == 0 ? std::vector<size_t>{}
+                              : std::vector<size_t>{operandCount - 1};
+@@ -170,5 +174,25 @@ inline void ValidateGenericOperationTypeContract(
+       throw std::runtime_error(
+           "generic operation type error: bufferization.to_tensor expected "
+           "one memref operand");
++  } else if (operation.name == "memref.memory_space_cast") {
++    requireSingleResult(
++        operation.resultTypes.size() == 1 &&
++            GenericIsMemRefType(operation.resultTypes.front()),
++        "memref");
++    if (operation.operands.size() != 1 ||
++        operation.operandTypes.size() != 1 ||
++        !GenericIsMemRefType(operation.operandTypes.front()))
++      throw std::runtime_error(
++          "generic operation type error: memref.memory_space_cast expected "
++          "one memref operand");
++  } else if (operation.name == "memref.copy") {
++    if (!operation.results.empty() || !operation.resultTypes.empty() ||
++        operation.operands.size() != 2 ||
++        operation.operandTypes.size() != 2 ||
++        !GenericIsMemRefType(operation.operandTypes[0]) ||
++        !GenericIsMemRefType(operation.operandTypes[1]))
++      throw std::runtime_error(
++          "generic operation type error: memref.copy expected source and "
++          "destination memref operands and no results");
+   }
+ }
+@@ -265,0 +290,9 @@
++  } else if (operation.name == "memref.copy" &&
++             operation.operands.size() == 2) {
++    operation.effects = JoinDelimited(
++        {
++            GenericMemoryEffect(
++                "read", std::to_string(operation.operands[0]), true),
++            GenericMemoryEffect(
++                "write", std::to_string(operation.operands[1]), true),
++        }, ", ");
+diff --git a/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp b/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp
+--- a/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp
++++ b/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp
+@@ -16,2 +16,5 @@ inline bool IsDestinationStyleOp(const std::string &opName) {
+   static const std::set<std::string> operations = {
++      "bufferization.materialize_in_destination",
++      "hfusion.gather_load",       "linalg.fill",
++      "linalg.matmul",
+       "hivm.hir.Conv1dL1",       "hivm.hir.Conv2dL1",
+diff --git a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp b/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp
+--- a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp
++++ b/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp
+@@ -1071,0 +1072,15 @@
++    if (op.opName == "memref.copy") {
++      std::vector<std::string> operands = operationOperandNames(op);
++      if (!operands.empty())
++        UpdateOpGenInfo(info, operands.back());
++      OpKillHandle(info);
++      continue;
++    }
++    if (startsWith(op.opName, "arith.") ||
++        startsWith(op.opName, "math.")) {
++      // Tensor elementwise operations are bufferized in-place before this
++      // boundary. They consume the already-defined local alias but do not
++      // create a distinct allocation.
++      OpKillHandle(info);
++      continue;
++    }
+diff --git a/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp b/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp
+--- a/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp
++++ b/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp
+@@ -276,4 +276,15 @@ inline bool IsAIVFunction(const GenericOperation &function) {
+-  return DecomposeEnumValue(
+-             FindDictionaryValue(function.attributes, "hivm.func_core_type")) ==
+-         "AIV";
++  if (DecomposeEnumValue(FindDictionaryValue(
++          function.attributes, "hivm.func_core_type")) == "AIV")
++    return true;
++  auto stringAttribute = [&](const std::string &name) {
++    std::string value = FindDictionaryValue(function.attributes, name);
++    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
++      value = value.substr(1, value.size() - 2);
++    return value;
++  };
++  const std::string mixMode = stringAttribute("mix_mode");
++  const std::string parallelMode = stringAttribute("parallel_mode");
++  return (mixMode == "aiv" || mixMode == "mix") &&
++         (parallelMode == "simd" ||
++          parallelMode == "mix_simd_simt");
+ }
+diff --git a/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp b/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp
+--- a/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp
++++ b/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp
+@@ -453,4 +453,11 @@ inline ModulePlanResult RunUBModuleFromAfterCVPipelining(
+       RunPassesBeforeOneShotBufferize(module, options, trace);
+   const std::vector<std::string> functions = AIVFunctionNames(projected);
+   ModulePlanResult result;
++  if (functions.empty()) {
++    result.precision = ModulePlanPrecision::Incomplete;
++    result.success = false;
++    result.diagnostics.push_back(
++        "module planning: no supported AIV or mixed SIMD function");
++    return result;
++  }
+   for (const std::string &function : functions) {

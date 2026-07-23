@@ -172,7 +172,7 @@
         <div class="grid-3">
           <div class="card blue"><h3>模型定位</h3><p>以抽象解释/语义事实传播为主，辅以解析公式；不是统计回归，也不是完整后端模拟器。</p></div>
           <div class="card violet"><h3>核心资产</h3><p><span class="mono">MURG</span> 保存资源下界事实；<span class="mono">UBResourceContract</span> 负责逐 lowering stage 更新这些事实。</p></div>
-          <div class="card amber"><h3>当前事实</h3><p>P0–P4 已完成安全覆盖闭环：五类可证明切片及 loop <span class="mono">num_stages=1/2</span> 边界已通过真实 oracle；静态单层 loop 支持任意正步长且至少两次迭代；Dynamic CV/MIX、descriptor 与 irregular memory 已有真实 boundary capture、具名 defer 和禁止错误 promotion 的门禁。packaged profile 仍为空，因此未人工认证的路径继续安全 <span class="mono">defer</span>。</p></div>
+          <div class="card amber"><h3>当前事实</h3><p>P0–P4 已完成安全覆盖闭环：五类既有切片及 loop <span class="mono">num_stages=1/2</span> 边界已通过真实 oracle；P4 又补齐 Dynamic CV/MIX dot-exp 与 simd_simt indirect-index 两条可执行合同链，并通过 20-seed semantic replay 下界检查。descriptor 和未匹配的 P4 长尾仍具名 <span class="mono">defer</span>。packaged profile 仍为空，因此未人工认证的路径不会提前 reject。</p></div>
         </div>
         <div class="meta">
           <span class="pill">分支：codex/ttir-ub-conservative-filter</span>
@@ -569,7 +569,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
             <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
             <tr><td>目标 CANN oracle gate</td><td><span class="tag fact">五类 + num_stages 边界已通过</span></td><td>104 项 C++ GTest、320 项 Python/binding/oracle 测试；既有 7 个真实 oracle case 的 contract / semantic replay / PlanMemory 在 20 seeds + retry 上均为 0 violation / 0 unavailable</td></tr>
-            <tr><td>P4 safe coverage</td><td><span class="tag fact">已闭环</span></td><td>Dynamic CV/MIX 与 irregular boundary 已真实捕获并绑定 producer/consumer 哈希；schema 不一致稳定阻止 promotion，P4 operation family 均有 replay-shadow 或具名 deliberate-defer</td></tr>
+            <tr><td>P4 executable slices</td><td><span class="tag fact">已实现</span></td><td>Dynamic CV/MIX dot-exp 与 simd_simt indirect-index 已有严格 matcher、MURG、完整真实 stage contract chain、certificate 和 20-seed semantic replay；同 schema suffix oracle 缺失仍阻止生产 promotion</td></tr>
             <tr><td>Production contracts</td><td><span class="tag plan">候选合同 12 / 已认证 0</span></td><td>五类 operation transfer function 与 loop factor=2 的 minInstances transfer 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
@@ -611,10 +611,10 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <p class="small"><strong>完成边界：</strong>静态单层 loop 已支持任意正 step、任意 lower/upper 且 trip count≥2；单次迭代、嵌套 loop、scan、argmin/argmax、多 tile、factor≠2、preload factor=4 与 Dynamic CV inner/outer multibuffer 全部进入机器可读 coverage matrix 并明确禁止 promotion。这里的“完成”是所有 P3 输入都有安全结论，不表示对 deliberate-defer 路径猜测 UB 公式。</p>
           </div>
           <div class="phase">
-            <h3>P4 · Dynamic CV / MIX / irregular memory <span class="tag fact">Complete · fail closed</span></h3>
-            <p>已增加真实 TTIR fixture generator 与 before-CVPipelining capture 工具，完整加载 core/buffer/Ascend dialect，并输出 generic/custom 两种无 debug-location 序列化及 SHA256 audit sidecar。目标环境已捕获 Dynamic CV MIX dot-exp 与 simd_simt irregular-indirect-add 两类边界，记录 CUBE/VECTOR scope、matmul/fixpipe 与 irregular lowering 事实。</p>
-            <p>Dynamic CV stage 现在只能绑定 <span class="mono">invalidate-unmodeled-stage@1</span>；loader 明确拒绝把 direct-copy/binary/reduction 等 active family contract 当作 DynamicCVPipelineContract 使用。defer 结果新增 <span class="mono">defer_trace</span>，保留 source matcher 与 invalidating contract。descriptor、gather/scatter/index/unstructured、layout、scan、额外控制流和诊断 operation 均返回稳定具名原因。</p>
-            <p class="small"><strong>验收结果：</strong>当前 producer libtriton 与独立 semantic model/suffix compiler 的 BiShengIR schema 不同；generic 路径在 Fixpipe operand groups 上不一致，custom 路径在 bufferization syntax 上不一致，强行适配后 consumer 会崩溃。因此两类 P4 case 被哈希绑定为 <span class="mono">deliberate-defer</span> 且 <span class="mono">promotion_allowed=false</span>。这满足“证据不足直接 defer”的安全完成定义；在 producer/consumer 对齐前，不声称 core projection、跨 core copy 或 inner/outer multibuffer 已有可用于 reject 的公式合同。</p>
+            <h3>P4 · Dynamic CV / MIX / irregular memory <span class="tag fact">Complete · executable safe slices</span></h3>
+            <p>已增加真实 TTIR fixture 与 before-CVPipelining boundary，完整加载 core/buffer/Ascend dialect，并用 SHA256 绑定输入。严格 matcher 只接受两条已验证形态：Dynamic CV MIX <span class="mono">dot → exp</span>，以及 simd_simt 的 <span class="mono">indirect index load → add</span>；shape、类型、选项、use-def 或 operation 集合漂移均 defer。</p>
+            <p>两条路径都不再把整条 pipeline 压缩成一个假 stage。Dynamic 路径按真实 13-stage 顺序绑定 <span class="mono">dynamic-cv-source-preserve@1 → dynamic-cv-replay@1 → dynamic-cv-result-preserve@1</span>；replay 在唯一 <span class="mono">ttir.dynamic-cv-pipeline</span> stage 将资源精化为 1024-byte Fixpipe output 与 1024-byte Vector output，证明二者 mustDistinct 且 coexist，下界为 2048 bytes。Irregular 路径按真实 12-stage 顺序绑定对应的 <span class="mono">irregular-memory-*</span> 合同，在 <span class="mono">ttir.triton-to-linalg</span> 将 64-byte index allocation 与必然产生的 32-byte gathered value 精化为 mustDistinct/coexist，下界为 96 bytes。任一 stage 名称、顺序、参数或前后资源事实不匹配都会 Invalidate。</p>
+            <p class="small"><strong>验收结果：</strong>在 CANN 容器中，patched semantic replay 对 seed 0..19 全部 Exact/success：Dynamic CV peak 固定为 40960 bits，满足 analyzer LB 16384 bits ≤ peak；irregular peak 固定为 1024 bits，满足 LB 768 bits ≤ peak。C++ 的 replay/drift/full-stage-chain 测试和 Python profile loader/binding 测试均已覆盖。当前独立 suffix compiler 仍不能消费 producer 的旧 BiShengIR schema，且 semantic model 的容量常量为 192 KiB、Ascend950 analyzer 容量为 256 KiB，因此完整 suffix/semantic outcome 一致性与生产 profile promotion 继续 fail closed；这不再阻塞 P4 合同链开发完成，但会阻止它未经同-schema oracle 审核就进入 enforce。</p>
           </div>
           <div class="phase">
             <h3>P5 · Dot、alignment 与长尾</h3>
@@ -682,6 +682,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <li><span class="mono">third_party/ascend/lib/Analysis/TTIRUBLowerBound/DirectTensorLoadMaterialization.cpp</span></li>
           <li><span class="mono">third_party/ascend/lib/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.cpp</span></li>
           <li><span class="mono">third_party/ascend/lib/Analysis/TTIRUBLowerBound/UBResourceContract.cpp</span></li>
+          <li><span class="mono">third_party/ascend/tools/patches/cvpipeline_ub_model_p4_compat.patch</span> — P4 fixture 在外部 semantic replay 中所需的 operation、DPS、旧 schema function 与 liveness 兼容补丁；可用 <span class="mono">git apply --check</span> 审计。</li>
           <li><span class="mono">third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp</span> — converter operation inventory。</li>
           <li><span class="mono">third_party/ascend/lib/DynamicCVPipeline/AddDynamicCVPipeline.cpp</span> — CV pipeline 内部 pass chain。</li>
         </ul>
@@ -692,7 +693,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <li><span class="mono">.../src/pipeline/modeling_result.hpp</span> — Exact/Incomplete 与 OracleExact/Partial/UBInvariant/Unsupported 覆盖语义。</li>
           <li><span class="mono">.../src/ir/semantic_ir.hpp</span> — allocation、gen/kill、lifetime、inplace、multibuffer 与 PlanMemory 结果。</li>
         </ul>
-        <div class="callout green"><strong>P0–P4 结论：</strong>可证明的五类 candidate、reduction/loop liveness 与 factor=2 multibuffer 已闭环；P4 Dynamic CV/MIX/irregular 也完成了真实 boundary capture、哈希审计、具名 defer 和错误 promotion 防护。当前可安全进入人工 candidate review；若希望把 P4 从“安全 defer”升级成“可提前 reject”，下一项外部前置条件是让 libtriton producer、suffix compiler 与 <span class="mono">cvpipeline_ub_model_cpp</span> 使用同一 BiShengIR schema，再补齐 replay + PlanMemory 零违规门禁，不能另写一套未经对齐的 CV 公式。</div>
+        <div class="callout green"><strong>P0–P4 结论：</strong>既有五类 candidate、reduction/loop liveness、factor=2 multibuffer，以及 P4 Dynamic CV/MIX dot-exp 和 irregular indirect-index 两条精确切片均已有可执行合同链。P4 新切片已通过 semantic replay 的 20-seed 下界门禁；未支持的 descriptor/layout/control-flow 长尾仍具名 defer。要把 P4 candidate 安装为生产 profile，仍需提供与 producer 同一 BiShengIR schema 的 suffix runner、统一容量参数，并完成 suffix + semantic replay + retry 的零违规报告；门禁未满足前不会进入 enforce。</div>
         <p class="footer">TTIR UB Conservative Lower-Bound Modeling · Internal Technical Brief</p>
       </section>
     </main>

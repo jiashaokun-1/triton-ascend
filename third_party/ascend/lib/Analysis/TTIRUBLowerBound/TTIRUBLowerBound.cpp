@@ -3,6 +3,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -224,7 +225,39 @@ StringRef getVerifierPreflightFailure(Operation *root) {
         return "malformed-ir";
       const auto *properties =
           operation->getPropertiesStorage().as<arith::ConstantOp::Properties *>();
-      if (!isa_and_nonnull<IntegerAttr>(properties->value))
+      if (!isa_and_nonnull<IntegerAttr, DenseElementsAttr>(properties->value))
+        return "malformed-ir";
+    } else if (name == arith::MulIOp::getOperationName()) {
+      if (!hasExactRegisteredType<arith::MulIOp>(operation) ||
+          !hasExactShape(operation, 2, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
+    } else if (name == triton::ExpandDimsOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::ExpandDimsOp>(operation) ||
+          !hasExactShape(operation, 1, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
+      const auto *properties = operation->getPropertiesStorage()
+                                   .as<triton::ExpandDimsOp::Properties *>();
+      if (!isa_and_nonnull<IntegerAttr>(properties->axis))
+        return "malformed-ir";
+    } else if (name == triton::BroadcastOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::BroadcastOp>(operation) ||
+          !hasExactShape(operation, 1, 1, 0, 0))
+        return "malformed-ir";
+    } else if (name == triton::DotOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::DotOp>(operation) ||
+          !hasExactShape(operation, 3, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
+      const auto *properties =
+          operation->getPropertiesStorage().as<triton::DotOp::Properties *>();
+      if (!properties->inputPrecision || !properties->maxNumImpreciseAcc)
+        return "malformed-ir";
+    } else if (name == math::ExpOp::getOperationName()) {
+      if (!hasExactRegisteredType<math::ExpOp>(operation) ||
+          !hasExactShape(operation, 1, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
         return "malformed-ir";
     } else if (name == scf::ForOp::getOperationName()) {
       if (!hasExactRegisteredType<scf::ForOp>(operation) ||

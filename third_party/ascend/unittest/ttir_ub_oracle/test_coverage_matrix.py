@@ -68,7 +68,7 @@ def test_p4_unsafe_generalization_is_shadow_or_deliberate_defer():
             assert item["status"] in {"replay-shadow", "deliberate-defer"}
 
 
-def test_p4_defer_evidence_is_hash_bound_and_never_promotable():
+def test_p4_replay_shadow_evidence_is_hash_bound_and_never_promotable():
     evidence = json.loads(P4_EVIDENCE.read_text(encoding="utf-8"))
     assert evidence["schema"] == "ttir-ub-p4-defer-evidence-v1"
     for field in (
@@ -84,8 +84,11 @@ def test_p4_defer_evidence_is_hash_bound_and_never_promotable():
         "irregular-indirect-add",
     }
     for case in evidence["cases"]:
-        assert case["status"] == "deliberate-defer"
+        assert case["status"] == "replay-shadow"
         assert case["promotion_allowed"] is False
         assert case["reason"]
+        assert case["validated_seeds"] == "0..19"
+        assert 0 < case["analyzer_lower_bound_bits"] <= \
+            case["semantic_replay_peak_bits"]
         assert len(case["ttir_sha256"]) == 64
         assert len(case["boundary_sha256"]) == 64

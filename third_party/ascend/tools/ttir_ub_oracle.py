@@ -35,6 +35,9 @@ _CASE_OPTION_KEYS = frozenset({
     "tile_mix_cube_loop",
     "tile_mix_vector_loop",
 })
+_DYNAMIC_CV_CASE_OPTION_KEYS = (
+    _CASE_OPTION_KEYS | {"enable_dynamic_cv_pipeline"}
+)
 _OPERATION_FAMILIES = {
     "direct-copy": {
         "matcher_trace": "ttir-direct-load-v1",
@@ -76,6 +79,22 @@ _OPERATION_FAMILIES = {
         "allocation_count": 1,
         "contract_prefix": "reduction-sum",
     },
+    "dynamic-cv": {
+        "matcher_trace": "ttir-dynamic-cv-dot-exp-v1",
+        "certificate_kind": "witness",
+        "certificate_resource_count": 2,
+        "resource_count": 2,
+        "allocation_count": 2,
+        "contract_prefix": "dynamic-cv",
+    },
+    "irregular-memory": {
+        "matcher_trace": "ttir-irregular-indirect-add-v1",
+        "certificate_kind": "witness",
+        "certificate_resource_count": 2,
+        "resource_count": 2,
+        "allocation_count": 1,
+        "contract_prefix": "irregular-memory",
+    },
 }
 _CONTRACT_PROPOSAL_KEYS = frozenset({
     "expected_resource_count",
@@ -89,6 +108,29 @@ _CONTRACT_PROPOSAL_KEYS = frozenset({
 _MULTIBUFFER_CONTRACT_PROPOSAL_KEYS = (
     _CONTRACT_PROPOSAL_KEYS | {"expected_step_input_instances"}
 )
+_DYNAMIC_CV_CONTRACT_PROPOSAL_KEYS = frozenset({
+    "expected_resource_count",
+    "expected_output_elements",
+    "expected_element_bit_width",
+    "expected_source_payload_bytes",
+    "projected_payload_bytes",
+    "fixpipe_min_instances",
+    "vector_min_instances",
+    "materialization_stage",
+    "auto_tile_and_bind_subblock_outcome",
+})
+_IRREGULAR_MEMORY_CONTRACT_PROPOSAL_KEYS = frozenset({
+    "expected_resource_count",
+    "expected_elements",
+    "expected_index_bit_width",
+    "expected_value_bit_width",
+    "expected_index_payload_bytes",
+    "expected_value_payload_bytes",
+    "max_tiles",
+    "materialized_allocation_count",
+    "materialization_stage",
+    "auto_tile_and_bind_subblock_outcome",
+})
 _IDENTITY_CONTRACT = {
     "auto_tile_and_bind_subblock": {
         "identity_value": "module-derived-per-exact-ttir",
@@ -106,8 +148,8 @@ _OVERFLOW_RE = re.compile(
 _SUB_BLOCK_INDEX_OP = "hivm.hir.get_sub_block_idx"
 _MAX_INT64 = (1 << 63) - 1
 _STATIC_ALLOC_RE = re.compile(
-    r'"memref\.alloc"\([^\n]*?\)\s*(?:<[^\n]*?>\s*)?:\s*\([^\n]*?\)\s*->\s*'
-    r'memref<(\d+)x(bf16|f16|f32|f64|i8|i16|i32|i64)>'
+    r'"memref\.alloc"\([^\n]*\)[^\n]*\s:\s*\([^\n]*\)\s*->\s*'
+    r'memref<([^\n]+)>'
 )
 
 
@@ -183,19 +225,41 @@ def parse_boundary_allocation_bytes(text: str) -> list[int]:
     matches = _STATIC_ALLOC_RE.findall(text)
     if not matches or len(matches) != text.count('"memref.alloc"'):
         raise OracleUnavailable(
-            "boundary allocations must all be supported static 1-D memrefs"
+            "boundary allocations must all be supported static ranked memrefs"
         )
     allocations = []
-    for elements_text, element_type in matches:
-        bit_width = 16 if element_type == "bf16" else int(re.search(r"\d+", element_type).group())
-        elements = int(elements_text)
-        if elements <= 0 or bit_width < 8 or bit_width % 8 != 0:
+    for memref_body in matches:
+        shaped_type = memref_body.split(",", 1)[0].strip()
+        parts = shaped_type.split("x")
+        if len(parts) < 2 or not all(part.isdecimal() for part in parts[:-1]):
+            raise OracleUnavailable("boundary allocation must have a static ranked shape")
+        element_type = parts[-1]
+        if not re.fullmatch(r"bf16|f16|f32|f64|i8|i16|i32|i64", element_type):
             raise OracleUnavailable("boundary allocation has an unsupported element type")
+        bit_width = 16 if element_type == "bf16" else int(
+            re.search(r"\d+", element_type).group()
+        )
+        elements = 1
+        for dimension in parts[:-1]:
+            elements *= int(dimension)
+        if elements <= 0 or bit_width < 8 or bit_width % 8 != 0:
+            raise OracleUnavailable("boundary allocation has an invalid static shape")
         allocation_bytes = elements * (bit_width // 8)
-        if allocation_bytes > (1 << 63) - 1:
+        if allocation_bytes > _MAX_INT64:
             raise OracleUnavailable("boundary allocation overflows int64")
         allocations.append(allocation_bytes)
     return allocations
+
+
+def parse_explicit_ub_allocation_bytes(text: str) -> list[int]:
+    """Return only allocations explicitly typed in the HiVM UB address space."""
+    matches = _STATIC_ALLOC_RE.findall(text)
+    all_allocations = parse_boundary_allocation_bytes(text)
+    return [
+        allocation
+        for memref_body, allocation in zip(matches, all_allocations)
+        if "#hivm.address_space<ub>" in memref_body
+    ]
 
 
 def parse_direct_copy_boundary_allocation_bytes(text: str) -> int:
@@ -294,14 +358,30 @@ def load_manifest(path: Path) -> dict:
         if family not in _OPERATION_FAMILIES:
             raise ManifestError(
                 "operation_family must be direct-copy, binary-add, "
-                "loop-carried-add, reshape-copy, or reduction-sum"
+                "loop-carried-add, reshape-copy, reduction-sum, dynamic-cv, "
+                "or irregular-memory"
             )
         if type(item["arch"]) is not str or not item["arch"]:
             raise ManifestError("arch must be a non-empty string")
-        if type(item["options"]) is not dict or set(item["options"]) != _CASE_OPTION_KEYS:
+        expected_option_keys = (
+            _DYNAMIC_CV_CASE_OPTION_KEYS
+            if family == "dynamic-cv" else _CASE_OPTION_KEYS
+        )
+        if type(item["options"]) is not dict or set(item["options"]) != expected_option_keys:
             raise ManifestError("options fields do not match the schema")
-        if item["options"].get("compile_mode") != "simd":
-            raise ManifestError("UB oracle cases require compile_mode=simd")
+        if (family == "dynamic-cv"
+                and item["options"]["enable_dynamic_cv_pipeline"] is not True):
+            raise ManifestError(
+                "dynamic-cv cases require enable_dynamic_cv_pipeline=true"
+            )
+        expected_compile_mode = (
+            "simd_simt" if family == "irregular-memory" else "simd"
+        )
+        if item["options"].get("compile_mode") != expected_compile_mode:
+            raise ManifestError(
+                f"{family} UB oracle cases require "
+                f"compile_mode={expected_compile_mode}"
+            )
         multibuffer = item["options"].get("multibuffer")
         if type(multibuffer) is not bool:
             raise ManifestError("options.multibuffer must be boolean")
@@ -320,12 +400,96 @@ def load_manifest(path: Path) -> dict:
         if expected_decision is not None and expected_decision not in ("defer", "reject"):
             raise ManifestError("expected_analyzer_decision must be defer, reject, or null")
         proposal = item["contract_proposal"]
-        expected_proposal_keys = (
-            _MULTIBUFFER_CONTRACT_PROPOSAL_KEYS
-            if effective_multibuffer else _CONTRACT_PROPOSAL_KEYS
-        )
+        if family == "dynamic-cv":
+            expected_proposal_keys = _DYNAMIC_CV_CONTRACT_PROPOSAL_KEYS
+        elif family == "irregular-memory":
+            expected_proposal_keys = _IRREGULAR_MEMORY_CONTRACT_PROPOSAL_KEYS
+        else:
+            expected_proposal_keys = (
+                _MULTIBUFFER_CONTRACT_PROPOSAL_KEYS
+                if effective_multibuffer else _CONTRACT_PROPOSAL_KEYS
+            )
         if type(proposal) is not dict or set(proposal) != expected_proposal_keys:
             raise ManifestError("contract_proposal fields do not match the schema")
+        if type(proposal["materialization_stage"]) is not str or not proposal["materialization_stage"]:
+            raise ManifestError("contract_proposal.materialization_stage must be non-empty")
+        auto_tile_outcome = proposal["auto_tile_and_bind_subblock_outcome"]
+        if auto_tile_outcome is not None and type(auto_tile_outcome) is not bool:
+            raise ManifestError(
+                "contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean or null"
+            )
+        if proposal["expected_resource_count"] != _OPERATION_FAMILIES[family]["resource_count"]:
+            raise ManifestError(
+                "contract_proposal.expected_resource_count disagrees with operation_family"
+            )
+        if family == "dynamic-cv":
+            for field in (
+                "expected_resource_count",
+                "expected_output_elements",
+                "expected_element_bit_width",
+                "expected_source_payload_bytes",
+                "projected_payload_bytes",
+                "fixpipe_min_instances",
+                "vector_min_instances",
+            ):
+                if type(proposal[field]) is not int or proposal[field] <= 0:
+                    raise ManifestError(
+                        f"contract_proposal.{field} must be a positive integer"
+                    )
+            bit_width = proposal["expected_element_bit_width"]
+            if bit_width < 8 or bit_width % 8:
+                raise ManifestError(
+                    "contract_proposal.expected_element_bit_width must be whole bytes"
+                )
+            source_payload = proposal["expected_output_elements"] * (bit_width // 8)
+            if (source_payload > _MAX_INT64
+                    or proposal["expected_source_payload_bytes"] != source_payload
+                    or proposal["projected_payload_bytes"] > source_payload
+                    or proposal["materialization_stage"] != "ttir.dynamic-cv-pipeline"):
+                raise ManifestError("dynamic-cv contract proposal is inconsistent")
+            case = dict(item)
+            case["ttir"] = _fixture_path(root, item["ttir"], "ttir")
+            case["before_cvpipelining"] = _fixture_path(
+                root, item["before_cvpipelining"], "before_cvpipelining"
+            )
+            cases.append(case)
+            continue
+        if family == "irregular-memory":
+            for field in (
+                "expected_resource_count",
+                "expected_elements",
+                "expected_index_bit_width",
+                "expected_value_bit_width",
+                "expected_index_payload_bytes",
+                "expected_value_payload_bytes",
+                "max_tiles",
+                "materialized_allocation_count",
+            ):
+                if type(proposal[field]) is not int or proposal[field] <= 0:
+                    raise ManifestError(
+                        f"contract_proposal.{field} must be a positive integer"
+                    )
+            index_width = proposal["expected_index_bit_width"]
+            value_width = proposal["expected_value_bit_width"]
+            if (index_width < 8 or index_width % 8 or value_width < 8
+                    or value_width % 8):
+                raise ManifestError("irregular-memory bit widths must be whole bytes")
+            if (
+                proposal["expected_index_payload_bytes"]
+                != proposal["expected_elements"] * (index_width // 8)
+                or proposal["expected_value_payload_bytes"]
+                != proposal["expected_elements"] * (value_width // 8)
+                or proposal["materialized_allocation_count"] != 1
+                or proposal["materialization_stage"] != "ttir.triton-to-linalg"
+            ):
+                raise ManifestError("irregular-memory contract proposal is inconsistent")
+            case = dict(item)
+            case["ttir"] = _fixture_path(root, item["ttir"], "ttir")
+            case["before_cvpipelining"] = _fixture_path(
+                root, item["before_cvpipelining"], "before_cvpipelining"
+            )
+            cases.append(case)
+            continue
         for field in (
             "expected_resource_count",
             "expected_source_elements",
@@ -335,13 +499,6 @@ def load_manifest(path: Path) -> dict:
         ):
             if type(proposal[field]) is not int or proposal[field] <= 0:
                 raise ManifestError(f"contract_proposal.{field} must be a positive integer")
-        if type(proposal["materialization_stage"]) is not str or not proposal["materialization_stage"]:
-            raise ManifestError("contract_proposal.materialization_stage must be non-empty")
-        auto_tile_outcome = proposal["auto_tile_and_bind_subblock_outcome"]
-        if auto_tile_outcome is not None and type(auto_tile_outcome) is not bool:
-            raise ManifestError(
-                "contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean or null"
-            )
         element_bit_width = proposal["expected_element_bit_width"]
         if element_bit_width < 8 or element_bit_width % 8:
             raise ManifestError(
@@ -355,10 +512,6 @@ def load_manifest(path: Path) -> dict:
         if proposal["expected_input_payload_bytes"] != derived_payload:
             raise ManifestError(
                 "contract_proposal input payload disagrees with source elements and bit width"
-            )
-        if proposal["expected_resource_count"] != _OPERATION_FAMILIES[family]["resource_count"]:
-            raise ManifestError(
-                "contract_proposal.expected_resource_count disagrees with operation_family"
             )
         if family == "reduction-sum" and (
             proposal["max_tiles"] != 1
@@ -400,6 +553,74 @@ def build_proposed_contract_profile(
     materialization_stage = proposal["materialization_stage"]
     if sum(stage["stage_name"] == materialization_stage for stage in pipeline_stages) != 1:
         raise OracleUnavailable("materialization stage must occur exactly once in the real pipeline")
+    if operation_family in ("dynamic-cv", "irregular-memory"):
+        if sum(
+            stage["stage_name"] == "bisheng.ub-affecting-suffix"
+            for stage in pipeline_stages
+        ) != 1:
+            raise OracleUnavailable(
+                "P4 pipeline must contain exactly one UB-affecting suffix stage"
+            )
+        if operation_family == "dynamic-cv":
+            parameters = {
+                name: str(proposal[name])
+                for name in (
+                    "expected_resource_count",
+                    "expected_output_elements",
+                    "expected_element_bit_width",
+                    "expected_source_payload_bytes",
+                    "projected_payload_bytes",
+                    "fixpipe_min_instances",
+                    "vector_min_instances",
+                )
+            }
+        else:
+            parameters = {
+                name: str(proposal[name])
+                for name in (
+                    "expected_resource_count",
+                    "expected_elements",
+                    "expected_index_bit_width",
+                    "expected_value_bit_width",
+                    "expected_index_payload_bytes",
+                    "expected_value_payload_bytes",
+                    "max_tiles",
+                    "materialized_allocation_count",
+                )
+            }
+        materialized = False
+        bindings = []
+        for stage in pipeline_stages:
+            is_materialization = stage["stage_name"] == materialization_stage
+            is_suffix = stage["stage_name"] == "bisheng.ub-affecting-suffix"
+            if is_materialization:
+                contract_id = f"{family['contract_prefix']}-replay"
+                materialized = True
+            elif is_suffix:
+                if not materialized:
+                    raise OracleUnavailable(
+                        "UB-affecting suffix occurs before P4 materialization"
+                    )
+                contract_id = f"{family['contract_prefix']}-result-preserve"
+            elif materialized:
+                raise OracleUnavailable(
+                    "P4 only permits the exact suffix after materialization"
+                )
+            else:
+                contract_id = f"{family['contract_prefix']}-source-preserve"
+            bindings.append({
+                **stage,
+                "contract_id": contract_id,
+                "contract_version": "1",
+                "contract_parameters": dict(parameters),
+            })
+        return {
+            "schema": "ttir-ub-lb-profile-v1",
+            "profiles": [{
+                "pipeline_identity": identity,
+                "pipeline_stages": bindings,
+            }],
+        }
     common = {
         "expected_resource_count": str(proposal["expected_resource_count"]),
         "expected_source_elements": str(proposal["expected_source_elements"]),
@@ -527,6 +748,58 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
             or type(lower_bound) is not int
             or type(stages) is not list):
         return False
+    if analysis.get("operation_family") == "dynamic-cv":
+        replay_stages = [
+            stage for stage in stages
+            if type(stage) is dict
+            and stage.get("contract_id") == "dynamic-cv-replay"
+        ]
+        if len(replay_stages) != 1:
+            return False
+        parameters = replay_stages[0].get("contract_parameters")
+        if type(parameters) is not dict:
+            return False
+        try:
+            projected = int(parameters["projected_payload_bytes"])
+            fixpipe_instances = int(parameters["fixpipe_min_instances"])
+            vector_instances = int(parameters["vector_min_instances"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (
+            projected > 0
+            and allocations == [projected, projected]
+            and lower_bound
+            == projected * (fixpipe_instances + vector_instances)
+        )
+    if analysis.get("operation_family") == "irregular-memory":
+        replay_stages = [
+            stage for stage in stages
+            if type(stage) is dict
+            and stage.get("contract_id") == "irregular-memory-replay"
+        ]
+        if len(replay_stages) != 1:
+            return False
+        parameters = replay_stages[0].get("contract_parameters")
+        if type(parameters) is not dict:
+            return False
+        try:
+            index_payload = int(parameters["expected_index_payload_bytes"])
+            value_payload = int(parameters["expected_value_payload_bytes"])
+            max_tiles = int(parameters["max_tiles"])
+            materialized_count = int(
+                parameters["materialized_allocation_count"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        if max_tiles <= 0:
+            return False
+        projected_index = (index_payload + max_tiles - 1) // max_tiles
+        projected_value = (value_payload + max_tiles - 1) // max_tiles
+        return (
+            materialized_count == 1
+            and allocations == [projected_index]
+            and lower_bound == projected_index + projected_value
+        )
     materialization_id = f"{family['contract_prefix']}-max-tiles"
     materialization_stages = [
         stage for stage in stages
@@ -749,6 +1022,11 @@ def analyze_case(case: dict) -> dict:
         module = ir.parse_mlir_module(str(case["ttir"]), context)
         option_values = dict(case["options"])
         option_values.setdefault("arch", case["arch"])
+        option_values.setdefault(
+            "compile_on_910_95",
+            case["arch"] == "Ascend950"
+            or case["arch"].startswith("Ascend910_95"),
+        )
         options = ascend_compiler.NPUOptions(**option_values)
         metadata = dict(options.__dict__)
         metadata.update({
@@ -778,7 +1056,11 @@ def analyze_case(case: dict) -> dict:
             module,
             {
                 "arch": case["arch"],
-                "compile_mode": "aiv" if options.compile_mode == "simd" else options.compile_mode,
+                "compile_mode": (
+                    "aiv"
+                    if options.compile_mode in ("simd", "simd_simt")
+                    else options.compile_mode
+                ),
                 "pipeline_identity": identity,
                 "pipeline_stages": pipeline_stages,
                 "contract_profile": profile,
@@ -798,16 +1080,32 @@ def analyze_case(case: dict) -> dict:
         boundary_ir = case["before_cvpipelining"].read_text(encoding="utf-8")
     except OSError as error:
         raise OracleUnavailable(f"cannot read before-CVPipelining fixture: {error}") from error
-    allocations = parse_boundary_allocation_bytes(boundary_ir)
+    allocations = (
+        parse_explicit_ub_allocation_bytes(boundary_ir)
+        if case["operation_family"] == "dynamic-cv"
+        else parse_boundary_allocation_bytes(boundary_ir)
+    )
     proposal = case["contract_proposal"]
     expected_allocation_count = _OPERATION_FAMILIES[
         case["operation_family"]
     ]["allocation_count"]
-    expected_allocation_bytes = (
-        proposal["expected_input_payload_bytes"] + proposal["max_tiles"] - 1
-    ) // proposal["max_tiles"]
-    if (len(allocations) != expected_allocation_count
-            or any(value != expected_allocation_bytes for value in allocations)):
+    if case["operation_family"] == "dynamic-cv":
+        expected_allocations = [
+            proposal["projected_payload_bytes"],
+            proposal["projected_payload_bytes"],
+        ]
+    elif case["operation_family"] == "irregular-memory":
+        expected_allocations = [(
+            proposal["expected_index_payload_bytes"] + proposal["max_tiles"] - 1
+        ) // proposal["max_tiles"]]
+    else:
+        expected_allocation_bytes = (
+            proposal["expected_input_payload_bytes"] + proposal["max_tiles"] - 1
+        ) // proposal["max_tiles"]
+        expected_allocations = [
+            expected_allocation_bytes
+        ] * expected_allocation_count
+    if allocations != expected_allocations:
         raise OracleUnavailable(
             "before-CVPipelining allocations do not match the proposed materialized resources"
         )
@@ -861,7 +1159,8 @@ def evaluate(
                 report["violations"].append({
                     "case": case["name"], "kind": "invalid-materialization-bridge",
                 })
-            if (case["operation_family"] != "reduction-sum"
+            if (case["operation_family"] not in (
+                    "reduction-sum", "irregular-memory")
                     and not effective_auto_multibuffer(case["options"])
                     and analysis.get("lower_bound_bytes", 0) > boundary_bytes):
                 report["violations"].append({

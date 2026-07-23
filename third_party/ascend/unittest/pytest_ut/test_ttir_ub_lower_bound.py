@@ -41,6 +41,13 @@ from triton.backends.ascend.ub_lower_bound import apply_ub_lower_bound_policy, l
 from triton.backends.ascend.runtime import utils as runtime_utils
 from triton.compiler import compiler as core_compiler
 
+
+def test_analysis_compile_mode_maps_simd_and_mixed_simd_to_aiv():
+    assert ub_lower_bound._analysis_compile_mode("simd") == "aiv"
+    assert ub_lower_bound._analysis_compile_mode("simd_simt") == "aiv"
+    assert ub_lower_bound._analysis_compile_mode("simt_only") == "simt_only"
+
+
 DIRECT_LOAD_COPY = """
 module {
   tt.func public @copy(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
@@ -134,6 +141,16 @@ module {
   }
 }
 """
+
+P4_FIXTURE_ROOT = (
+    Path(__file__).parents[1] / "ttir_ub_oracle" / "fixtures"
+)
+DYNAMIC_CV_MIX_DOT_EXP = (
+    P4_FIXTURE_ROOT / "dynamic-cv-mix-dot-exp.ttir.mlir"
+).read_text(encoding="utf-8")
+IRREGULAR_INDIRECT_ADD = (
+    P4_FIXTURE_ROOT / "irregular-indirect-add.ttir.mlir"
+).read_text(encoding="utf-8")
 
 INT64_MAX = (1 << 63) - 1
 UINT32_MAX = (1 << 32) - 1
@@ -1387,6 +1404,84 @@ def _direct_copy_profile_entry(
     }
 
 
+def _p4_profile_entry(family, **option_overrides):
+    if family == "dynamic-cv":
+        relevant_options = {
+            "compile_mode": "simd",
+            "enable_dynamic_cv_pipeline": True,
+            "multibuffer": False,
+        }
+        stage = {
+            "stage_name": "ttir.dynamic-cv-pipeline",
+            "options": {"compile_on_910_95": "true"},
+            "contract_id": "dynamic-cv-replay",
+            "contract_version": "1",
+            "contract_parameters": {
+                "expected_resource_count": "2",
+                "expected_output_elements": "256",
+                "expected_element_bit_width": "32",
+                "expected_source_payload_bytes": "1024",
+                "projected_payload_bytes": "1024",
+                "fixpipe_min_instances": "1",
+                "vector_min_instances": "1",
+            },
+        }
+    elif family == "irregular-memory":
+        relevant_options = {
+            "compile_mode": "simd_simt",
+            "enable_dynamic_cv_pipeline": False,
+            "multibuffer": False,
+        }
+        stage = {
+            "stage_name": "ttir.triton-to-linalg",
+            "options": {"compile_mode": "\"simd_simt\""},
+            "contract_id": "irregular-memory-replay",
+            "contract_version": "1",
+            "contract_parameters": {
+                "expected_resource_count": "2",
+                "expected_elements": "8",
+                "expected_index_bit_width": "64",
+                "expected_value_bit_width": "32",
+                "expected_index_payload_bytes": "64",
+                "expected_value_payload_bytes": "32",
+                "max_tiles": "1",
+                "materialized_allocation_count": "1",
+            },
+        }
+    else:
+        raise AssertionError(f"unsupported test family: {family}")
+    relevant_options.update(option_overrides)
+    identity = {
+        "open_source_pipeline": f"p4-{family}-pipeline",
+        "canonical_ttir_sha256": "d" * 64,
+        "relevant_options_json": json.dumps(
+            relevant_options, sort_keys=True, separators=(",", ":")
+        ),
+        "target_arch": "Ascend950",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "",
+    }
+    identity["sha256"] = hashlib.sha256(json.dumps({
+        "cann_version_hash": identity["cann_version_hash"],
+        "canonical_ttir_sha256": identity["canonical_ttir_sha256"],
+        "open_source_pipeline": identity["open_source_pipeline"],
+        "relevant_options": relevant_options,
+        "target_arch": identity["target_arch"],
+        "triton_version": identity["triton_version"],
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "pipeline_identity": identity,
+        "pipeline_stages": [stage],
+        "contract_version": "ttir-ub-lb-v1",
+        "oracle_report_sha256": "e" * 64,
+        "semantic_model_sha256": "f" * 64,
+        "validated_seeds": list(range(20)),
+        "retry_validated": True,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+
+
 def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_path):
     profile_path = tmp_path / "profiles.json"
     document = {
@@ -1397,6 +1492,43 @@ def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_pa
     profile_path.write_text(json.dumps(document))
     monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
     assert load_contract_profiles() == document
+
+
+@pytest.mark.parametrize("family", ["dynamic-cv", "irregular-memory"])
+def test_profile_loader_accepts_certified_p4_schema(
+        monkeypatch, tmp_path, family):
+    profile_path = tmp_path / "profiles.json"
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [_p4_profile_entry(family)],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
+@pytest.mark.parametrize(
+    ("family", "option_overrides"),
+    [
+        ("dynamic-cv", {"compile_mode": "simd_simt"}),
+        ("dynamic-cv", {"enable_dynamic_cv_pipeline": False}),
+        ("irregular-memory", {"compile_mode": "simd"}),
+        ("irregular-memory", {"enable_dynamic_cv_pipeline": True}),
+        ("irregular-memory", {"multibuffer": True}),
+    ],
+)
+def test_profile_loader_rejects_p4_option_drift(
+        monkeypatch, tmp_path, family, option_overrides):
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [_p4_profile_entry(family, **option_overrides)],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
+        load_contract_profiles()
 
 
 def test_profile_loader_accepts_certified_binary_add_schema(monkeypatch, tmp_path):
@@ -1806,6 +1938,261 @@ def test_binding_rejects_active_family_contract_on_dynamic_cv_stage(tmp_path):
 
     assert result["decision"] == "defer"
     assert result["unsupported_reasons"] == ["unknown-pipeline-profile"]
+
+
+def test_binding_runs_replay_backed_dynamic_cv_contract(tmp_path):
+    source = tmp_path / "dynamic-cv-mix-dot-exp.ttir"
+    source.write_text(DYNAMIC_CV_MIX_DOT_EXP)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p4-dynamic-cv-replay",
+        "canonical_ttir_sha256": hashlib.sha256(
+            DYNAMIC_CV_MIX_DOT_EXP.encode()
+        ).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend950",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p4-dynamic-cv-replay-identity",
+    }
+    stage_names = [
+        "ttir.auto-blockify",
+        "ttir.triton-to-structure",
+        "ttir.discrete-mask-access-conversion",
+        "ttir.triton-to-annotation",
+        "ttir.triton-to-unstructure",
+        "ttir.triton-to-hivm",
+        "ttir.triton-to-hfusion",
+        "ttir.triton-to-llvm",
+        "ttir.bubble-up-operation",
+        "ttir.triton-to-structure",
+        "ttir.triton-to-linalg",
+        "ttir.dynamic-cv-pipeline",
+        "bisheng.ub-affecting-suffix",
+    ]
+    stages = [
+        {
+            "stage_name": stage_name,
+            "options": (
+                {"compile_on_910_95": "true"}
+                if stage_name == "ttir.dynamic-cv-pipeline"
+                else {}
+            ),
+        }
+        for stage_name in stage_names
+    ]
+    parameters = {
+        "expected_resource_count": "2",
+        "expected_output_elements": "256",
+        "expected_element_bit_width": "32",
+        "expected_source_payload_bytes": "1024",
+        "projected_payload_bytes": "1024",
+        "fixpipe_min_instances": "1",
+        "vector_min_instances": "1",
+    }
+    bindings = []
+    for stage in stages:
+        if stage["stage_name"] == "ttir.dynamic-cv-pipeline":
+            contract_id = "dynamic-cv-replay"
+        elif stage["stage_name"] == "bisheng.ub-affecting-suffix":
+            contract_id = "dynamic-cv-result-preserve"
+        else:
+            contract_id = "dynamic-cv-source-preserve"
+        bindings.append({
+            **stage,
+            "contract_id": contract_id,
+            "contract_version": "1",
+            "contract_parameters": dict(parameters),
+        })
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": bindings,
+        }],
+    }
+
+    result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend950",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+
+    assert result["decision"] == "defer"
+    assert result["lower_bound_bytes"] == 2048
+    assert result["unsupported_reasons"] == []
+    certificate = result["certificates"][0]
+    assert certificate["kind"] == "witness"
+    assert certificate["bytes"] == 2048
+    assert certificate["resource_ids"] == [0, 1]
+    assert certificate["contract_trace"] == [
+        "ttir-dynamic-cv-dot-exp-v1",
+        *(["dynamic-cv-source-preserve"] * 11),
+        "dynamic-cv-replay",
+        "dynamic-cv-result-preserve",
+    ]
+
+    drifted_profile = json.loads(json.dumps(profile))
+    drifted_profile["profiles"][0]["pipeline_stages"][11][
+        "contract_parameters"
+    ]["expected_output_elements"] = "257"
+    drifted = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend950",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": drifted_profile,
+        },
+    )
+    assert drifted["decision"] == "defer"
+    assert drifted["lower_bound_bytes"] == 0
+    assert drifted["unsupported_reasons"] == ["dynamic-cv-replay"]
+
+    overflow_profile = json.loads(json.dumps(profile))
+    for binding in overflow_profile["profiles"][0]["pipeline_stages"]:
+        binding["contract_parameters"]["fixpipe_min_instances"] = "128"
+        binding["contract_parameters"]["vector_min_instances"] = "129"
+    overflow = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend950",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": overflow_profile,
+        },
+    )
+    assert overflow["decision"] == "reject"
+    assert overflow["lower_bound_bytes"] == 263168
+    assert overflow["capacity_bytes"] == 262144
+    assert overflow["certificates"][0]["kind"] == "witness"
+
+
+def test_binding_runs_replay_backed_irregular_memory_contract(tmp_path):
+    source = tmp_path / "irregular-indirect-add.ttir"
+    source.write_text(IRREGULAR_INDIRECT_ADD)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p4-irregular-memory-replay",
+        "canonical_ttir_sha256": hashlib.sha256(
+            IRREGULAR_INDIRECT_ADD.encode()
+        ).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend950",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p4-irregular-memory-replay-identity",
+    }
+    stage_names = [
+        "ttir.auto-blockify",
+        "ttir.triton-to-structure",
+        "ttir.discrete-mask-access-conversion",
+        "ttir.triton-to-annotation",
+        "ttir.triton-to-unstructure",
+        "ttir.triton-to-hivm",
+        "ttir.triton-to-hfusion",
+        "ttir.triton-to-llvm",
+        "ttir.bubble-up-operation",
+        "ttir.triton-to-structure",
+        "ttir.triton-to-linalg",
+        "bisheng.ub-affecting-suffix",
+    ]
+    stages = [
+        {
+            "stage_name": stage_name,
+            "options": (
+                {"compile_mode": "\"simd_simt\""}
+                if stage_name == "ttir.triton-to-linalg"
+                else {}
+            ),
+        }
+        for stage_name in stage_names
+    ]
+    parameters = {
+        "expected_resource_count": "2",
+        "expected_elements": "8",
+        "expected_index_bit_width": "64",
+        "expected_value_bit_width": "32",
+        "expected_index_payload_bytes": "64",
+        "expected_value_payload_bytes": "32",
+        "max_tiles": "1",
+        "materialized_allocation_count": "1",
+    }
+    bindings = []
+    for stage in stages:
+        if stage["stage_name"] == "ttir.triton-to-linalg":
+            contract_id = "irregular-memory-replay"
+        elif stage["stage_name"] == "bisheng.ub-affecting-suffix":
+            contract_id = "irregular-memory-result-preserve"
+        else:
+            contract_id = "irregular-memory-source-preserve"
+        bindings.append({
+            **stage,
+            "contract_id": contract_id,
+            "contract_version": "1",
+            "contract_parameters": dict(parameters),
+        })
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": bindings,
+        }],
+    }
+
+    result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend950",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+
+    assert result["decision"] == "defer"
+    assert result["lower_bound_bytes"] == 96
+    assert result["unsupported_reasons"] == []
+    certificate = result["certificates"][0]
+    assert certificate["kind"] == "witness"
+    assert certificate["bytes"] == 96
+    assert certificate["resource_ids"] == [0, 1]
+    assert certificate["contract_trace"] == [
+        "ttir-irregular-indirect-add-v1",
+        *(["irregular-memory-source-preserve"] * 10),
+        "irregular-memory-replay",
+        "irregular-memory-result-preserve",
+    ]
+
+    drifted_profile = json.loads(json.dumps(profile))
+    drifted_profile["profiles"][0]["pipeline_stages"][10][
+        "contract_parameters"
+    ]["expected_elements"] = "9"
+    drifted = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend950",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": drifted_profile,
+        },
+    )
+    assert drifted["decision"] == "defer"
+    assert drifted["lower_bound_bytes"] == 0
+    assert drifted["unsupported_reasons"] == ["irregular-memory-replay"]
 
 
 def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):

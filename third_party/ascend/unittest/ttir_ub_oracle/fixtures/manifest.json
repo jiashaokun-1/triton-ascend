@@ -169,6 +169,60 @@
         "auto_tile_and_bind_subblock_outcome": false
       },
       "expected_analyzer_decision": "reject"
+    },
+    {
+      "name": "dynamic-cv-mix-dot-exp-f32-16x16",
+      "operation_family": "dynamic-cv",
+      "ttir": "dynamic-cv-mix-dot-exp.ttir.mlir",
+      "before_cvpipelining": "dynamic-cv-mix-dot-exp.before_cvpipelining.mlir",
+      "arch": "Ascend950",
+      "options": {
+        "compile_mode": "simd",
+        "enable_dynamic_cv_pipeline": true,
+        "multibuffer": false,
+        "num_stages": 2,
+        "tile_mix_cube_loop": 1,
+        "tile_mix_vector_loop": 1
+      },
+      "contract_proposal": {
+        "expected_resource_count": 2,
+        "expected_output_elements": 256,
+        "expected_element_bit_width": 32,
+        "expected_source_payload_bytes": 1024,
+        "projected_payload_bytes": 1024,
+        "fixpipe_min_instances": 1,
+        "vector_min_instances": 1,
+        "materialization_stage": "ttir.dynamic-cv-pipeline",
+        "auto_tile_and_bind_subblock_outcome": false
+      },
+      "expected_analyzer_decision": "defer"
+    },
+    {
+      "name": "irregular-indirect-add-i64-f32-8",
+      "operation_family": "irregular-memory",
+      "ttir": "irregular-indirect-add.ttir.mlir",
+      "before_cvpipelining": "irregular-indirect-add.before_cvpipelining.mlir",
+      "arch": "Ascend950",
+      "options": {
+        "compile_mode": "simd_simt",
+        "multibuffer": false,
+        "num_stages": 2,
+        "tile_mix_cube_loop": 1,
+        "tile_mix_vector_loop": 1
+      },
+      "contract_proposal": {
+        "expected_resource_count": 2,
+        "expected_elements": 8,
+        "expected_index_bit_width": 64,
+        "expected_value_bit_width": 32,
+        "expected_index_payload_bytes": 64,
+        "expected_value_payload_bytes": 32,
+        "max_tiles": 1,
+        "materialized_allocation_count": 1,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "auto_tile_and_bind_subblock_outcome": false
+      },
+      "expected_analyzer_decision": "defer"
     }
   ]
 }

@@ -137,11 +137,133 @@ makeProfileContract(const PipelineContractBinding &binding) {
   if (binding.contractId == "invalidate-unmodeled-stage" &&
       binding.contractVersion == "1" && binding.parameters.empty())
     return makeInvalidateContract(binding.stage);
+  const bool dynamicSourcePreserve =
+      binding.contractId == "dynamic-cv-source-preserve" &&
+      binding.contractVersion == "1";
+  const bool dynamicReplay = binding.contractId == "dynamic-cv-replay" &&
+                             binding.contractVersion == "1";
+  const bool dynamicResultPreserve =
+      binding.contractId == "dynamic-cv-result-preserve" &&
+      binding.contractVersion == "1";
+  if (dynamicSourcePreserve || dynamicReplay || dynamicResultPreserve) {
+    constexpr std::array<StringRef, 7> names = {
+        "expected_resource_count", "expected_output_elements",
+        "expected_element_bit_width", "expected_source_payload_bytes",
+        "projected_payload_bytes", "fixpipe_min_instances",
+        "vector_min_instances"};
+    const bool validStage =
+        (dynamicReplay &&
+         binding.stage.stageName == "ttir.dynamic-cv-pipeline") ||
+        (dynamicResultPreserve &&
+         binding.stage.stageName == "bisheng.ub-affecting-suffix") ||
+        (dynamicSourcePreserve &&
+         binding.stage.stageName != "ttir.dynamic-cv-pipeline" &&
+         binding.stage.stageName != "bisheng.ub-affecting-suffix");
+    if (!validStage || !hasExactParameters(binding, names))
+      return nullptr;
+    auto resourceCount =
+        getPositiveInt64Parameter(binding, "expected_resource_count");
+    auto outputElements =
+        getPositiveInt64Parameter(binding, "expected_output_elements");
+    auto elementBitWidth =
+        getPositiveInt64Parameter(binding, "expected_element_bit_width");
+    auto sourcePayload =
+        getPositiveInt64Parameter(binding, "expected_source_payload_bytes");
+    auto projectedPayload =
+        getPositiveInt64Parameter(binding, "projected_payload_bytes");
+    auto fixpipeInstances =
+        getPositiveInt64Parameter(binding, "fixpipe_min_instances");
+    auto vectorInstances =
+        getPositiveInt64Parameter(binding, "vector_min_instances");
+    if (!resourceCount || !outputElements || !elementBitWidth ||
+        !sourcePayload || !projectedPayload || !fixpipeInstances ||
+        !vectorInstances ||
+        *elementBitWidth > std::numeric_limits<unsigned>::max())
+      return nullptr;
+    if (dynamicReplay)
+      return makeDynamicCVReplayContract(
+          binding.stage, *resourceCount, *outputElements,
+          static_cast<unsigned>(*elementBitWidth), *sourcePayload,
+          *projectedPayload, *fixpipeInstances, *vectorInstances);
+    if (dynamicResultPreserve)
+      return makeDynamicCVResultPreserveContract(
+          binding.stage, *resourceCount, *outputElements,
+          static_cast<unsigned>(*elementBitWidth), *sourcePayload,
+          *projectedPayload, *fixpipeInstances, *vectorInstances);
+    return makeDynamicCVSourcePreserveContract(
+        binding.stage, *resourceCount, *outputElements,
+        static_cast<unsigned>(*elementBitWidth), *sourcePayload,
+        *projectedPayload, *fixpipeInstances, *vectorInstances);
+  }
+  const bool irregularSourcePreserve =
+      binding.contractId == "irregular-memory-source-preserve" &&
+      binding.contractVersion == "1";
+  const bool irregularReplay =
+      binding.contractId == "irregular-memory-replay" &&
+      binding.contractVersion == "1";
+  const bool irregularResultPreserve =
+      binding.contractId == "irregular-memory-result-preserve" &&
+      binding.contractVersion == "1";
+  if (irregularSourcePreserve || irregularReplay ||
+      irregularResultPreserve) {
+    constexpr std::array<StringRef, 8> names = {
+        "expected_resource_count", "expected_elements",
+        "expected_index_bit_width", "expected_value_bit_width",
+        "expected_index_payload_bytes", "expected_value_payload_bytes",
+        "max_tiles", "materialized_allocation_count"};
+    const bool validStage =
+        (irregularReplay &&
+         binding.stage.stageName == "ttir.triton-to-linalg") ||
+        (irregularResultPreserve &&
+         binding.stage.stageName == "bisheng.ub-affecting-suffix") ||
+        (irregularSourcePreserve &&
+         binding.stage.stageName != "ttir.triton-to-linalg" &&
+         binding.stage.stageName != "bisheng.ub-affecting-suffix");
+    if (!validStage || !hasExactParameters(binding, names))
+      return nullptr;
+    auto resourceCount =
+        getPositiveInt64Parameter(binding, "expected_resource_count");
+    auto elements = getPositiveInt64Parameter(binding, "expected_elements");
+    auto indexBitWidth =
+        getPositiveInt64Parameter(binding, "expected_index_bit_width");
+    auto valueBitWidth =
+        getPositiveInt64Parameter(binding, "expected_value_bit_width");
+    auto indexPayload =
+        getPositiveInt64Parameter(binding, "expected_index_payload_bytes");
+    auto valuePayload =
+        getPositiveInt64Parameter(binding, "expected_value_payload_bytes");
+    auto maxTiles = getPositiveInt64Parameter(binding, "max_tiles");
+    auto allocationCount =
+        getPositiveInt64Parameter(binding, "materialized_allocation_count");
+    if (!resourceCount || !elements || !indexBitWidth || !valueBitWidth ||
+        !indexPayload || !valuePayload || !maxTiles || !allocationCount ||
+        *allocationCount != 1 ||
+        *indexBitWidth > std::numeric_limits<unsigned>::max() ||
+        *valueBitWidth > std::numeric_limits<unsigned>::max())
+      return nullptr;
+    if (irregularReplay)
+      return makeIrregularMemoryReplayContract(
+          binding.stage, *resourceCount, *elements,
+          static_cast<unsigned>(*indexBitWidth),
+          static_cast<unsigned>(*valueBitWidth), *indexPayload, *valuePayload,
+          *maxTiles);
+    if (irregularResultPreserve)
+      return makeIrregularMemoryResultPreserveContract(
+          binding.stage, *resourceCount, *elements,
+          static_cast<unsigned>(*indexBitWidth),
+          static_cast<unsigned>(*valueBitWidth), *indexPayload, *valuePayload,
+          *maxTiles);
+    return makeIrregularMemorySourcePreserveContract(
+        binding.stage, *resourceCount, *elements,
+        static_cast<unsigned>(*indexBitWidth),
+        static_cast<unsigned>(*valueBitWidth), *indexPayload, *valuePayload,
+        *maxTiles);
+  }
   // Dynamic CV changes core projection, dataflow, liveness and cache
-  // multiplicity.  Reusing a family-level Preserve/Transform contract here
-  // would incorrectly treat those changes as no-ops.  Until a replay-backed
-  // DynamicCVPipelineContract is implemented, this exact stage may only carry
-  // the explicit fail-closed contract above.
+  // multiplicity. Reusing an unrelated family-level Preserve/Transform
+  // contract here would incorrectly treat those changes as no-ops. This exact
+  // stage may therefore carry only the explicit fail-closed contract or the
+  // replay-backed dynamic contract handled above.
   if (binding.stage.stageName == "ttir.dynamic-cv-pipeline")
     return nullptr;
 

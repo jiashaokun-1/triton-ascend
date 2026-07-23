@@ -833,6 +833,314 @@ public:
   }
 };
 
+class ReplayContractBase : public UBResourceContract {
+public:
+  explicit ReplayContractBase(const PipelineStageContext &stage)
+      : stageName(stage.stageName) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef version() const final { return "1"; }
+  bool matches(const PipelineStageContext &context) const final {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+};
+
+class DynamicCVReplayContract final : public ReplayContractBase {
+public:
+  DynamicCVReplayContract(const PipelineStageContext &stage,
+                          int64_t expectedResourceCount,
+                          int64_t expectedOutputElements,
+                          unsigned expectedElementBitWidth,
+                          int64_t expectedSourcePayloadBytes,
+                          int64_t projectedPayloadBytes,
+                          int64_t fixpipeMinInstances,
+                          int64_t vectorMinInstances)
+      : ReplayContractBase(stage),
+        expectedResourceCount(expectedResourceCount),
+        expectedOutputElements(expectedOutputElements),
+        expectedElementBitWidth(expectedElementBitWidth),
+        expectedSourcePayloadBytes(expectedSourcePayloadBytes),
+        projectedPayloadBytes(projectedPayloadBytes),
+        fixpipeMinInstances(fixpipeMinInstances),
+        vectorMinInstances(vectorMinInstances) {}
+
+  StringRef id() const override { return "dynamic-cv-replay"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (expectedResourceCount != 2 || expectedOutputElements <= 0 ||
+        expectedElementBitWidth == 0 || expectedSourcePayloadBytes <= 0 ||
+        projectedPayloadBytes <= 0 ||
+        projectedPayloadBytes > expectedSourcePayloadBytes ||
+        fixpipeMinInstances <= 0 || vectorMinInstances <= 0 ||
+        graph.resources().size() != 2 || graph.witnesses().size() != 1 ||
+        !graph.hasPairwiseMayAliasWitness(0))
+      return ContractDisposition::Invalidate;
+    const MandatoryUBResource &fixpipe = graph.resources()[0];
+    const MandatoryUBResource &vector = graph.resources()[1];
+    if (fixpipe.validity != ValidityState::Valid ||
+        vector.validity != ValidityState::Valid ||
+        fixpipe.kind != MaterializationKind::DynamicCVFixpipeOutput ||
+        vector.kind != MaterializationKind::DynamicCVVectorOutput ||
+        fixpipe.origin != "tt.dot" || vector.origin != "math.exp" ||
+        fixpipe.consumer != "math.exp" || vector.consumer != "tt.store" ||
+        fixpipe.sourceElements != expectedOutputElements ||
+        vector.sourceElements != expectedOutputElements ||
+        fixpipe.elementBitWidth != expectedElementBitWidth ||
+        vector.elementBitWidth != expectedElementBitWidth ||
+        fixpipe.minPayloadBytes != expectedSourcePayloadBytes ||
+        vector.minPayloadBytes != expectedSourcePayloadBytes ||
+        fixpipe.minInstances != 1 || vector.minInstances != 1 ||
+        fixpipe.lastRequiredUse.ordinal != vector.birth.ordinal)
+      return ContractDisposition::Invalidate;
+    if (failed(graph.updateResourceLowerBound(
+            0, projectedPayloadBytes, fixpipeMinInstances, id())) ||
+        failed(graph.updateResourceLowerBound(
+            1, projectedPayloadBytes, vectorMinInstances, id())) ||
+        failed(graph.refineWitnessToMustDistinct(0, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Transform;
+  }
+
+private:
+  int64_t expectedResourceCount;
+  int64_t expectedOutputElements;
+  unsigned expectedElementBitWidth;
+  int64_t expectedSourcePayloadBytes;
+  int64_t projectedPayloadBytes;
+  int64_t fixpipeMinInstances;
+  int64_t vectorMinInstances;
+};
+
+class DynamicCVPreserveContract final : public ReplayContractBase {
+public:
+  DynamicCVPreserveContract(const PipelineStageContext &stage,
+                            int64_t expectedResourceCount,
+                            int64_t expectedOutputElements,
+                            unsigned expectedElementBitWidth,
+                            int64_t expectedSourcePayloadBytes,
+                            int64_t projectedPayloadBytes,
+                            int64_t fixpipeMinInstances,
+                            int64_t vectorMinInstances, bool resultState)
+      : ReplayContractBase(stage),
+        expectedResourceCount(expectedResourceCount),
+        expectedOutputElements(expectedOutputElements),
+        expectedElementBitWidth(expectedElementBitWidth),
+        expectedSourcePayloadBytes(expectedSourcePayloadBytes),
+        projectedPayloadBytes(projectedPayloadBytes),
+        fixpipeMinInstances(fixpipeMinInstances),
+        vectorMinInstances(vectorMinInstances), resultState(resultState) {}
+
+  StringRef id() const override {
+    return resultState ? "dynamic-cv-result-preserve"
+                       : "dynamic-cv-source-preserve";
+  }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (expectedResourceCount != 2 || expectedOutputElements <= 0 ||
+        expectedElementBitWidth == 0 || expectedSourcePayloadBytes <= 0 ||
+        projectedPayloadBytes <= 0 ||
+        projectedPayloadBytes > expectedSourcePayloadBytes ||
+        fixpipeMinInstances <= 0 || vectorMinInstances <= 0 ||
+        graph.resources().size() != 2 || graph.witnesses().size() != 1)
+      return ContractDisposition::Invalidate;
+    if (resultState ? !graph.hasPairwiseDistinctWitness(0)
+                    : !graph.hasPairwiseMayAliasWitness(0))
+      return ContractDisposition::Invalidate;
+    const MandatoryUBResource &fixpipe = graph.resources()[0];
+    const MandatoryUBResource &vector = graph.resources()[1];
+    const int64_t expectedPayload =
+        resultState ? projectedPayloadBytes : expectedSourcePayloadBytes;
+    if (fixpipe.validity != ValidityState::Valid ||
+        vector.validity != ValidityState::Valid ||
+        fixpipe.kind != MaterializationKind::DynamicCVFixpipeOutput ||
+        vector.kind != MaterializationKind::DynamicCVVectorOutput ||
+        fixpipe.origin != "tt.dot" || vector.origin != "math.exp" ||
+        fixpipe.consumer != "math.exp" || vector.consumer != "tt.store" ||
+        fixpipe.sourceElements != expectedOutputElements ||
+        vector.sourceElements != expectedOutputElements ||
+        fixpipe.elementBitWidth != expectedElementBitWidth ||
+        vector.elementBitWidth != expectedElementBitWidth ||
+        fixpipe.minPayloadBytes != expectedPayload ||
+        vector.minPayloadBytes != expectedPayload ||
+        fixpipe.minInstances != (resultState ? fixpipeMinInstances : 1) ||
+        vector.minInstances != (resultState ? vectorMinInstances : 1) ||
+        fixpipe.lastRequiredUse.ordinal != vector.birth.ordinal)
+      return ContractDisposition::Invalidate;
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
+      if (failed(graph.appendResourceTrace(
+              static_cast<ResourceId>(ordinal), id())))
+        return ContractDisposition::InternalError;
+    return ContractDisposition::Preserve;
+  }
+
+private:
+  int64_t expectedResourceCount;
+  int64_t expectedOutputElements;
+  unsigned expectedElementBitWidth;
+  int64_t expectedSourcePayloadBytes;
+  int64_t projectedPayloadBytes;
+  int64_t fixpipeMinInstances;
+  int64_t vectorMinInstances;
+  bool resultState;
+};
+
+class IrregularMemoryReplayContract final : public ReplayContractBase {
+public:
+  IrregularMemoryReplayContract(const PipelineStageContext &stage,
+                                int64_t expectedResourceCount,
+                                int64_t expectedElements,
+                                unsigned expectedIndexBitWidth,
+                                unsigned expectedValueBitWidth,
+                                int64_t expectedIndexPayloadBytes,
+                                int64_t expectedValuePayloadBytes,
+                                int64_t maxTiles)
+      : ReplayContractBase(stage),
+        expectedResourceCount(expectedResourceCount),
+        expectedElements(expectedElements),
+        expectedIndexBitWidth(expectedIndexBitWidth),
+        expectedValueBitWidth(expectedValueBitWidth),
+        expectedIndexPayloadBytes(expectedIndexPayloadBytes),
+        expectedValuePayloadBytes(expectedValuePayloadBytes),
+        maxTiles(maxTiles) {}
+
+  StringRef id() const override { return "irregular-memory-replay"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (expectedResourceCount != 2 || expectedElements <= 0 ||
+        expectedIndexBitWidth == 0 || expectedValueBitWidth == 0 ||
+        expectedIndexPayloadBytes <= 0 ||
+        expectedValuePayloadBytes <= 0 || maxTiles <= 0 ||
+        graph.resources().size() != 2 || graph.witnesses().size() != 1 ||
+        !graph.hasPairwiseMayAliasWitness(0))
+      return ContractDisposition::Invalidate;
+    const MandatoryUBResource &index = graph.resources()[0];
+    const MandatoryUBResource &value = graph.resources()[1];
+    if (index.validity != ValidityState::Valid ||
+        value.validity != ValidityState::Valid ||
+        index.kind != MaterializationKind::IrregularIndex ||
+        value.kind != MaterializationKind::IrregularGather ||
+        index.sourceElements != expectedElements ||
+        value.sourceElements != expectedElements ||
+        index.elementBitWidth != expectedIndexBitWidth ||
+        value.elementBitWidth != expectedValueBitWidth ||
+        index.minPayloadBytes != expectedIndexPayloadBytes ||
+        value.minPayloadBytes != expectedValuePayloadBytes ||
+        index.minInstances != 1 || value.minInstances != 1 ||
+        index.lastRequiredUse.ordinal != value.birth.ordinal)
+      return ContractDisposition::Invalidate;
+    const int64_t projectedIndex =
+        expectedIndexPayloadBytes / maxTiles +
+        (expectedIndexPayloadBytes % maxTiles != 0);
+    const int64_t projectedValue =
+        expectedValuePayloadBytes / maxTiles +
+        (expectedValuePayloadBytes % maxTiles != 0);
+    if (failed(graph.updateResourceLowerBound(0, projectedIndex, 1, id())) ||
+        failed(graph.updateResourceLowerBound(1, projectedValue, 1, id())) ||
+        failed(graph.refineWitnessToMustDistinct(0, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Transform;
+  }
+
+private:
+  int64_t expectedResourceCount;
+  int64_t expectedElements;
+  unsigned expectedIndexBitWidth;
+  unsigned expectedValueBitWidth;
+  int64_t expectedIndexPayloadBytes;
+  int64_t expectedValuePayloadBytes;
+  int64_t maxTiles;
+};
+
+class IrregularMemoryPreserveContract final : public ReplayContractBase {
+public:
+  IrregularMemoryPreserveContract(const PipelineStageContext &stage,
+                                  int64_t expectedResourceCount,
+                                  int64_t expectedElements,
+                                  unsigned expectedIndexBitWidth,
+                                  unsigned expectedValueBitWidth,
+                                  int64_t expectedIndexPayloadBytes,
+                                  int64_t expectedValuePayloadBytes,
+                                  int64_t maxTiles, bool resultState)
+      : ReplayContractBase(stage),
+        expectedResourceCount(expectedResourceCount),
+        expectedElements(expectedElements),
+        expectedIndexBitWidth(expectedIndexBitWidth),
+        expectedValueBitWidth(expectedValueBitWidth),
+        expectedIndexPayloadBytes(expectedIndexPayloadBytes),
+        expectedValuePayloadBytes(expectedValuePayloadBytes),
+        maxTiles(maxTiles), resultState(resultState) {}
+
+  StringRef id() const override {
+    return resultState ? "irregular-memory-result-preserve"
+                       : "irregular-memory-source-preserve";
+  }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (expectedResourceCount != 2 || expectedElements <= 0 ||
+        expectedIndexBitWidth == 0 || expectedValueBitWidth == 0 ||
+        expectedIndexPayloadBytes <= 0 || expectedValuePayloadBytes <= 0 ||
+        maxTiles <= 0 || graph.resources().size() != 2 ||
+        graph.witnesses().size() != 1)
+      return ContractDisposition::Invalidate;
+    if (resultState ? !graph.hasPairwiseDistinctWitness(0)
+                    : !graph.hasPairwiseMayAliasWitness(0))
+      return ContractDisposition::Invalidate;
+    const MandatoryUBResource &index = graph.resources()[0];
+    const MandatoryUBResource &value = graph.resources()[1];
+    const int64_t projectedIndex =
+        expectedIndexPayloadBytes / maxTiles +
+        (expectedIndexPayloadBytes % maxTiles != 0);
+    const int64_t projectedValue =
+        expectedValuePayloadBytes / maxTiles +
+        (expectedValuePayloadBytes % maxTiles != 0);
+    if (index.validity != ValidityState::Valid ||
+        value.validity != ValidityState::Valid ||
+        index.kind != MaterializationKind::IrregularIndex ||
+        value.kind != MaterializationKind::IrregularGather ||
+        index.sourceElements != expectedElements ||
+        value.sourceElements != expectedElements ||
+        index.elementBitWidth != expectedIndexBitWidth ||
+        value.elementBitWidth != expectedValueBitWidth ||
+        index.minPayloadBytes !=
+            (resultState ? projectedIndex : expectedIndexPayloadBytes) ||
+        value.minPayloadBytes !=
+            (resultState ? projectedValue : expectedValuePayloadBytes) ||
+        index.minInstances != 1 || value.minInstances != 1 ||
+        index.lastRequiredUse.ordinal != value.birth.ordinal)
+      return ContractDisposition::Invalidate;
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
+      if (failed(graph.appendResourceTrace(
+              static_cast<ResourceId>(ordinal), id())))
+        return ContractDisposition::InternalError;
+    return ContractDisposition::Preserve;
+  }
+
+private:
+  int64_t expectedResourceCount;
+  int64_t expectedElements;
+  unsigned expectedIndexBitWidth;
+  unsigned expectedValueBitWidth;
+  int64_t expectedIndexPayloadBytes;
+  int64_t expectedValuePayloadBytes;
+  int64_t maxTiles;
+  bool resultState;
+};
+
 } // namespace
 
 void PipelineContractRegistry::setProfileIdentity(PipelineIdentity identity) {
@@ -1040,6 +1348,74 @@ std::unique_ptr<UBResourceContract> makeReductionSumExtraBufferContract(
       stage, expectedResourceCount, expectedSourceElements,
       expectedElementBitWidth, expectedInputPayloadBytes,
       expectedScratchPayloadBytes, expectedAccumulatorPayloadBytes);
+}
+
+std::unique_ptr<UBResourceContract> makeDynamicCVReplayContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedOutputElements, unsigned expectedElementBitWidth,
+    int64_t expectedSourcePayloadBytes, int64_t projectedPayloadBytes,
+    int64_t fixpipeMinInstances, int64_t vectorMinInstances) {
+  return std::make_unique<DynamicCVReplayContract>(
+      stage, expectedResourceCount, expectedOutputElements,
+      expectedElementBitWidth, expectedSourcePayloadBytes,
+      projectedPayloadBytes, fixpipeMinInstances, vectorMinInstances);
+}
+
+std::unique_ptr<UBResourceContract> makeDynamicCVSourcePreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedOutputElements, unsigned expectedElementBitWidth,
+    int64_t expectedSourcePayloadBytes, int64_t projectedPayloadBytes,
+    int64_t fixpipeMinInstances, int64_t vectorMinInstances) {
+  return std::make_unique<DynamicCVPreserveContract>(
+      stage, expectedResourceCount, expectedOutputElements,
+      expectedElementBitWidth, expectedSourcePayloadBytes,
+      projectedPayloadBytes, fixpipeMinInstances, vectorMinInstances,
+      /*resultState=*/false);
+}
+
+std::unique_ptr<UBResourceContract> makeDynamicCVResultPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedOutputElements, unsigned expectedElementBitWidth,
+    int64_t expectedSourcePayloadBytes, int64_t projectedPayloadBytes,
+    int64_t fixpipeMinInstances, int64_t vectorMinInstances) {
+  return std::make_unique<DynamicCVPreserveContract>(
+      stage, expectedResourceCount, expectedOutputElements,
+      expectedElementBitWidth, expectedSourcePayloadBytes,
+      projectedPayloadBytes, fixpipeMinInstances, vectorMinInstances,
+      /*resultState=*/true);
+}
+
+std::unique_ptr<UBResourceContract> makeIrregularMemoryReplayContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedElements, unsigned expectedIndexBitWidth,
+    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
+    int64_t expectedValuePayloadBytes, int64_t maxTiles) {
+  return std::make_unique<IrregularMemoryReplayContract>(
+      stage, expectedResourceCount, expectedElements, expectedIndexBitWidth,
+      expectedValueBitWidth, expectedIndexPayloadBytes,
+      expectedValuePayloadBytes, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeIrregularMemorySourcePreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedElements, unsigned expectedIndexBitWidth,
+    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
+    int64_t expectedValuePayloadBytes, int64_t maxTiles) {
+  return std::make_unique<IrregularMemoryPreserveContract>(
+      stage, expectedResourceCount, expectedElements, expectedIndexBitWidth,
+      expectedValueBitWidth, expectedIndexPayloadBytes,
+      expectedValuePayloadBytes, maxTiles, /*resultState=*/false);
+}
+
+std::unique_ptr<UBResourceContract> makeIrregularMemoryResultPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedElements, unsigned expectedIndexBitWidth,
+    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
+    int64_t expectedValuePayloadBytes, int64_t maxTiles) {
+  return std::make_unique<IrregularMemoryPreserveContract>(
+      stage, expectedResourceCount, expectedElements, expectedIndexBitWidth,
+      expectedValueBitWidth, expectedIndexPayloadBytes,
+      expectedValuePayloadBytes, maxTiles, /*resultState=*/true);
 }
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {

@@ -33,7 +33,11 @@ enum class MaterializationKind {
   GMToUBLoad,
   ViewAlias,
   ReductionScratch,
-  ReductionAccumulator
+  ReductionAccumulator,
+  DynamicCVFixpipeOutput,
+  DynamicCVVectorOutput,
+  IrregularIndex,
+  IrregularGather
 };
 
 struct ProgramPoint {
@@ -90,6 +94,10 @@ public:
                                      StringRef contractId);
   LogicalResult raiseResourceInstances(ResourceId id, int64_t minInstances,
                                        StringRef contractId);
+  LogicalResult updateResourceLowerBound(ResourceId id,
+                                         int64_t minPayloadBytes,
+                                         int64_t minInstances,
+                                         StringRef contractId);
   LogicalResult appendResourceTrace(ResourceId id, StringRef contractId);
   LogicalResult refineWitnessToMustDistinct(WitnessId id,
                                             StringRef contractId);

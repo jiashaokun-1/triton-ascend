@@ -1,9 +1,9 @@
 {
   "schema": "ttir-ub-p4-defer-evidence-v1",
   "captured_on": "2026-07-23",
-  "producer_libtriton_sha256": "4305c970d76161fa91725323d5ccb1ae12242939a4e89d62ed6c559c8a6e411e",
+  "producer_libtriton_sha256": "ff7cfbcd21fa392ccb4146f3e5c6c21be13cba013a4d3bc12a4aa53af35aafa8",
   "consumer_suffix_compiler_sha256": "4cf8798e69e1500e43257b714db6222792039f0fb73c0459bacea985f5c6c6f5",
-  "consumer_semantic_model_sha256": "948acdc0d41f4a011cbcd9590e7ba1a57ada28fbe9990031918b77cb68ad8381",
+  "consumer_semantic_model_sha256": "0d398b32d46f7e93af8bfca44a75abf61afddc524d04d3cf5cf89385f5fb6b40",
   "cases": [
     {
       "name": "dynamic-cv-mix-dot-exp",
@@ -22,8 +22,11 @@
         "ttir.triton-to-linalg",
         "ttir.dynamic-cv-pipeline"
       ],
-      "status": "deliberate-defer",
-      "reason": "producer-consumer-bishengir-schema-mismatch",
+      "status": "replay-shadow",
+      "analyzer_lower_bound_bits": 16384,
+      "semantic_replay_peak_bits": 40960,
+      "validated_seeds": "0..19",
+      "reason": "same-schema-suffix-oracle-unavailable-and-capacity-parameter-mismatch",
       "promotion_allowed": false
     },
     {
@@ -42,8 +45,11 @@
         "ttir.triton-to-unstructure",
         "ttir.triton-to-linalg"
       ],
-      "status": "deliberate-defer",
-      "reason": "unsupported-op-irregular-memory",
+      "status": "replay-shadow",
+      "analyzer_lower_bound_bits": 768,
+      "semantic_replay_peak_bits": 1024,
+      "validated_seeds": "0..19",
+      "reason": "same-schema-suffix-oracle-unavailable-and-capacity-parameter-mismatch",
       "promotion_allowed": false
     }
   ]
