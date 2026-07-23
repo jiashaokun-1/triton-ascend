@@ -272,6 +272,13 @@ protected:
     if (requireDistinct ? !graph.hasPairwiseDistinctWitness(0)
                         : !graph.hasPairwiseMayAliasWitness(0))
       return false;
+    const MandatoryUBResource &lhs = graph.resources()[0];
+    const MandatoryUBResource &rhs = graph.resources()[1];
+    if (lhs.birth.ordinal == rhs.birth.ordinal ||
+        lhs.lastRequiredUse.ordinal != rhs.lastRequiredUse.ordinal ||
+        lhs.birth.ordinal >= lhs.lastRequiredUse.ordinal ||
+        rhs.birth.ordinal >= rhs.lastRequiredUse.ordinal)
+      return false;
     return llvm::all_of(graph.resources(), [&](const auto &resource) {
       return resource.validity == ValidityState::Valid &&
              resource.origin == "tt.load" &&

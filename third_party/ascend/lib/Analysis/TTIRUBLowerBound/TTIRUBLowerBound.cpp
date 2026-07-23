@@ -68,6 +68,12 @@ StringRef classifyUnsupportedOperation(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
   if (name == triton::ReduceOp::getOperationName())
     return "unsupported-op-reduction";
+  if (name == triton::BroadcastOp::getOperationName())
+    return "unsupported-op-broadcast";
+  if (name == triton::ExpandDimsOp::getOperationName())
+    return "unsupported-op-expand-dims";
+  if (name == triton::BitcastOp::getOperationName())
+    return "unsupported-op-bitcast";
   if (name.split('.').first == "arith")
     return "unsupported-op-arithmetic";
   if (operation->getNumRegions() != 0)

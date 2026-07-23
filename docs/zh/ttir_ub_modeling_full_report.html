@@ -484,7 +484,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>DirectTensorLoadSourceContract</code><span>定义 direct contiguous load/store source pattern，产生 GMToUBLoad candidate。</span><span class="status now">Matcher exists</span></div>
         <div class="contract"><code>TritonToLinalgLoadMaterializationContract</code><span>证明 candidate 在 TTIR→Linalg/HIVM 中真正成为 local/UB allocation 与 GM→local copy；当前由 <span class="mono">direct-copy-max-tiles@1</span> 候选摘要表达。</span><span class="status now">Candidate implemented</span></div>
         <div class="contract"><code>TritonToLinalgStoreMaterializationContract</code><span>定义输出是否物化、是否通过 DPS/inplace 复用输入。</span><span class="status todo">P2</span></div>
-        <div class="contract"><code>IntermediateMaterializationContract</code><span>elementwise/layout/reduction 中间 tensor 是融合、view 还是独立 buffer。</span><span class="status todo">P2+</span></div>
+        <div class="contract"><code>IntermediateMaterializationContract</code><span>elementwise/layout/reduction 中间 tensor 是融合、view 还是独立 buffer；binary-add 与 reshape-copy 已各落地一个严格候选切片。</span><span class="status now">P2 slice implemented</span></div>
 
         <h3>B. Open-source TTIR pipeline contracts</h3>
         <div class="contract"><code>AutoBlockifyContract</code><span>根据 auto_blockify_size 推导 block/tile 下界；未知分割规则则 Invalidate。</span><span class="status todo">P1</span></div>
@@ -500,7 +500,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
 
         <h3>C. Operation-family contracts</h3>
         <div class="contract"><code>ElementwiseFusionContract</code><span>判断 elementwise chain 是否零中间物化，并为多输入建立/拒绝 coexistence。</span><span class="status todo">P2</span></div>
-        <div class="contract"><code>ViewAliasContract</code><span>为 reshape/expand_dims/bitcast/view 建立 mustAlias；不能证明时只允许 mayAlias。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>ViewAliasContract</code><span>为 reshape/expand_dims/bitcast/view 建立 mustAlias；当前只对受限 rank-1→rank-2 reshape 由物化合同把 mayAlias 精化为 mustAlias，其余形态明确 defer。</span><span class="status now">Reshape slice implemented</span></div>
         <div class="contract"><code>LayoutConversionContract</code><span>transpose/broadcast/cat 等是否产生新 allocation 或 scratch。</span><span class="status todo">P3/P4</span></div>
         <div class="contract"><code>ReductionMaterializationContract</code><span>建立 accumulator、init 和 scratch resources 及其最小 shape。</span><span class="status todo">P3</span></div>
         <div class="contract"><code>DotMaterializationContract</code><span>描述 A/B tile、accumulator 和 Cube/AIV memory-space 边界。</span><span class="status todo">P5</span></div>
@@ -522,14 +522,14 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>TileAndBindSubBlockContract</code><span>sub-block 切分的最大 tile 数或最小 tile shape 证明。</span><span class="status todo">P1</span></div>
         <div class="contract"><code>CanonicalizationEliminationContract</code><span>DCE/fusion/canonicalization 是否消除或缩小 resource。</span><span class="status todo">P1/P2</span></div>
         <div class="contract"><code>BufferizationContract</code><span>逻辑 tensor 到 allocation 的映射与 memory space；是后续 alias/lifetime 的基础。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>InPlaceAliasContract</code><span>建立 mustAlias/mayAlias，禁止把可能 inplace 的输出作为独立资源相加。</span><span class="status todo">P2</span></div>
-        <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct。</span><span class="status todo">P2</span></div>
-        <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness。</span><span class="status todo">P2/P3</span></div>
+        <div class="contract"><code>InPlaceAliasContract</code><span>建立 mustAlias/mayAlias，禁止把可能 inplace 的输出作为独立资源相加；reshape-copy 候选链已实现单 allocation 证明。</span><span class="status now">P2 slice implemented</span></div>
+        <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct；binary-add 候选链已实现双 allocation 证明。</span><span class="status now">P2 slice implemented</span></div>
+        <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness；binary-add 合同现已要求两个不同 birth、同一 lastRequiredUse 且 birth 早于该 use，任一漂移都会 Invalidate。</span><span class="status now">Binary slice implemented</span></div>
         <div class="contract"><code>AlignmentContract</code><span>证明 planner 强制 alignment 的最小 padding；首版可忽略以保持更小下界。</span><span class="status todo">P5</span></div>
         <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存。</span><span class="status todo">P3/P4</span></div>
         <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status todo">P0</span></div>
 
-        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 <span class="mono">invalidate-unmodeled-stage@1</span>、<span class="mono">direct-copy-preserve@1</span> 和 <span class="mono">direct-copy-max-tiles@1</span>。后两者会严格核对资源数量、source elements、element width、输入 payload 和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证的 Preserve/Transform 合同仍为 0。</div>
+        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 7 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>，以及 direct-copy、binary-add、reshape-copy 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入 payload 和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证的 Preserve/Transform 合同仍为 0。</div>
       </section>
 
       <section class="sheet" id="solver">
@@ -568,7 +568,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
             <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
-            <tr><td>本地完整 oracle gate</td><td><span class="tag fact">已通过</span></td><td>精确 LLVM 原生构建；289 项 Python 测试、85 项 C++ GTest；contract / semantic replay / real PlanMemory 三方在 direct-copy 20 seeds + retry 上为 0 violation / 0 unavailable</td></tr>
+            <tr><td>本地完整 oracle gate</td><td><span class="tag fact">已通过</span></td><td>精确 LLVM 原生构建；289 项 Python 测试、88 项 C++ GTest；contract / semantic replay / real PlanMemory 三方在 direct-copy 20 seeds + retry 上为 0 violation / 0 unavailable</td></tr>
             <tr><td>Production contracts</td><td><span class="tag plan">候选合同 6 / 已认证 0</span></td><td>direct-copy、binary-add 与 reshape-copy 的 Preserve / max-tiles transfer function 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
@@ -594,8 +594,8 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <h3>P2 · Elementwise 与 alias/coexistence <span class="tag plan">In progress</span></h3>
             <p>第一条最小切片已实现：严格匹配 <span class="mono">load(lhs) + load(rhs) → arith.addf → store</span>，生成两条 GM→UB resource、pairwise mayAlias 和同一 program point 的 CoexistenceWitness；<span class="mono">binary-add-max-tiles@1</span> 只有在物化阶段验证完整 source facts 后，才把该 witness 从 mayAlias 精化为 mustDistinct，并按 <span class="mono">ceil(payload/maxTiles)</span> 传递两条资源。后续 preserve 合同要求 mustDistinct 证明继续有效；否则整图 Invalidate/defer。</p>
             <p>第二条最小切片也已实现：严格匹配无 <span class="mono">allow_reorder</span> / <span class="mono">efficient_layout</span> 的 <span class="mono">load → reshape → store</span>。matcher 为 load 和 view 建立两个逻辑 resource node，但只先记录 mayAlias；<span class="mono">reshape-copy-max-tiles@1</span> 必须在 materialization stage 证明二者落到同一个 allocation，才精化为 mustAlias。solver 按 alias class 取一次大小，因此不会把逻辑 view 重复计入 UB。</p>
-            <p class="small"><strong>当前门禁：</strong>solver 仅对同一 witness 且 pairwise mustDistinct 的资源求和；mayAlias、重复 resource id、缺少 witness、合同顺序或参数漂移均不能产生双资源证书。oracle 已区分 logical resource count、certificate resource count 与 physical allocation count：binary-add 是 2/2/2，reshape-copy 是 2/1/1。before-CVPipelining allocation 数量或 payload 不匹配即禁止晋升。尚缺目标 CANN 环境生成的精确配对 snapshot 和 seeds 0..19 + retry 联合验证，因此两类 P2 profile 均不得安装。</p>
-            <p class="small"><strong>下一步：</strong>在目标 CANN 服务器完成 binary-add、reshape-copy 配对 fixture 与真实 identity 晋升；随后扩展 broadcast 物化分支及可复用的 Lifetime contracts。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加，也禁止把 mustAlias view 重复计数；真实可编译误拒绝数为 0。</p>
+            <p class="small"><strong>当前门禁：</strong>solver 仅对同一 witness 且 pairwise mustDistinct 的资源求和；mayAlias、重复 resource id、缺少 witness、合同顺序或参数漂移均不能产生双资源证书。binary-add 合同还要求两个资源有不同 birth、相同 lastRequiredUse，且两个 birth 都早于共同 use；lifetime 漂移会使整图失效。oracle 已区分 logical resource count、certificate resource count 与 physical allocation count：binary-add 是 2/2/2，reshape-copy 是 2/1/1。before-CVPipelining allocation 数量或 payload 不匹配即禁止晋升。broadcast、expand_dims、bitcast 目前返回具名 unsupported reason 并 defer，不能被误归为已支持 view。尚缺目标 CANN 环境生成的精确配对 snapshot 和 seeds 0..19 + retry 联合验证，因此两类 P2 profile 均不得安装。</p>
+            <p class="small"><strong>下一步：</strong>在目标 CANN 服务器完成 binary-add、reshape-copy 配对 fixture 与真实 identity 晋升；同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，以决定它们是 mustAlias view、独立 allocation 还是 materialized broadcast，证据不足时继续 defer。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加，也禁止把 mustAlias view 重复计数；真实可编译误拒绝数为 0。</p>
           </div>
           <div class="phase">
             <h3>P3 · Reduction、loop 与 multibuffer</h3>

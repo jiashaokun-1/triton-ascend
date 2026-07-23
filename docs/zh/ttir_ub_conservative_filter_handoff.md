@@ -478,7 +478,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
 - UB/策略/oracle 聚焦 Python 测试：289 项通过；
-- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：85 项通过；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：88 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
   `32768 bits`，逐次精确相等，且下界不超过两者；
@@ -495,7 +495,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：289 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
-- 普通 C++ GTest：85 项通过；
+- 普通 C++ GTest：88 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
   0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
@@ -533,6 +533,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
   mayAlias、CoexistenceWitness 和逐资源 lifetime facts；
 - 参数化 `binary-add-preserve@1` / `binary-add-max-tiles@1` 候选合同；只有物化阶段验证
   source facts 后才能把同一 witness 内的 mayAlias 精化为 mustDistinct；
+- binary-add 合同同时验证 lifetime facts：两个资源必须有不同 birth、相同 lastRequiredUse，
+  且 birth 都早于共同 use；任一漂移会 Invalidate；
 - witness solver 只允许对同一 CoexistenceWitness 且 pairwise mustDistinct 的资源求和；
 - 严格的无 reorder `load -> reshape -> store` matcher；load/view 先建 mayAlias，
   `reshape-copy-max-tiles@1` 在物化阶段证明单 allocation 后才精化为 mustAlias，solver
@@ -591,12 +593,14 @@ Preserve/Transform 合同。因此：
 
 ### P2：双输入 elementwise 与 alias/coexistence
 
-binary-add 和 reshape-copy 两条本地可执行切片已经完成，但尚未生产认证。下一步需要在目标 CANN
+binary-add 和 reshape-copy 两条本地可执行切片已经完成，但尚未生产认证。broadcast、expand_dims、
+bitcast 当前均以具名 unsupported reason 明确 defer，避免把尚未证明的 view/materialization 语义误当成
+已支持。下一步需要在目标 CANN
 环境从同一次真实编译保存 canonical TTIR 与 before-CVPipelining snapshot，确认边界上存在
-binary-add 边界存在两个独立 local allocations、reshape-copy 边界只有一个 alias allocation，
+binary-add 的两个独立 local allocations、reshape-copy 的单个 alias allocation，
 再运行 analyzer、semantic replay 和真实 suffix compiler 的 seeds `0..19` + retry 联合门禁。验证完成前不得把 P2 candidate
-写入 packaged profile。之后再扩展 view/reshape/broadcast 和可复用的 InPlaceAlias/Lifetime
-contracts；broadcast 仍保持明确 defer。
+写入 packaged profile。同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，确认各路径究竟
+是 mustAlias view、独立 allocation 还是 materialized broadcast，再决定是否扩展合同；证据不足时继续 defer。
 
 ### P1：扩大真实 oracle corpus
 

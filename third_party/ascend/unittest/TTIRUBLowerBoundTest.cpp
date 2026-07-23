@@ -527,13 +527,16 @@ TEST(UBResourceContract, DirectCopyMaxTilesRejectsResourceCountDrift) {
             "direct-copy-max-tiles");
 }
 
-MandatoryUBResource binaryAddResource(int64_t payloadBytes = 262144) {
+MandatoryUBResource binaryAddResource(int64_t payloadBytes = 262144,
+                                      uint64_t birth = 1) {
   MandatoryUBResource resource{"binary-input", payloadBytes, 1};
   resource.origin = "tt.load";
   resource.kind = MaterializationKind::GMToUBLoad;
   resource.sourceElements = 65536;
   resource.elementBitWidth = 32;
   resource.consumer = "arith.addf";
+  resource.birth.ordinal = birth;
+  resource.lastRequiredUse.ordinal = 3;
   resource.contractTrace = {"ttir-binary-add-v1"};
   return resource;
 }
@@ -541,7 +544,7 @@ MandatoryUBResource binaryAddResource(int64_t payloadBytes = 262144) {
 TEST(UBResourceContract, BinaryAddMaxTilesProvesDistinctCoexistence) {
   MandatoryUBResourceGraph graph;
   ResourceId lhs = graph.addResource(binaryAddResource());
-  ResourceId rhs = graph.addResource(binaryAddResource());
+  ResourceId rhs = graph.addResource(binaryAddResource(262144, 2));
   graph.addMayAlias(lhs, rhs);
   CoexistenceWitness witness;
   witness.resources = {lhs, rhs};
@@ -568,7 +571,7 @@ TEST(UBResourceContract, BinaryAddMaxTilesProvesDistinctCoexistence) {
 TEST(UBResourceContract, BinaryAddPreserveRequiresPriorDistinctProof) {
   MandatoryUBResourceGraph graph;
   ResourceId lhs = graph.addResource(binaryAddResource(4096));
-  ResourceId rhs = graph.addResource(binaryAddResource(4096));
+  ResourceId rhs = graph.addResource(binaryAddResource(4096, 2));
   graph.addMayAlias(lhs, rhs);
   graph.addWitness({lhs, rhs});
   PipelineContractRegistry registry;
@@ -580,6 +583,25 @@ TEST(UBResourceContract, BinaryAddPreserveRequiresPriorDistinctProof) {
   EXPECT_EQ(graph.resources()[lhs].validity, ValidityState::Invalid);
   EXPECT_EQ(graph.resources()[rhs].validity, ValidityState::Invalid);
   EXPECT_EQ(graph.resources()[lhs].invalidReason, "binary-add-preserve");
+}
+
+TEST(UBResourceContract, BinaryAddContractRejectsLifetimeDrift) {
+  MandatoryUBResourceGraph graph;
+  ResourceId lhs = graph.addResource(binaryAddResource());
+  ResourceId rhs = graph.addResource(binaryAddResource());
+  graph.addMayAlias(lhs, rhs);
+  CoexistenceWitness witness;
+  witness.resources = {lhs, rhs};
+  witness.contractTrace = {"ttir-binary-add-v1"};
+  graph.addWitness(std::move(witness));
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeBinaryAddMaxTilesContract(
+      {.stageName = "materialize"}, 2, 65536, 32, 262144, 64));
+
+  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "materialize"})));
+  EXPECT_EQ(graph.resources()[lhs].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[rhs].validity, ValidityState::Invalid);
 }
 
 std::pair<ResourceId, ResourceId>
@@ -786,6 +808,31 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
   TTIRUBAnalysisResult result = analyze(source, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unsupported-view-dataflow"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, BroadcastDefersWithNamedReason) {
+  std::string source = replaceOnce(
+      kDirectLoadCopy,
+      "    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>",
+      R"mlir(    %expanded = tt.expand_dims %value {axis = 1 : i32} : tensor<65536xf32> -> tensor<65536x1xf32>
+    %broadcast = tt.broadcast %expanded : tensor<65536x1xf32> -> tensor<65536x2xf32>
+    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>)mlir");
+
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-op-broadcast"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ExpandDimsDefersWithNamedReason) {
+  std::string source = replaceOnce(
+      kDirectLoadCopy,
+      "    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>",
+      R"mlir(    %expanded = tt.expand_dims %value {axis = 1 : i32} : tensor<65536xf32> -> tensor<65536x1xf32>
+    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>)mlir");
+
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-op-expand-dims"));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,
