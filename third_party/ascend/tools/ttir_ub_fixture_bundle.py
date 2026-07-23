@@ -46,6 +46,8 @@ class BundleConfig:
     auto_tile_and_bind_subblock_outcome: bool | None = None
     expected_analyzer_decision: str | None = None
     materialization_stage: str = "ttir.triton-to-linalg"
+    tile_mix_cube_loop: int = 2
+    tile_mix_vector_loop: int = 2
 
 
 def _file_sha256(path: Path) -> str:
@@ -72,6 +74,8 @@ def _validate_config(config: BundleConfig) -> int:
         ("source elements", config.source_elements),
         ("element bit width", config.element_bit_width),
         ("max tiles", config.max_tiles),
+        ("tile mix cube loop", config.tile_mix_cube_loop),
+        ("tile mix vector loop", config.tile_mix_vector_loop),
     ):
         if type(value) is not int or value <= 0:
             raise BundleError(f"{name} must be a positive integer")
@@ -165,6 +169,8 @@ def create_fixture_bundle(
             "options": {
                 "compile_mode": "simd",
                 "multibuffer": False,
+                "tile_mix_cube_loop": config.tile_mix_cube_loop,
+                "tile_mix_vector_loop": config.tile_mix_vector_loop,
             },
             "expected_analyzer_decision": config.expected_analyzer_decision,
             "contract_proposal": {
@@ -230,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-elements", type=int, required=True)
     parser.add_argument("--element-bit-width", type=int, required=True)
     parser.add_argument("--max-tiles", type=int, required=True)
+    parser.add_argument("--tile-mix-cube-loop", type=int, default=2)
+    parser.add_argument("--tile-mix-vector-loop", type=int, default=2)
     parser.add_argument("--auto-tile-outcome", type=_parse_outcome, default=None)
     parser.add_argument(
         "--expected-analyzer-decision", choices=("defer", "reject"), default=None
@@ -252,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                 auto_tile_and_bind_subblock_outcome=arguments.auto_tile_outcome,
                 expected_analyzer_decision=arguments.expected_analyzer_decision,
                 materialization_stage=arguments.materialization_stage,
+                tile_mix_cube_loop=arguments.tile_mix_cube_loop,
+                tile_mix_vector_loop=arguments.tile_mix_vector_loop,
             ),
             ttir_dump_name=arguments.ttir_dump_name,
             before_dump_name=arguments.before_dump_name,

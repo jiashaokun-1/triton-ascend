@@ -76,6 +76,15 @@ bool containsRelation(const Range &relations, ResourceId lhs,
   });
 }
 
+bool isOrderedSubsequence(ArrayRef<std::string> subsequence,
+                          ArrayRef<std::string> sequence) {
+  size_t next = 0;
+  for (const std::string &item : sequence)
+    if (next < subsequence.size() && item == subsequence[next])
+      ++next;
+  return next == subsequence.size();
+}
+
 void appendUnique(SmallVectorImpl<std::string> &destination,
                   ArrayRef<std::string> source) {
   for (const std::string &item : source)
@@ -400,13 +409,30 @@ MandatoryUBResourceGraph::solveWitnessLowerBound() const {
       resourceIds.push_back(classResource[root]);
     }
     if (bytes > result.bytes) {
+      if (resourceIds.empty())
+        continue;
+      const ArrayRef<std::string> exactTrace =
+          resources_[resourceIds.front()].contractTrace;
       result.bytes = bytes;
       result.resourceIds = std::move(resourceIds);
       result.kind = "witness";
-      result.contractTrace.clear();
-      appendUnique(result.contractTrace, witness.contractTrace);
-      for (ResourceId id : result.resourceIds)
-        appendUnique(result.contractTrace, resources_[id].contractTrace);
+      if (llvm::all_of(result.resourceIds, [&](ResourceId id) {
+            return ArrayRef<std::string>(resources_[id].contractTrace) ==
+                   exactTrace;
+          }) &&
+          isOrderedSubsequence(witness.contractTrace, exactTrace)) {
+        // Profile-backed multi-resource proofs carry the same exact stage
+        // chain on every resource.  Preserve repeated contract IDs and their
+        // order; they represent distinct pipeline stages.
+        result.contractTrace.assign(exactTrace.begin(), exactTrace.end());
+      } else {
+        // Generic graph clients may combine independently-derived resources.
+        // Retain their compact provenance representation.
+        result.contractTrace.clear();
+        appendUnique(result.contractTrace, witness.contractTrace);
+        for (ResourceId id : result.resourceIds)
+          appendUnique(result.contractTrace, resources_[id].contractTrace);
+      }
     }
   }
 

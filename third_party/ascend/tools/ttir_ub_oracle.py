@@ -28,6 +28,12 @@ _CASE_KEYS = frozenset({
     "expected_analyzer_decision",
     "contract_proposal",
 })
+_CASE_OPTION_KEYS = frozenset({
+    "compile_mode",
+    "multibuffer",
+    "tile_mix_cube_loop",
+    "tile_mix_vector_loop",
+})
 _OPERATION_FAMILIES = {
     "direct-copy": {
         "matcher_trace": "ttir-direct-load-v1",
@@ -74,7 +80,8 @@ _REQUIRED_RE = re.compile(r"^PLANMEM_REQUIRED\t(-?\d+)\t(\d+)\t(\d+)$", re.MULTI
 _COMPLETE_RE = re.compile(r"^PLANMEM_UB_ORACLE_COMPLETE\t(-?\d+)$", re.MULTILINE)
 _PLAN_ATTEMPT_RE = re.compile(r"^PLANMEM_PLAN_ATTEMPT\t[^\t]+\t(-?\d+)\t(success|failure)$", re.MULTILINE)
 _OVERFLOW_RE = re.compile(
-    r"\b(UB|L1|L0A|L0B|L0C) overflow, requires (\d+) bits while (\d+) bits available!"
+    r"\b(UB|L1|L0A|L0B|L0C) overflow, requires (\d+) bits while (\d+) bits available!",
+    re.IGNORECASE,
 )
 _SUB_BLOCK_INDEX_OP = "hivm.hir.get_sub_block_idx"
 _MAX_INT64 = (1 << 63) - 1
@@ -132,7 +139,7 @@ def parse_planmemory_required(text: str, attempt: int, scope: str = UB_SCOPE) ->
 
 def parse_overflow_scope(text: str) -> str | None:
     match = _OVERFLOW_RE.search(text)
-    return match.group(1) if match else None
+    return match.group(1).upper() if match else None
 
 
 def parse_completed_attempt(text: str) -> int:
@@ -184,6 +191,7 @@ def classify_failure(text: str, attempt: int = 0) -> dict:
     if not match:
         raise OracleUnavailable("compiler failure is not a recognized memory-capacity result")
     scope, required, available = match.groups()
+    scope = scope.upper()
     result = {
         "status": "overflow",
         "overflow_scope": scope,
@@ -257,10 +265,13 @@ def load_manifest(path: Path) -> dict:
             )
         if type(item["arch"]) is not str or not item["arch"]:
             raise ManifestError("arch must be a non-empty string")
-        if type(item["options"]) is not dict:
-            raise ManifestError("options must be an object")
+        if type(item["options"]) is not dict or set(item["options"]) != _CASE_OPTION_KEYS:
+            raise ManifestError("options fields do not match the schema")
         if item["options"].get("compile_mode") != "simd" or item["options"].get("multibuffer") is not False:
             raise ManifestError("UB oracle cases require compile_mode=simd and multibuffer=false")
+        for field in ("tile_mix_cube_loop", "tile_mix_vector_loop"):
+            if type(item["options"][field]) is not int or item["options"][field] <= 0:
+                raise ManifestError(f"options.{field} must be a positive integer")
         expected_decision = item["expected_analyzer_decision"]
         if expected_decision is not None and expected_decision not in ("defer", "reject"):
             raise ManifestError("expected_analyzer_decision must be defer, reject, or null")
@@ -447,7 +458,18 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
     return all(value == expected for value in allocations)
 
 
-def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: float = 120.0) -> dict:
+def suffix_pipeline_arguments(options: dict) -> list[str]:
+    """Translate the identity-bearing fixture options to both oracle executables."""
+    return [
+        f"--tile-mix-cube-loop={options['tile_mix_cube_loop']}",
+        f"--tile-mix-vector-loop={options['tile_mix_vector_loop']}",
+    ]
+
+
+def run_suffix_compiler(
+    compiler: Path, input_path: Path, seed: int, pipeline_arguments: Iterable[str] = (),
+    timeout: float = 120.0,
+) -> dict:
     if not compiler.is_file() or not os.access(compiler, os.X_OK):
         raise OracleUnavailable(f"suffix compiler is not executable: {compiler}")
     compiler = compiler.resolve()
@@ -464,6 +486,7 @@ def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: fl
             "--mlir-disable-threading",
             "--ub-oracle-only",
             f"--dump-stage-oracle-dir={stage_oracle_dir}",
+            *pipeline_arguments,
         ]
         environment = os.environ.copy()
         environment["BISHENGIR_DUMP_PLAN_MEMORY_ATTEMPTS"] = "1"
@@ -548,13 +571,17 @@ def parse_semantic_model_result(payload: object, requested_seed: int) -> dict:
     }
 
 
-def run_semantic_model(model: Path, input_path: Path, seed: int, timeout: float = 120.0) -> dict:
+def run_semantic_model(
+    model: Path, input_path: Path, seed: int, pipeline_arguments: Iterable[str] = (),
+    timeout: float = 120.0,
+) -> dict:
     if not model.is_file() or not os.access(model, os.X_OK):
         raise OracleUnavailable(f"semantic replay model is not executable: {model}")
     command = [
         str(model.resolve()),
         f"--before-cvpipelining-ir={input_path.resolve()}",
         "--format=json",
+        *pipeline_arguments,
     ]
     if seed >= 0:
         command.append(f"--random-seed={seed}")
@@ -664,9 +691,9 @@ def evaluate(
     seeds: Iterable[int],
     check_retry: bool,
     analyzer: Callable[[dict], dict] = analyze_case,
-    suffix_runner: Callable[[Path, Path, int], dict] = run_suffix_compiler,
+    suffix_runner: Callable[[Path, Path, int, Iterable[str]], dict] = run_suffix_compiler,
     semantic_model: Path | None = None,
-    semantic_runner: Callable[[Path, Path, int], dict] = run_semantic_model,
+    semantic_runner: Callable[[Path, Path, int, Iterable[str]], dict] = run_semantic_model,
 ) -> dict:
     seed_list = list(seeds)
     run_seeds = seed_list + ([-1] if check_retry and -1 not in seed_list else [])
@@ -682,6 +709,7 @@ def evaluate(
     }
     for case in manifest["cases"]:
         case_report = {"name": case["name"], "runs": []}
+        pipeline_arguments = suffix_pipeline_arguments(case["options"])
         try:
             analysis = analyzer(case)
             case_report["analysis"] = analysis
@@ -718,7 +746,9 @@ def evaluate(
         expected_outcome = case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"]
         for seed in run_seeds:
             try:
-                actual = suffix_runner(compiler, case["before_cvpipelining"], seed)
+                actual = suffix_runner(
+                    compiler, case["before_cvpipelining"], seed, pipeline_arguments
+                )
                 case_report["runs"].append(actual)
             except OracleUnavailable as error:
                 report["unavailable"].append({
@@ -751,7 +781,10 @@ def evaluate(
                 })
             if semantic_model is not None:
                 try:
-                    replay = semantic_runner(semantic_model, case["before_cvpipelining"], seed)
+                    replay = semantic_runner(
+                        semantic_model, case["before_cvpipelining"], seed,
+                        pipeline_arguments,
+                    )
                     actual["semantic_replay"] = replay
                 except OracleUnavailable as error:
                     report["unavailable"].append({

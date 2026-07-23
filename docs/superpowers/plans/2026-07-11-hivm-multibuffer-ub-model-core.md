@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Edit and commit all source in local `/Users/sky/Code/AscendNPU-IR`; this local Git worktree is the only source of truth.
-- Use `/home/skj/code/AscendNPU-IR` inside container `sgl-skj` on `root@192.168.25.212` only as a replaceable build/validation mirror.
+- Use `/home/skj/code/AscendNPU-IR` inside container `${ASCEND_VALIDATION_CONTAINER}` on `${ASCEND_VALIDATION_HOST}` only as a replaceable build/validation mirror.
 - Before each server build, sync local source offline while excluding `.git`, local `build`, caches, and Torch-MLIR. Temporarily restore the repository-pinned LLVM submodule because the container has no LLVM/MLIR development package.
 - Only `#hivm.address_space<ub>` contributes to UB bytes; GM/L1/L0 remain diagnostic metadata.
 - Consume the second local `MarkMultiBuffer` checkpoint; never read `PlanMemory` pointer offsets as prediction input.
@@ -43,7 +43,7 @@ edit + review + commit locally
   /Users/sky/Code/AscendNPU-IR
            ↓ rsync (never copy remote .git back)
 build + test remotely
-  /home/skj/code/AscendNPU-IR in sgl-skj
+  /home/skj/code/AscendNPU-IR in ${ASCEND_VALIDATION_CONTAINER}
 ```
 
 Before each remote build, synchronize the local working tree with:
@@ -53,7 +53,7 @@ rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
   --exclude='**/__pycache__/' --exclude='**/.pytest_cache/' \
   --exclude='third-party/torch-mlir/' \
   /Users/sky/Code/AscendNPU-IR/ \
-  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
+  ${ASCEND_VALIDATION_HOST}:/home/skj/code/AscendNPU-IR/
 ```
 
 All `git add`, `git diff`, and `git commit` commands run locally. All `ninja`, `bishengir-opt`, and `llvm-lit` commands run inside the remote container. A remote source edit must be discarded and reproduced locally before continuing.
@@ -76,7 +76,7 @@ rsync -an --stats --exclude=.git/ --exclude=build/ \
   --exclude='**/__pycache__/' --exclude='**/.pytest_cache/' \
   --exclude='third-party/llvm-project/' --exclude='third-party/torch-mlir/' \
   /Users/sky/Code/AscendNPU-IR/ \
-  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
+  ${ASCEND_VALIDATION_HOST}:/home/skj/code/AscendNPU-IR/
 ```
 
 Expected: dry-run succeeds and excludes local build artifacts, LLVM, and Torch-MLIR from the first transfer.
@@ -88,10 +88,10 @@ rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
   --exclude='**/__pycache__/' --exclude='**/.pytest_cache/' \
   --exclude='third-party/llvm-project/' --exclude='third-party/torch-mlir/' \
   /Users/sky/Code/AscendNPU-IR/ \
-  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
+  ${ASCEND_VALIDATION_HOST}:/home/skj/code/AscendNPU-IR/
 ```
 
-Expected: `CMakeLists.txt` is visible at the destination inside `sgl-skj`.
+Expected: `CMakeLists.txt` is visible at the destination inside `${ASCEND_VALIDATION_CONTAINER}`.
 
 - [ ] **Step 3: Restore and transfer the repository-pinned LLVM source**
 
@@ -99,7 +99,7 @@ Expected: `CMakeLists.txt` is visible at the destination inside `sgl-skj`.
 git -C /Users/sky/Code/AscendNPU-IR submodule update --init \
   third-party/llvm-project
 rsync -a /Users/sky/Code/AscendNPU-IR/third-party/llvm-project/ \
-  root@192.168.25.212:/home/skj/code/AscendNPU-IR/third-party/llvm-project/
+  ${ASCEND_VALIDATION_HOST}:/home/skj/code/AscendNPU-IR/third-party/llvm-project/
 ```
 
 Expected: the server has `third-party/llvm-project/llvm/CMakeLists.txt` at the commit recorded by the AscendNPU-IR superproject.
@@ -107,8 +107,8 @@ Expected: the server has `third-party/llvm-project/llvm/CMakeLists.txt` at the c
 - [ ] **Step 4: Configure and build with the documented build script**
 
 ```bash
-ssh root@192.168.25.212 \
-  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR && ./build-tools/build.sh -o ./build --build-type Release --apply-patches --fast-build -j 128"'
+ssh ${ASCEND_VALIDATION_HOST} \
+  'docker exec ${ASCEND_VALIDATION_CONTAINER} bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR && ./build-tools/build.sh -o ./build --build-type Release --apply-patches --fast-build -j 128"'
 ```
 
 Expected: exit 0 and `build/bin/bishengir-opt` exists.
@@ -116,8 +116,8 @@ Expected: exit 0 and `build/bin/bishengir-opt` exists.
 - [ ] **Step 5: Establish the baseline**
 
 ```bash
-ssh root@192.168.25.212 \
-  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/mark-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/plan-memory.mlir"'
+ssh ${ASCEND_VALIDATION_HOST} \
+  'docker exec ${ASCEND_VALIDATION_CONTAINER} bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/mark-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/plan-memory.mlir"'
 ```
 
 Expected: both pass. Stop and record any pre-existing failure before changing source.
@@ -227,9 +227,9 @@ Register `TestHIVMUBModel` in `TestPasses.h`, add its source to `BiShengIRTestDi
 ```bash
 rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
   /Users/sky/Code/AscendNPU-IR/ \
-  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
-ssh root@192.168.25.212 \
-  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ninja bishengir-opt BiShengIRTestDialectHIVM && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-buffer-collection.mlir"'
+  ${ASCEND_VALIDATION_HOST}:/home/skj/code/AscendNPU-IR/
+ssh ${ASCEND_VALIDATION_HOST} \
+  'docker exec ${ASCEND_VALIDATION_CONTAINER} bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ninja bishengir-opt BiShengIRTestDialectHIVM && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-buffer-collection.mlir"'
 cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/include/bishengir/Dialect/HIVM/Analysis \
   bishengir/lib/Dialect/HIVM/Analysis \
@@ -498,9 +498,9 @@ Each buffer must include ID, raw/aligned bytes, alias group, gen/kill, factor, s
 ```bash
 rsync -a --delete-delay --exclude=.git/ --exclude=build/ \
   /Users/sky/Code/AscendNPU-IR/ \
-  root@192.168.25.212:/home/skj/code/AscendNPU-IR/
-ssh root@192.168.25.212 \
-  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ninja bishengir-opt BiShengIRTestDialectHIVM && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir"'
+  ${ASCEND_VALIDATION_HOST}:/home/skj/code/AscendNPU-IR/
+ssh ${ASCEND_VALIDATION_HOST} \
+  'docker exec ${ASCEND_VALIDATION_CONTAINER} bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ninja bishengir-opt BiShengIRTestDialectHIVM && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir"'
 cd /Users/sky/Code/AscendNPU-IR
 git add bishengir/lib/Dialect/HIVM/Analysis/UBModel.cpp \
   bishengir/test/lib/Dialect/HIVM/TestHIVMUBModel.cpp \
@@ -527,8 +527,8 @@ Expected: all five model test files PASS.
 - [ ] **Step 1: Run memory-pass regressions**
 
 ```bash
-ssh root@192.168.25.212 \
-  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/mark-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/plan-memory.mlir ../bishengir/test/Dialect/HIVM/enable-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/infer-hivm-mem-scope.mlir ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir"'
+ssh ${ASCEND_VALIDATION_HOST} \
+  'docker exec ${ASCEND_VALIDATION_CONTAINER} bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR/build && ./bin/llvm-lit -v ../bishengir/test/Dialect/HIVM/mark-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/plan-memory.mlir ../bishengir/test/Dialect/HIVM/enable-multi-buffer.mlir ../bishengir/test/Dialect/HIVM/infer-hivm-mem-scope.mlir ../bishengir/test/Dialect/HIVM/Analysis/ub-model-*.mlir"'
 ```
 
 Expected: all PASS. Any failure blocks handoff.
@@ -553,8 +553,8 @@ Include all four decisions and a factor-2 before/after example.
 ```bash
 cd /Users/sky/Code/AscendNPU-IR
 git diff --check
-ssh root@192.168.25.212 \
-  'docker exec sgl-skj bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR && build/bin/llvm-lit -v bishengir/test/Dialect/HIVM/Analysis"'
+ssh ${ASCEND_VALIDATION_HOST} \
+  'docker exec ${ASCEND_VALIDATION_CONTAINER} bash --noprofile --norc -c "cd /home/skj/code/AscendNPU-IR && build/bin/llvm-lit -v bishengir/test/Dialect/HIVM/Analysis"'
 ```
 
 Expected: no whitespace errors and all tests PASS.

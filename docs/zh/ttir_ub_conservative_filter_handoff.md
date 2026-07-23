@@ -465,6 +465,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - candidate 携带 `semantic_model_sha256`；Python loader 和 C++ production binding 都要求该
   指纹是合法的小写 SHA256，避免重放模型变化后误用旧认证；
 - 首个 direct-copy profile 只接受 `compile_mode=simd`、`multibuffer=false`；其他组合继续 defer；
+- fixture 必须显式记录 `tile_mix_cube_loop` / `tile_mix_vector_loop`，oracle 将同一组参数同时
+  传给真实 suffix compiler 和语义模型，禁止依赖两边可能漂移的默认值；
 - 永远不自动编辑 packaged profile。
 - `--profile-candidate` 必须同时提供 `--report`，保证 profile 中的 report hash 可审计。
 
@@ -478,7 +480,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
 - UB/策略/oracle 聚焦 Python 测试：313 项通过；
-- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：89 项通过；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：90 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
   `32768 bits`，逐次精确相等，且下界不超过两者；
@@ -486,7 +488,11 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - 联合 oracle report：violations 0，unavailable 0，并成功生成未安装的 candidate；
 - 新 promotion gate 要求 suffix compiler 提供唯一的 `post-TileAndBindSubBlock` stage snapshot；缺失或歧义会明确 unavailable；
 - identity 会把 `-cce-link-aicore-ll-module` 的绝对路径规范化为文件内容 SHA256；安装目录变化不再造成无意义漂移，文件内容变化仍会失配；
-- 当前主机没有真实 CANN toolkit；本次只用明确标记的 local-only install-info 验证端到端机制，因此 candidate 不能作为生产认证，也没有安装生产 profile；
+- 目标 CANN 环境已对 direct-copy 重跑同一联合门禁，21 次结果仍为 violations 0、unavailable 0；
+- binary-add 的目标 CANN candidate 也已完成 seeds `0..19` + retry：analyzer 下界
+  `524288 bytes`，真实 PlanMemory 与语义模型均为 UB overflow，required/peak 都是
+  `4194304 bits`，capacity 为 `1572864 bits`，21 次逐次一致，auto-tile outcome 均为 `false`；
+- 两份 candidate 都只生成在构建目录供人工审核，没有写入 packaged profile；
 - outcome=`true` 只属于未来 split MIX AIV profile，不是当前纯 AIV direct-copy profile 的认证前置条件。
 
 ## 11. 测试与质量状态
@@ -495,7 +501,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：313 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
-- 普通 C++ GTest：89 项通过；
+- 普通 C++ GTest：90 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
   0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
@@ -507,7 +513,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 环境限制：
 
 - 4 个既有 autotune 文件依赖 `torch_npu`，本机无法收集；
-- 本机没有 CANN identity 环境和 NPU 硬件；
+- 本地开发机没有 CANN identity 环境和 NPU 硬件；真实 identity/PlanMemory 验证在目标 CANN
+  容器完成；
 - p95 数据是空生产 profile 的快速 defer 路径，不代表未来完整 matcher/contract 的最终开销；
 - `.build-ttir-ub/` 是预存未跟踪构建目录，不纳入提交。
 
@@ -533,6 +540,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
   mayAlias、CoexistenceWitness 和逐资源 lifetime facts；
 - 参数化 `binary-add-preserve@1` / `binary-add-max-tiles@1` 候选合同；只有物化阶段验证
   source facts 后才能把同一 witness 内的 mayAlias 精化为 mustDistinct；
+- `binary-add-preserve@1` / `reshape-copy-preserve@1` 可出现在 materialization 前后：前段只
+  保持 matcher 已证明的 mayAlias，后段保持已精化的 mustDistinct/mustAlias；solver 仍只在
+  mustDistinct 后求和、只在 mustAlias 后折叠 alias class，preserve 本身不会凭空加强关系；
 - binary-add 合同同时验证 lifetime facts：两个资源必须有不同 birth、相同 lastRequiredUse，
   且 birth 都早于共同 use；任一漂移会 Invalidate；
 - witness solver 只允许对同一 CoexistenceWitness 且 pairwise mustDistinct 的资源求和；
@@ -558,6 +568,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - off/shadow/enforce policy；
 - debug certificate dump，并在每个 certificate 的 `contract_trace` 中保留实际参与
   下界计算的 matcher、witness 和逐 stage contract ID；
+- 多资源 witness certificate 不再去重 contract ID，而是要求资源携带一致的有序 trace，
+  原样保留每一个 pipeline stage；
 - autotune 串行/并行过滤接线和 telemetry；
 - PlanMemory seed/retry oracle、report 和 candidate gate；
 - 双语用户文档和完整单元测试。
@@ -580,12 +592,11 @@ Preserve/Transform 合同。因此：
 
 ### P1：为真实 pipeline 建立第一组有效合同
 
-当前已完成候选合同实现、canonical TTIR 绑定、可执行 oracle candidate chain，以及本机
-精确 LLVM 下的 analyzer + semantic replay + PlanMemory 联合验证。下一步是在具备真实 CANN toolkit 的目标环境
-重跑相同 promotion gate，使 `cann_version_hash`、NPU compiler 内容 hash、libdevice 内容 hash
-都来自待发布环境，再人工审核 candidate。`TileAndBindSubBlock` 的 true 分支属于 split MIX AIV，
+当前已完成候选合同实现、canonical TTIR 绑定、可执行 oracle candidate chain，并已在目标 CANN
+环境完成 direct-copy 的 analyzer + semantic replay + PlanMemory 联合验证。下一步是人工审核
+candidate，再决定是否写入 packaged profile；不能由 oracle 自动安装。`TileAndBindSubBlock` 的 true 分支属于 split MIX AIV，
 应在未来 MIX profile 的独立 identity/fixture 中认证，不再阻塞 P1 的 false-outcome profile。
-目标 CANN report 完成并审核前，packaged profile 必须保持为空。
+人工审核完成前，packaged profile 必须保持为空。
 
 优先选择最小、可证明且能产生收益的路径，不要直接声明整个 pipeline Preserve。
 
@@ -602,13 +613,16 @@ Preserve/Transform 合同。因此：
 
 ### P2：双输入 elementwise 与 alias/coexistence
 
-binary-add 和 reshape-copy 两条本地可执行切片已经完成，但尚未生产认证。broadcast、expand_dims、
+binary-add 已完成目标 CANN 的 20 seeds + retry 联合验证并生成未安装 candidate：边界包含两个
+`262144-byte` local allocations，analyzer witness 下界为 `524288 bytes`，真实 PlanMemory 与
+语义模型都得到 `4194304-bit` UB overflow，且所有 auto-tile outcome 为 `false`。reshape-copy
+本地合同切片已完成，但真实 canonical TTIR 目前仍在 open-source lowering 的
+`TritonToUnstructure` 路径触发上游断言，尚未形成可认证的配对 fixture。broadcast、expand_dims、
 bitcast 当前均以具名 unsupported reason 明确 defer，避免把尚未证明的 view/materialization 语义误当成
-已支持。下一步需要在目标 CANN
-环境从同一次真实编译保存 canonical TTIR 与 before-CVPipelining snapshot，确认边界上存在
-binary-add 的两个独立 local allocations、reshape-copy 的单个 alias allocation，
-再运行 analyzer、semantic replay 和真实 suffix compiler 的 seeds `0..19` + retry 联合门禁。验证完成前不得把 P2 candidate
-写入 packaged profile。同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，确认各路径究竟
+已支持。下一步需要先生成能通过真实 open-source lowering 的 reshape-copy canonical TTIR，再从同一次
+真实编译保存 before-CVPipelining snapshot，确认边界上的单个 alias allocation，并运行同一联合门禁。
+人工审核完成前不得把 binary-add candidate 或未验证的 reshape-copy candidate 写入 packaged profile。
+同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，确认各路径究竟
 是 mustAlias view、独立 allocation 还是 materialized broadcast，再决定是否扩展合同；证据不足时继续 defer。
 
 ### P1：扩大真实 oracle corpus

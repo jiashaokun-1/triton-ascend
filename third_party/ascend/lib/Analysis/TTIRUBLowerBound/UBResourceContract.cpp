@@ -318,7 +318,15 @@ public:
   ContractDisposition
   apply(MandatoryUBResourceGraph &graph,
         const PipelineStageContext &) const override {
-    if (!matchesResources(graph, /*requireDistinct=*/true))
+    // Preserve is used on both sides of the materialization contract.  Before
+    // materialization, the matcher can only prove that the two inputs may
+    // alias; afterwards, BinaryAddMaxTilesContract monotonically refines that
+    // relation to must-distinct.  Accept either sound state here.  The witness
+    // solver still requires must-distinct before it is allowed to add the two
+    // payloads, so this does not turn a pre-materialization may-alias fact into
+    // a lower-bound certificate.
+    if (!matchesResources(graph, /*requireDistinct=*/false) &&
+        !matchesResources(graph, /*requireDistinct=*/true))
       return ContractDisposition::Invalidate;
     if (failed(appendTrace(graph, id())))
       return ContractDisposition::InternalError;
@@ -443,7 +451,12 @@ public:
   ContractDisposition
   apply(MandatoryUBResourceGraph &graph,
         const PipelineStageContext &) const override {
-    if (!matchesResources(graph, /*requireMustAlias=*/true))
+    // As with binary-add, preserve spans both sides of materialization.  The
+    // source matcher starts with may-alias and ReshapeCopyMaxTilesContract
+    // later refines it to must-alias.  Merely preserving may-alias is not
+    // enough for the solver to collapse the two resources into one class.
+    if (!matchesResources(graph, /*requireMustAlias=*/false) &&
+        !matchesResources(graph, /*requireMustAlias=*/true))
       return ContractDisposition::Invalidate;
     if (failed(appendTrace(graph, id())))
       return ContractDisposition::InternalError;

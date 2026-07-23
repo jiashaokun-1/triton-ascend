@@ -352,7 +352,7 @@ REVIEW
 
 ## 14. NPU 验证环境
 
-服务器：`root@192.168.25.212`；容器：`sgl-skj`；代码目录：`/home/skj/code`。
+服务器：`${ASCEND_VALIDATION_HOST}`；容器：`${ASCEND_VALIDATION_CONTAINER}`；代码目录：`/home/skj/code`。
 
 已确认：
 

@@ -568,7 +568,7 @@ TEST(UBResourceContract, BinaryAddMaxTilesProvesDistinctCoexistence) {
                                       "binary-add-max-tiles"}));
 }
 
-TEST(UBResourceContract, BinaryAddPreserveRequiresPriorDistinctProof) {
+TEST(UBResourceContract, BinaryAddPreserveKeepsPreMaterializationMayAlias) {
   MandatoryUBResourceGraph graph;
   ResourceId lhs = graph.addResource(binaryAddResource(4096));
   ResourceId rhs = graph.addResource(binaryAddResource(4096, 2));
@@ -580,9 +580,13 @@ TEST(UBResourceContract, BinaryAddPreserveRequiresPriorDistinctProof) {
 
   ASSERT_TRUE(succeeded(
       registry.applyOrInvalidateAll(graph, {.stageName = "suffix"})));
-  EXPECT_EQ(graph.resources()[lhs].validity, ValidityState::Invalid);
-  EXPECT_EQ(graph.resources()[rhs].validity, ValidityState::Invalid);
-  EXPECT_EQ(graph.resources()[lhs].invalidReason, "binary-add-preserve");
+  EXPECT_EQ(graph.resources()[lhs].validity, ValidityState::Valid);
+  EXPECT_EQ(graph.resources()[rhs].validity, ValidityState::Valid);
+  EXPECT_TRUE(graph.hasPairwiseMayAliasWitness(0));
+  auto result = graph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->kind, "singleton");
+  EXPECT_EQ(result->bytes, 4096);
 }
 
 TEST(UBResourceContract, BinaryAddContractRejectsLifetimeDrift) {
@@ -643,7 +647,7 @@ TEST(UBResourceContract, ReshapeCopyMaxTilesProvesSingleAllocationAlias) {
   EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 4096);
 }
 
-TEST(UBResourceContract, ReshapeCopyPreserveRequiresPriorAliasProof) {
+TEST(UBResourceContract, ReshapeCopyPreserveKeepsPreMaterializationMayAlias) {
   MandatoryUBResourceGraph graph;
   auto [source, view] = addReshapeCopyResources(graph, 4096);
   PipelineContractRegistry registry;
@@ -652,8 +656,10 @@ TEST(UBResourceContract, ReshapeCopyPreserveRequiresPriorAliasProof) {
 
   ASSERT_TRUE(succeeded(
       registry.applyOrInvalidateAll(graph, {.stageName = "suffix"})));
-  EXPECT_EQ(graph.resources()[source].validity, ValidityState::Invalid);
-  EXPECT_EQ(graph.resources()[view].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[source].validity, ValidityState::Valid);
+  EXPECT_EQ(graph.resources()[view].validity, ValidityState::Valid);
+  EXPECT_TRUE(graph.hasMayAlias(source, view));
+  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 4096);
 }
 
 TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
@@ -760,6 +766,50 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
   EXPECT_EQ(result.certificates[0].contractTrace,
             SmallVector<std::string>({"ttir-binary-add-v1",
                                       "binary-add-max-tiles"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       BinaryAddProfilePreservesProofBeforeAndAfterMaterialization) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages = {{.stageName = "source"},
+                            {.stageName = "materialize"},
+                            {.stageName = "suffix"}};
+  PipelineContractRegistry registry;
+  registry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(registry.addProfileContract(
+      {.stage = analysisOptions.stages[0],
+       .contractId = "binary-add-preserve",
+       .contractVersion = "1"},
+      makeBinaryAddPreserveContract(analysisOptions.stages[0], 2, 65536, 32,
+                                    262144))));
+  ASSERT_TRUE(succeeded(registry.addProfileContract(
+      {.stage = analysisOptions.stages[1],
+       .contractId = "binary-add-max-tiles",
+       .contractVersion = "1"},
+      makeBinaryAddMaxTilesContract(analysisOptions.stages[1], 2, 65536, 32,
+                                    262144, 1))));
+  ASSERT_TRUE(succeeded(registry.addProfileContract(
+      {.stage = analysisOptions.stages[2],
+       .contractId = "binary-add-preserve",
+       .contractVersion = "1"},
+      makeBinaryAddPreserveContract(analysisOptions.stages[2], 2, 65536, 32,
+                                    262144))));
+
+  OwningOpRef<ModuleOp> module = parse(kBinaryAdd);
+  ASSERT_TRUE(module);
+  TTIRUBAnalysisResult result =
+      analyzeTTIRUBLowerBound(*module, analysisOptions, registry);
+
+  EXPECT_EQ(result.decision, TTIRUBDecision::Reject);
+  EXPECT_EQ(result.lowerBoundBytes, 524288);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "witness");
+  EXPECT_EQ(result.certificates[0].contractTrace,
+            SmallVector<std::string>({"ttir-binary-add-v1",
+                                      "binary-add-preserve",
+                                      "binary-add-max-tiles",
+                                      "binary-add-preserve"}));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,

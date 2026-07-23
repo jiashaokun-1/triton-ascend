@@ -58,6 +58,12 @@ def test_bundle_packages_one_same_dump_pair_for_the_oracle(tmp_path):
     manifest = oracle.load_manifest(Path(result["manifest"]))
     case = manifest["cases"][0]
     assert case["operation_family"] == "binary-add"
+    assert case["options"] == {
+        "compile_mode": "simd",
+        "multibuffer": False,
+        "tile_mix_cube_loop": 2,
+        "tile_mix_vector_loop": 2,
+    }
     assert case["contract_proposal"] == {
         "expected_resource_count": 2,
         "expected_source_elements": 65536,

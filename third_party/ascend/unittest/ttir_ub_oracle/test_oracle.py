@@ -46,6 +46,12 @@ def test_planmemory_parsers_are_scope_and_attempt_specific():
         oracle.parse_planmemory_peak(SUCCESS, attempt=1, scope="6")
     assert oracle.parse_overflow_scope(UB_RESULT) == "UB"
     assert oracle.parse_overflow_scope(L1_RESULT) == "L1"
+    assert oracle.parse_overflow_scope(
+        "ub overflow, requires 1700000 bits while 1572864 bits available!"
+    ) == "UB"
+    assert oracle.classify_failure(
+        "ub overflow, requires 1700000 bits while 1572864 bits available!"
+    )["overflow_scope"] == "UB"
 
 
 def test_completed_attempt_selects_last_retry_result():
@@ -114,6 +120,8 @@ def test_suffix_runner_reads_real_auto_tile_stage_snapshot(monkeypatch, tmp_path
 
     def run(command, **_kwargs):
         assert Path(_kwargs["cwd"]).is_dir()
+        assert "--tile-mix-cube-loop=1" in command
+        assert "--tile-mix-vector-loop=1" in command
         dump_option = next(item for item in command if item.startswith("--dump-stage-oracle-dir="))
         stage_dir = Path(dump_option.split("=", 1)[1])
         stage_dir.mkdir(parents=True)
@@ -123,7 +131,10 @@ def test_suffix_runner_reads_real_auto_tile_stage_snapshot(monkeypatch, tmp_path
         return oracle.subprocess.CompletedProcess(command, 0, SUCCESS, "")
 
     monkeypatch.setattr(oracle.subprocess, "run", run)
-    result = oracle.run_suffix_compiler(compiler, input_path, 0)
+    result = oracle.run_suffix_compiler(
+        compiler, input_path, 0,
+        ["--tile-mix-cube-loop=1", "--tile-mix-vector-loop=1"],
+    )
     assert result["status"] == "success"
     assert result["actual_peak_bits"] == 1572864
     assert result["auto_tile_and_bind_subblock_outcome"] is True
@@ -163,10 +174,15 @@ def test_semantic_model_runner_parses_exact_result(monkeypatch, tmp_path):
         assert f"--before-cvpipelining-ir={input_path.resolve()}" in command
         assert "--format=json" in command
         assert "--random-seed=7" in command
+        assert "--tile-mix-cube-loop=1" in command
+        assert "--tile-mix-vector-loop=1" in command
         return oracle.subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
     monkeypatch.setattr(oracle.subprocess, "run", run)
-    assert oracle.run_semantic_model(model, input_path, 7) == {
+    assert oracle.run_semantic_model(
+        model, input_path, 7,
+        ["--tile-mix-cube-loop=1", "--tile-mix-vector-loop=1"],
+    ) == {
         "status": "success",
         "overflow_scope": None,
         "actual_peak_bits": 32768,
@@ -228,7 +244,12 @@ def _write_manifest(root, **updates):
         "ttir": "case.ttir",
         "before_cvpipelining": "case.mlir",
         "arch": "Ascend910B",
-        "options": {"compile_mode": "simd", "multibuffer": False},
+        "options": {
+            "compile_mode": "simd",
+            "multibuffer": False,
+            "tile_mix_cube_loop": 2,
+            "tile_mix_vector_loop": 2,
+        },
         "expected_analyzer_decision": "defer",
         "contract_proposal": {
             "expected_resource_count": 1,
@@ -310,15 +331,21 @@ def test_manifest_paths_stay_with_fixtures(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "options",
+    ("options", "error"),
     [
-        {"compile_mode": "simd", "multibuffer": True},
-        {"compile_mode": "simt", "multibuffer": False},
-        {"compile_mode": "simd"},
+        ({"compile_mode": "simd", "multibuffer": True,
+          "tile_mix_cube_loop": 2, "tile_mix_vector_loop": 2},
+         "compile_mode=simd"),
+        ({"compile_mode": "simt", "multibuffer": False,
+          "tile_mix_cube_loop": 2, "tile_mix_vector_loop": 2},
+         "compile_mode=simd"),
+        ({"compile_mode": "simd", "tile_mix_cube_loop": 2,
+          "tile_mix_vector_loop": 2},
+         "options fields"),
     ],
 )
-def test_manifest_restricts_first_direct_copy_profile(options, tmp_path):
-    with pytest.raises(oracle.ManifestError, match="compile_mode=simd"):
+def test_manifest_restricts_first_direct_copy_profile(options, error, tmp_path):
+    with pytest.raises(oracle.ManifestError, match=error):
         oracle.load_manifest(_write_manifest(tmp_path, options=options))
 
 
@@ -483,7 +510,7 @@ def test_reshape_copy_bridge_maps_two_logical_resources_to_one_allocation():
 def test_evaluate_accepts_available_defer_results(tmp_path):
     manifest = oracle.load_manifest(_write_manifest(tmp_path))
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
@@ -506,7 +533,7 @@ def test_evaluate_derives_one_consistent_auto_tile_outcome(tmp_path):
     analysis = _analysis()
     analysis["auto_tile_and_bind_subblock_outcome"] = None
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
@@ -524,7 +551,7 @@ def test_evaluate_accepts_actual_decision_when_fixture_has_no_golden_expectation
         _write_manifest(tmp_path, expected_analyzer_decision=None)
     )
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed,
             "status": "overflow",
@@ -543,7 +570,7 @@ def test_evaluate_accepts_actual_decision_when_fixture_has_no_golden_expectation
 def test_evaluate_keeps_explicit_golden_decision_as_an_assertion(tmp_path):
     manifest = oracle.load_manifest(_write_manifest(tmp_path))
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed,
             "status": "overflow",
@@ -570,7 +597,7 @@ def test_evaluate_rejects_seed_dependent_auto_tile_outcome(tmp_path):
     analysis = _analysis()
     analysis["auto_tile_and_bind_subblock_outcome"] = None
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 1024,
@@ -587,7 +614,7 @@ def test_evaluate_detects_invalid_lower_bound_and_reject_result(tmp_path):
     path = _write_manifest(tmp_path, expected_analyzer_decision="reject")
     manifest = oracle.load_manifest(path)
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
@@ -602,7 +629,7 @@ def test_evaluate_detects_invalid_lower_bound_and_reject_result(tmp_path):
 def test_evaluate_requires_semantic_replay_to_match_real_suffix(tmp_path):
     manifest = oracle.load_manifest(_write_manifest(tmp_path))
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
@@ -610,7 +637,8 @@ def test_evaluate_requires_semantic_replay_to_match_real_suffix(tmp_path):
 
     report = oracle.evaluate(
         manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run,
-        Path("semantic-model"), lambda _model, _input, seed: _semantic_result(seed),
+        Path("semantic-model"),
+        lambda _model, _input, seed, _pipeline_arguments: _semantic_result(seed),
     )
     assert report["summary"]["semantic_replay_checked"] is True
     assert report["violations"] == []
@@ -618,7 +646,10 @@ def test_evaluate_requires_semantic_replay_to_match_real_suffix(tmp_path):
 
     mismatch = oracle.evaluate(
         manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run,
-        Path("semantic-model"), lambda _model, _input, seed: _semantic_result(seed, peak=2048),
+        Path("semantic-model"),
+        lambda _model, _input, seed, _pipeline_arguments: _semantic_result(
+            seed, peak=2048
+        ),
     )
     assert {item["kind"] for item in mismatch["violations"]} == {
         "semantic-replay-result-mismatch"
@@ -630,7 +661,7 @@ def test_evaluate_rejects_certificate_from_a_different_contract_chain(tmp_path):
     analysis = _analysis("defer", 256)
     analysis["certificates"][0]["contract_trace"] = ["ttir-direct-load-v1", "different-contract"]
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 4096, "auto_tile_and_bind_subblock_outcome": False,
@@ -647,7 +678,7 @@ def test_evaluate_rejects_invalid_materialization_bridge(tmp_path):
     analysis = _analysis()
     analysis["before_cvpipelining_allocations_bytes"] = [2048]
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed, "status": "success", "overflow_scope": None,
             "actual_peak_bits": 4096, "auto_tile_and_bind_subblock_outcome": False,
@@ -661,7 +692,7 @@ def test_evaluate_rejects_invalid_materialization_bridge(tmp_path):
 
 def test_profile_candidate_requires_complete_certificate(tmp_path):
     manifest = oracle.load_manifest(_write_manifest(tmp_path))
-    run = lambda _compiler, _input, seed: {
+    run = lambda _compiler, _input, seed, _pipeline_arguments: {
         "seed": seed, "status": "success", "overflow_scope": None, "actual_peak_bits": 1024,
         "auto_tile_and_bind_subblock_outcome": False,
     }
@@ -679,7 +710,7 @@ def test_profile_candidate_uses_outcome_derived_from_all_real_runs(tmp_path):
     analysis = _analysis("reject", 256)
     analysis["auto_tile_and_bind_subblock_outcome"] = None
 
-    def run(_compiler, _input, seed):
+    def run(_compiler, _input, seed, _pipeline_arguments):
         return {
             "seed": seed,
             "status": "overflow",
@@ -696,7 +727,7 @@ def test_profile_candidate_uses_outcome_derived_from_all_real_runs(tmp_path):
         lambda _case: analysis,
         run,
         Path("semantic-model"),
-        lambda _model, _input, seed: _semantic_result(
+        lambda _model, _input, seed, _pipeline_arguments: _semantic_result(
             seed, status="overflow", peak=4096
         ),
     )
