@@ -17,11 +17,13 @@ _OPERATION_FAMILY_RESOURCE_COUNTS = {
     "direct-copy": 1,
     "binary-add": 2,
     "reshape-copy": 2,
+    "reduction-sum": 3,
 }
 _OPERATION_FAMILY_ALLOCATION_COUNTS = {
     "direct-copy": 1,
     "binary-add": 2,
     "reshape-copy": 1,
+    "reduction-sum": 1,
 }
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _MAX_INT64 = (1 << 63) - 1
@@ -81,6 +83,12 @@ def _validate_config(config: BundleConfig) -> int:
             raise BundleError(f"{name} must be a positive integer")
     if config.element_bit_width < 8 or config.element_bit_width % 8:
         raise BundleError("element bit width must be a whole positive number of bytes")
+    if (config.operation_family == "reduction-sum"
+            and (config.max_tiles != 1 or config.element_bit_width != 32
+                 or config.source_elements % 2)):
+        raise BundleError(
+            "reduction-sum currently requires even f32 input and max_tiles=1"
+        )
     payload_bytes = config.source_elements * (config.element_bit_width // 8)
     if payload_bytes > _MAX_INT64:
         raise BundleError("input payload overflows int64")

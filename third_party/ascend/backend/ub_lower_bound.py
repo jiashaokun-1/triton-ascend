@@ -83,6 +83,10 @@ _DIRECT_COPY_PARAMETER_KEYS = frozenset({
     "expected_element_bit_width",
     "expected_input_payload_bytes",
 })
+_REDUCTION_PARAMETER_KEYS = _DIRECT_COPY_PARAMETER_KEYS | {
+    "expected_scratch_payload_bytes",
+    "expected_accumulator_payload_bytes",
+}
 
 
 def _has_positive_decimal_parameters(parameters, expected_keys):
@@ -119,6 +123,12 @@ def _is_valid_profile_stage(stage):
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
     if contract_id == "reshape-copy-max-tiles":
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
+    if contract_id == "reduction-sum-preserve":
+        return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS)
+    if contract_id == "reduction-sum-max-tiles":
+        return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS | {"max_tiles"})
+    if contract_id == "reduction-sum-extra-buffer":
+        return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS)
     return False
 
 
@@ -202,7 +212,8 @@ def _is_valid_profile_entry(entry):
         return False
     if not all(_is_valid_profile_stage(stage) for stage in stages):
         return False
-    if any(stage["contract_id"].startswith(("direct-copy-", "binary-add-", "reshape-copy-"))
+    if any(stage["contract_id"].startswith(
+            ("direct-copy-", "binary-add-", "reshape-copy-", "reduction-sum-"))
            for stage in stages):
         if relevant_options.get("compile_mode") != "simd" or relevant_options.get("multibuffer") is not False:
             return False

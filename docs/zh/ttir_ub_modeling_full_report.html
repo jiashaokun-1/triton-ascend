@@ -502,7 +502,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>ElementwiseFusionContract</code><span>判断 elementwise chain 是否零中间物化，并为多输入建立/拒绝 coexistence。</span><span class="status todo">P2</span></div>
         <div class="contract"><code>ViewAliasContract</code><span>为 reshape/expand_dims/bitcast/view 建立 mustAlias；当前只对受限 rank-1→rank-2 reshape 由物化合同把 mayAlias 精化为 mustAlias，其余形态明确 defer。</span><span class="status now">Reshape slice implemented</span></div>
         <div class="contract"><code>LayoutConversionContract</code><span>transpose/broadcast/cat 等是否产生新 allocation 或 scratch。</span><span class="status todo">P3/P4</span></div>
-        <div class="contract"><code>ReductionMaterializationContract</code><span>建立 accumulator、init 和 scratch resources 及其最小 shape。</span><span class="status todo">P3</span></div>
+        <div class="contract"><code>ReductionMaterializationContract</code><span>建立 accumulator、init 和 scratch resources 及其最小 shape；当前已对受限的一维 contiguous f32 sum reduction 建立 input、scratch、accumulator 三资源切片。</span><span class="status now">P3 sum slice implemented</span></div>
         <div class="contract"><code>DotMaterializationContract</code><span>描述 A/B tile、accumulator 和 Cube/AIV memory-space 边界。</span><span class="status todo">P5</span></div>
         <div class="contract"><code>DescriptorMemoryContract</code><span>descriptor load/store/gather/scatter/reduce 的物化、mask 和 boundary 规则。</span><span class="status todo">P4</span></div>
         <div class="contract"><code>IrregularMemoryContract</code><span>gather/scatter/index/unstructured 访问的 working-set 下界和临时 index/mask。</span><span class="status todo">P4</span></div>
@@ -523,13 +523,13 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>CanonicalizationEliminationContract</code><span>DCE/fusion/canonicalization 是否消除或缩小 resource。</span><span class="status todo">P1/P2</span></div>
         <div class="contract"><code>BufferizationContract</code><span>逻辑 tensor 到 allocation 的映射与 memory space；是后续 alias/lifetime 的基础。</span><span class="status todo">P1</span></div>
         <div class="contract"><code>InPlaceAliasContract</code><span>建立 mustAlias/mayAlias，禁止把可能 inplace 的输出作为独立资源相加；reshape-copy 候选链已实现单 allocation 证明。</span><span class="status now">P2 slice implemented</span></div>
-        <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct；binary-add 候选链已实现双 allocation 证明。</span><span class="status now">P2 slice implemented</span></div>
-        <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness；binary-add 合同现已要求两个不同 birth、同一 lastRequiredUse 且 birth 早于该 use，任一漂移都会 Invalidate。</span><span class="status now">Binary slice implemented</span></div>
+        <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct；binary-add 候选链已实现双 allocation 证明，reduction-sum 候选链由 suffix extra-buffer 合同证明 input/scratch/accumulator 三者 pairwise mustDistinct。</span><span class="status now">P2/P3 slices implemented</span></div>
+        <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness；binary-add 要求两个不同 birth、同一 lastRequiredUse，reduction-sum 要求 input 活到 reduce、scratch 产生并消费于 reduce、accumulator 从 reduce 活到 scalar store。</span><span class="status now">Binary/reduction slices implemented</span></div>
         <div class="contract"><code>AlignmentContract</code><span>证明 planner 强制 alignment 的最小 padding；首版可忽略以保持更小下界。</span><span class="status todo">P5</span></div>
         <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存。</span><span class="status todo">P3/P4</span></div>
         <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status todo">P0</span></div>
 
-        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 7 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>，以及 direct-copy、binary-add、reshape-copy 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入 payload 和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证的 Preserve/Transform 合同仍为 0。</div>
+        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 10 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>；direct-copy、binary-add、reshape-copy 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>；以及 <span class="mono">reduction-sum-preserve@1</span>、<span class="mono">reduction-sum-max-tiles@1</span>、<span class="mono">reduction-sum-extra-buffer@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入/临时 payload 和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证后自动安装的合同仍为 0。</div>
       </section>
 
       <section class="sheet" id="solver">
@@ -599,9 +599,11 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <p class="small"><strong>下一步：</strong>人工审核 direct-copy、binary-add、reshape-copy 三类 candidate，不自动写入 packaged profile；同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，再按证据决定扩展合同或继续 defer。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加，也禁止把 mustAlias view 重复计数；真实可编译误拒绝数为 0。</p>
           </div>
           <div class="phase">
-            <h3>P3 · Reduction、loop 与 multibuffer</h3>
-            <p>增加 accumulator/scratch resources、loop-carried liveness、minInstances 和 multi-buffer coexistence。</p>
-            <p class="small"><strong>验收：</strong>num_stages、loop depth、buffer count 的边界组合全部有 oracle fixtures。</p>
+            <h3>P3 · Reduction、loop 与 multibuffer <span class="tag plan">In progress</span></h3>
+            <p>第一条 reduction 最小切片已实现：严格匹配唯一的一维连续 <span class="mono">f32 load → tt.reduce(axis=0, arith.addf) → scalar store</span>，只接受偶数元素、无 mask/特殊 cache/fast-math、单一 reducer region 和单一结果 use。matcher 建立三条逻辑资源：输入 payload、<span class="mono">ReductionScratch = input/2</span>、4-byte <span class="mono">ReductionAccumulator</span>，并记录三资源 CoexistenceWitness；任何 shape、combiner、dataflow 或 store 语义漂移均具名 defer。</p>
+            <p>合同链不是把 scratch 当成 TTIR 已有 allocation：<span class="mono">reduction-sum-preserve@1</span> 只传递资源事实；当前 <span class="mono">reduction-sum-max-tiles@1</span> 只接受经真实 lowering 认证的 <span class="mono">max_tiles=1</span>；直到原子 BiSheng suffix 的 <span class="mono">reduction-sum-extra-buffer@1</span> 验证 <span class="mono">AllocExtraBuffer</span> 行为后，才把 input/scratch/accumulator 从 pairwise mayAlias 精化为 pairwise mustDistinct，solver 才能给出三者之和的 witness certificate。多 tile reduction 没有套用未经证明的公式，继续 defer。</p>
+            <p class="small"><strong>真实证据：</strong>before-CVPipelining snapshot 只有一个 262144-byte source allocation；现有语义模型的 debug 账本显示 reduction scratch 为 131072 bytes、accumulator 为 4 bytes，三者在 reduction 点同时存活，实际未对齐峰值为 393220 bytes。analyzer 因此给出同值下界和 <span class="mono">resource_ids=[0,1,2]</span> 证书；真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到对齐后的 3145984 bits UB overflow（capacity 1572864 bits），auto-tile outcome 全为 false，4-case 联合报告 violations/unavailable 均为 0。candidate 已生成但未安装。</p>
+            <p class="small"><strong>剩余工作：</strong>继续实现 loop-carried liveness、<span class="mono">minInstances</span> 和 multi-buffer coexistence；为 num_stages、loop depth、buffer count 的边界组合补同编译 snapshot、semantic replay 与真实 PlanMemory fixtures。<strong>验收：</strong>不得从一次 reduction 证据外推多 tile、scan、argmin/argmax、loop 或 multibuffer。</p>
           </div>
           <div class="phase">
             <h3>P4 · Dynamic CV / MIX / irregular memory</h3>

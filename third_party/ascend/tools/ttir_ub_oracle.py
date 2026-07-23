@@ -59,6 +59,14 @@ _OPERATION_FAMILIES = {
         "allocation_count": 1,
         "contract_prefix": "reshape-copy",
     },
+    "reduction-sum": {
+        "matcher_trace": "ttir-reduction-sum-v1",
+        "certificate_kind": "witness",
+        "certificate_resource_count": 3,
+        "resource_count": 3,
+        "allocation_count": 1,
+        "contract_prefix": "reduction-sum",
+    },
 }
 _CONTRACT_PROPOSAL_KEYS = frozenset({
     "expected_resource_count",
@@ -261,7 +269,7 @@ def load_manifest(path: Path) -> dict:
         family = item["operation_family"]
         if family not in _OPERATION_FAMILIES:
             raise ManifestError(
-                "operation_family must be direct-copy, binary-add, or reshape-copy"
+                "operation_family must be direct-copy, binary-add, reshape-copy, or reduction-sum"
             )
         if type(item["arch"]) is not str or not item["arch"]:
             raise ManifestError("arch must be a non-empty string")
@@ -312,6 +320,14 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError(
                 "contract_proposal.expected_resource_count disagrees with operation_family"
             )
+        if family == "reduction-sum" and (
+            proposal["max_tiles"] != 1
+            or proposal["expected_element_bit_width"] != 32
+            or proposal["expected_source_elements"] % 2
+        ):
+            raise ManifestError(
+                "reduction-sum currently requires even f32 input and max_tiles=1"
+            )
         case = dict(item)
         case["ttir"] = _fixture_path(root, item["ttir"], "ttir")
         case["before_cvpipelining"] = _fixture_path(
@@ -338,6 +354,14 @@ def build_proposed_contract_profile(
         "expected_element_bit_width": str(proposal["expected_element_bit_width"]),
     }
     input_payload = proposal["expected_input_payload_bytes"]
+    is_reduction = operation_family == "reduction-sum"
+    if is_reduction:
+        common.update({
+            "expected_scratch_payload_bytes": str(input_payload // 2),
+            "expected_accumulator_payload_bytes": str(
+                proposal["expected_element_bit_width"] // 8
+            ),
+        })
     output_payload = (input_payload + proposal["max_tiles"] - 1) // proposal["max_tiles"]
     materialized = False
     bindings = []
@@ -352,6 +376,8 @@ def build_proposed_contract_profile(
             contract_id = f"{family['contract_prefix']}-max-tiles"
             parameters["max_tiles"] = str(proposal["max_tiles"])
             materialized = True
+        elif is_reduction and stage["stage_name"] == "bisheng.ub-affecting-suffix":
+            contract_id = "reduction-sum-extra-buffer"
         bindings.append({
             **stage,
             "contract_id": contract_id,
@@ -434,7 +460,7 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
             or len(allocations) != family["allocation_count"]
             or not all(type(value) is int and value > 0 for value in allocations)
             or type(total) is not int or total != sum(allocations)
-            or type(lower_bound) is not int or lower_bound > total
+            or type(lower_bound) is not int
             or type(stages) is not list):
         return False
     materialization_id = f"{family['contract_prefix']}-max-tiles"
@@ -455,7 +481,30 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
     if input_payload <= 0 or max_tiles <= 0:
         return False
     expected = (input_payload + max_tiles - 1) // max_tiles
-    return all(value == expected for value in allocations)
+    if not all(value == expected for value in allocations):
+        return False
+    if analysis.get("operation_family") != "reduction-sum":
+        return lower_bound <= total
+    extra_stages = [
+        stage for stage in stages
+        if type(stage) is dict
+        and stage.get("contract_id") == "reduction-sum-extra-buffer"
+    ]
+    if len(extra_stages) != 1:
+        return False
+    extra_parameters = extra_stages[0].get("contract_parameters")
+    if type(extra_parameters) is not dict:
+        return False
+    try:
+        scratch = int(extra_parameters["expected_scratch_payload_bytes"])
+        accumulator = int(
+            extra_parameters["expected_accumulator_payload_bytes"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return scratch > 0 and accumulator > 0 and lower_bound == (
+        total + scratch + accumulator
+    )
 
 
 def suffix_pipeline_arguments(options: dict) -> list[str]:
@@ -728,7 +777,8 @@ def evaluate(
                 report["violations"].append({
                     "case": case["name"], "kind": "invalid-materialization-bridge",
                 })
-            if analysis.get("lower_bound_bytes", 0) > boundary_bytes:
+            if (case["operation_family"] != "reduction-sum"
+                    and analysis.get("lower_bound_bytes", 0) > boundary_bytes):
                 report["violations"].append({
                     "case": case["name"], "kind": "lower-bound-exceeds-before-cvpipelining-allocation",
                     "lower_bound_bytes": analysis.get("lower_bound_bytes", 0),

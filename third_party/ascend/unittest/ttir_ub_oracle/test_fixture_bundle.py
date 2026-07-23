@@ -175,3 +175,47 @@ def test_bundle_cli_emits_machine_readable_result(tmp_path, capsys):
     assert case["operation_family"] == "reshape-copy"
     assert case["expected_analyzer_decision"] is None
     assert case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] is None
+
+
+def test_bundle_packages_reduction_source_allocation(tmp_path):
+    dump_dir = _dump_dir(
+        tmp_path / "reduction-dump",
+        allocation_count=1,
+        allocation_elements=65536,
+    )
+    output_dir = tmp_path / "reduction-fixture"
+    result = bundle.create_fixture_bundle(
+        dump_dir,
+        output_dir,
+        _config(
+            name="reduction-sum-f32-65536-a2-tile1",
+            operation_family="reduction-sum",
+            max_tiles=1,
+        ),
+    )
+    case = oracle.load_manifest(Path(result["manifest"]))["cases"][0]
+    assert case["operation_family"] == "reduction-sum"
+    assert case["contract_proposal"]["expected_resource_count"] == 3
+    assert result["before_cvpipelining_allocations_bytes"] == [262144]
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"max_tiles": 2},
+        {"element_bit_width": 16},
+        {"source_elements": 65535},
+    ],
+)
+def test_bundle_rejects_unvalidated_reduction_variants(tmp_path, updates):
+    config = {
+        "operation_family": "reduction-sum",
+        "max_tiles": 1,
+        **updates,
+    }
+    with pytest.raises(bundle.BundleError, match="even f32"):
+        bundle.create_fixture_bundle(
+            _dump_dir(tmp_path / "reduction-dump"),
+            tmp_path / "fixture",
+            _config(**config),
+        )

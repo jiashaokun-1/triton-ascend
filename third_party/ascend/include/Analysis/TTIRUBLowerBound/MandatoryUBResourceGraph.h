@@ -29,7 +29,12 @@ inline constexpr WitnessId InvalidWitnessId =
 
 enum class ValidityState { Valid, Invalid };
 enum class UBAddressSpace { UB };
-enum class MaterializationKind { GMToUBLoad, ViewAlias };
+enum class MaterializationKind {
+  GMToUBLoad,
+  ViewAlias,
+  ReductionScratch,
+  ReductionAccumulator
+};
 
 struct ProgramPoint {
   uint64_t ordinal = 0;

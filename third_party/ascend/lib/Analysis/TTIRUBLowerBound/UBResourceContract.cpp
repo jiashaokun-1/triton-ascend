@@ -506,6 +506,168 @@ private:
   int64_t maxTiles;
 };
 
+class ReductionSumContractBase : public UBResourceContract {
+public:
+  ReductionSumContractBase(const PipelineStageContext &stage,
+                           int64_t expectedResourceCount,
+                           int64_t expectedSourceElements,
+                           unsigned expectedElementBitWidth,
+                           int64_t expectedInputPayloadBytes,
+                           int64_t expectedScratchPayloadBytes,
+                           int64_t expectedAccumulatorPayloadBytes)
+      : stageName(stage.stageName),
+        expectedResourceCount(expectedResourceCount),
+        expectedSourceElements(expectedSourceElements),
+        expectedElementBitWidth(expectedElementBitWidth),
+        expectedInputPayloadBytes(expectedInputPayloadBytes),
+        expectedScratchPayloadBytes(expectedScratchPayloadBytes),
+        expectedAccumulatorPayloadBytes(expectedAccumulatorPayloadBytes) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef version() const final { return "1"; }
+
+  bool matches(const PipelineStageContext &context) const final {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+
+protected:
+  bool matchesResources(const MandatoryUBResourceGraph &graph,
+                        bool requireDistinct) const {
+    if (expectedResourceCount != 3 || expectedSourceElements <= 0 ||
+        expectedElementBitWidth != 32 || expectedInputPayloadBytes <= 0 ||
+        expectedScratchPayloadBytes <= 0 ||
+        expectedAccumulatorPayloadBytes <= 0 ||
+        graph.resources().size() != 3 || graph.witnesses().size() != 1)
+      return false;
+    const CoexistenceWitness &witness = graph.witnesses().front();
+    if (witness.resources != SmallVector<ResourceId>({0, 1, 2}) ||
+        (requireDistinct ? !graph.hasPairwiseDistinctWitness(0)
+                         : !graph.hasPairwiseMayAliasWitness(0)))
+      return false;
+    const MandatoryUBResource &input = graph.resources()[0];
+    const MandatoryUBResource &scratch = graph.resources()[1];
+    const MandatoryUBResource &accumulator = graph.resources()[2];
+    auto matchesCommon = [&](const MandatoryUBResource &resource) {
+      return resource.validity == ValidityState::Valid &&
+             resource.minInstances == 1 &&
+             resource.sourceElements == expectedSourceElements &&
+             resource.elementBitWidth == expectedElementBitWidth;
+    };
+    return matchesCommon(input) && matchesCommon(scratch) &&
+           matchesCommon(accumulator) && input.origin == "tt.load" &&
+           input.kind == MaterializationKind::GMToUBLoad &&
+           input.consumer == "tt.reduce" &&
+           input.minPayloadBytes == expectedInputPayloadBytes &&
+           scratch.origin == "tt.reduce" &&
+           scratch.kind == MaterializationKind::ReductionScratch &&
+           scratch.consumer == "tt.reduce" &&
+           scratch.minPayloadBytes == expectedScratchPayloadBytes &&
+           accumulator.origin == "tt.reduce" &&
+           accumulator.kind == MaterializationKind::ReductionAccumulator &&
+           accumulator.consumer == "tt.store" &&
+           accumulator.minPayloadBytes == expectedAccumulatorPayloadBytes &&
+           input.lastRequiredUse.ordinal == scratch.birth.ordinal &&
+           scratch.birth.ordinal == scratch.lastRequiredUse.ordinal &&
+           accumulator.birth.ordinal == scratch.birth.ordinal &&
+           accumulator.lastRequiredUse.ordinal >
+               accumulator.birth.ordinal;
+  }
+
+  LogicalResult appendTrace(MandatoryUBResourceGraph &graph,
+                            StringRef contractId) const {
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
+      if (failed(graph.appendResourceTrace(static_cast<ResourceId>(ordinal),
+                                           contractId)))
+        return failure();
+    return success();
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+  int64_t expectedResourceCount;
+  int64_t expectedSourceElements;
+  unsigned expectedElementBitWidth;
+  int64_t expectedInputPayloadBytes;
+  int64_t expectedScratchPayloadBytes;
+  int64_t expectedAccumulatorPayloadBytes;
+};
+
+class ReductionSumPreserveContract final : public ReductionSumContractBase {
+public:
+  using ReductionSumContractBase::ReductionSumContractBase;
+
+  StringRef id() const override { return "reduction-sum-preserve"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (!matchesResources(graph, /*requireDistinct=*/false) &&
+        !matchesResources(graph, /*requireDistinct=*/true))
+      return ContractDisposition::Invalidate;
+    if (failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Preserve;
+  }
+};
+
+class ReductionSumMaxTilesContract final : public ReductionSumContractBase {
+public:
+  ReductionSumMaxTilesContract(const PipelineStageContext &stage,
+                               int64_t expectedResourceCount,
+                               int64_t expectedSourceElements,
+                               unsigned expectedElementBitWidth,
+                               int64_t expectedInputPayloadBytes,
+                               int64_t expectedScratchPayloadBytes,
+                               int64_t expectedAccumulatorPayloadBytes,
+                               int64_t maxTiles)
+      : ReductionSumContractBase(
+            stage, expectedResourceCount, expectedSourceElements,
+            expectedElementBitWidth, expectedInputPayloadBytes,
+            expectedScratchPayloadBytes, expectedAccumulatorPayloadBytes),
+        maxTiles(maxTiles) {}
+
+  StringRef id() const override { return "reduction-sum-max-tiles"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    // The P3 slice is intentionally restricted to the observed tile=1
+    // lowering.  A later profile must supply a separately validated formula
+    // before multi-tile reductions can be admitted.
+    if (maxTiles != 1 || !matchesResources(graph, /*requireDistinct=*/false))
+      return ContractDisposition::Invalidate;
+    if (failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Transform;
+  }
+
+private:
+  int64_t maxTiles;
+};
+
+class ReductionSumExtraBufferContract final
+    : public ReductionSumContractBase {
+public:
+  using ReductionSumContractBase::ReductionSumContractBase;
+
+  StringRef id() const override { return "reduction-sum-extra-buffer"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (!matchesResources(graph, /*requireDistinct=*/false))
+      return ContractDisposition::Invalidate;
+    if (failed(graph.refineWitnessToMustDistinct(0, id())) ||
+        failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Transform;
+  }
+};
+
 } // namespace
 
 void PipelineContractRegistry::setProfileIdentity(PipelineIdentity identity) {
@@ -652,6 +814,39 @@ std::unique_ptr<UBResourceContract> makeReshapeCopyMaxTilesContract(
   return std::make_unique<ReshapeCopyMaxTilesContract>(
       stage, expectedResourceCount, expectedSourceElements,
       expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeReductionSumPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedScratchPayloadBytes,
+    int64_t expectedAccumulatorPayloadBytes) {
+  return std::make_unique<ReductionSumPreserveContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes,
+      expectedScratchPayloadBytes, expectedAccumulatorPayloadBytes);
+}
+
+std::unique_ptr<UBResourceContract> makeReductionSumMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedScratchPayloadBytes,
+    int64_t expectedAccumulatorPayloadBytes, int64_t maxTiles) {
+  return std::make_unique<ReductionSumMaxTilesContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes,
+      expectedScratchPayloadBytes, expectedAccumulatorPayloadBytes, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeReductionSumExtraBufferContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedScratchPayloadBytes,
+    int64_t expectedAccumulatorPayloadBytes) {
+  return std::make_unique<ReductionSumExtraBufferContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes,
+      expectedScratchPayloadBytes, expectedAccumulatorPayloadBytes);
 }
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {

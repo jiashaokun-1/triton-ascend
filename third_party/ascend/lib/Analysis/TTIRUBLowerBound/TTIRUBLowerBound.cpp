@@ -178,6 +178,21 @@ StringRef getVerifierPreflightFailure(Operation *root) {
       if (!detail::hasValidStoreOperandSegments(
               segments, operation->getNumOperands()))
         return "malformed-ir";
+    } else if (name == triton::ReduceOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::ReduceOp>(operation) ||
+          !hasExactShape(operation, 1, 1, 1, 0) ||
+          !operation->getPropertiesStorage())
+        return "unsupported-op-reduction";
+      const auto *properties =
+          operation->getPropertiesStorage().as<triton::ReduceOp::Properties *>();
+      if (!isa_and_nonnull<IntegerAttr>(properties->axis) ||
+          !operation->getRegion(0).hasOneBlock() ||
+          operation->getRegion(0).front().getNumArguments() != 2)
+        return "unsupported-op-reduction";
+    } else if (name == triton::ReduceReturnOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::ReduceReturnOp>(operation) ||
+          !hasExactShape(operation, 1, 0, 0, 0))
+        return "unsupported-op-reduction";
     } else if (name == arith::AddFOp::getOperationName()) {
       if (!hasExactRegisteredType<arith::AddFOp>(operation) ||
           !hasExactShape(operation, 2, 1, 0, 0) ||

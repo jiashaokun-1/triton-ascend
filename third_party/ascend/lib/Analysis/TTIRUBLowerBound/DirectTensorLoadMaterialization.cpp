@@ -147,10 +147,6 @@ LogicalResult rejectUnsupportedOperations(
     ModuleOp module, const llvm::DenseSet<Operation *> &matched,
     SmallVectorImpl<std::string> &reasons) {
   WalkResult result = module.walk([&](Operation *operation) {
-    if (isa<triton::ReduceOp>(operation)) {
-      addReason(reasons, "unsupported-op-reduction");
-      return WalkResult::interrupt();
-    }
     if (isa<ModuleOp>(operation))
       return WalkResult::advance();
     if (auto function = dyn_cast<triton::FuncOp>(operation)) {
@@ -171,11 +167,21 @@ LogicalResult rejectUnsupportedOperations(
     }
     if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp,
             triton::LoadOp, triton::StoreOp, triton::ReshapeOp,
+            triton::ReduceOp, triton::ReduceReturnOp,
             arith::AddFOp>(operation)) {
       triton::FuncOp function = operation->getParentOfType<triton::FuncOp>();
-      if (matched.contains(operation) && function &&
-          isDirectlyInEntryBlock(operation, function) &&
-          operation->getNumRegions() == 0 &&
+      const bool isReduction = isa<triton::ReduceOp>(operation);
+      const bool isReductionBody =
+          isa<triton::ReduceReturnOp, arith::AddFOp>(operation) &&
+          operation->getParentOfType<triton::ReduceOp>();
+      const bool validPlacement =
+          isReduction
+              ? function && isDirectlyInEntryBlock(operation, function) &&
+                    operation->getNumRegions() == 1
+              : isReductionBody ||
+                    (function && isDirectlyInEntryBlock(operation, function) &&
+                     operation->getNumRegions() == 0);
+      if (matched.contains(operation) && validPlacement &&
           operation->getNumSuccessors() == 0)
         return WalkResult::advance();
       addReason(reasons, "unmatched-operation");
@@ -191,6 +197,154 @@ LogicalResult rejectUnsupportedOperations(
     return WalkResult::interrupt();
   });
   return result.wasInterrupted() ? failure() : success();
+}
+
+LogicalResult materializeReductionSum(
+    triton::LoadOp load, triton::ReduceOp reduce,
+    MandatoryUBResourceGraph &graph, llvm::DenseSet<Operation *> &matched,
+    SmallVectorImpl<std::string> &reasons) {
+  triton::FuncOp function = load->getParentOfType<triton::FuncOp>();
+  if (!function || !isDirectlyInEntryBlock(load, function) ||
+      !isDirectlyInEntryBlock(reduce, function) ||
+      load->getNumOperands() != 1 || load->getNumResults() != 1 ||
+      load->getNumRegions() != 0 || load->getNumSuccessors() != 0 ||
+      reduce->getNumOperands() != 1 || reduce->getNumResults() != 1 ||
+      reduce->getNumRegions() != 1 || reduce->getNumSuccessors() != 0 ||
+      reduce.getAxis() != 0)
+    return defer(reasons, "unsupported-reduction-shape");
+  if (load.getOther() || !load.getBoundaryCheck().empty() ||
+      load.getPadding() || load.getIsVolatile() ||
+      load.getCache() != triton::CacheModifier::NONE ||
+      load.getEvict() != triton::EvictionPolicy::NORMAL)
+    return defer(reasons, "unsupported-load-semantics");
+
+  auto inputType = dyn_cast<RankedTensorType>(load.getType());
+  if (!inputType || !inputType.hasStaticShape() || inputType.getRank() != 1 ||
+      !inputType.getElementType().isF32() ||
+      inputType.getNumElements() < 2 ||
+      inputType.getNumElements() % 2 != 0 ||
+      reduce.getSrcs().front() != load.getResult() ||
+      reduce.getResult().front().getType() != inputType.getElementType() ||
+      !load.getResult().hasOneUse() ||
+      *load.getResult().getUsers().begin() != reduce.getOperation() ||
+      !load->isBeforeInBlock(reduce))
+    return defer(reasons, "unsupported-reduction-shape");
+  FailureOr<int64_t> payloadBytes = getPayloadBytes(inputType, reasons);
+  if (failed(payloadBytes))
+    return failure();
+
+  FailureOr<ContiguousPointerChain> sourceChain = matchContiguousPointer(
+      load.getPtr(), function, inputType.getNumElements(),
+      inputType.getElementType(), reasons);
+  if (failed(sourceChain))
+    return failure();
+  if (!sourceChain->addPtr.getResult().hasOneUse() ||
+      !sourceChain->addPtr->isBeforeInBlock(load))
+    return defer(reasons, "load-pointer-has-extra-use");
+
+  Region &combine = reduce.getCombineOp();
+  if (!combine.hasOneBlock())
+    return defer(reasons, "unsupported-reduction-combiner");
+  Block &block = combine.front();
+  if (block.getNumArguments() != 2 ||
+      block.getArgument(0).getType() != inputType.getElementType() ||
+      block.getArgument(1).getType() != inputType.getElementType())
+    return defer(reasons, "unsupported-reduction-combiner");
+  auto add = dyn_cast_or_null<arith::AddFOp>(block.empty() ? nullptr
+                                                           : &block.front());
+  auto reduceReturn =
+      dyn_cast_or_null<triton::ReduceReturnOp>(block.empty() ? nullptr
+                                                             : &block.back());
+  if (!add || !reduceReturn || &block.front() == &block.back() ||
+      std::distance(block.begin(), block.end()) != 2 ||
+      add->getNumOperands() != 2 || add->getNumResults() != 1 ||
+      add.getFastmath() != arith::FastMathFlags::none ||
+      add.getLhs() != block.getArgument(0) ||
+      add.getRhs() != block.getArgument(1) ||
+      reduceReturn->getNumOperands() != 1 ||
+      reduceReturn.getResult().front() != add.getResult())
+    return defer(reasons, "unsupported-reduction-combiner");
+
+  Value result = reduce.getResult().front();
+  if (result.use_empty())
+    return defer(reasons, "unsupported-op-reduction");
+  if (!result.hasOneUse())
+    return defer(reasons, "unsupported-reduction-dataflow");
+  auto store = dyn_cast<triton::StoreOp>(*result.getUsers().begin());
+  auto destination = dyn_cast<BlockArgument>(store ? store.getPtr() : Value());
+  auto destinationType =
+      destination
+          ? dyn_cast<triton::PointerType>(destination.getType())
+          : triton::PointerType();
+  if (!store || store->getNumOperands() != 2 || store->getNumResults() != 0 ||
+      store->getNumRegions() != 0 || store->getNumSuccessors() != 0 ||
+      store.getValue() != result || !isDirectlyInEntryBlock(store, function) ||
+      !reduce->isBeforeInBlock(store) || !store.getBoundaryCheck().empty() ||
+      store.getCache() != triton::CacheModifier::NONE ||
+      store.getEvict() != triton::EvictionPolicy::NORMAL || !destination ||
+      destination.getOwner() != &function.getBody().front() ||
+      !destination.hasOneUse() || !destinationType ||
+      destinationType.getPointeeType() != inputType.getElementType() ||
+      destinationType.getAddressSpace() != 1)
+    return defer(reasons, "unsupported-reduction-store");
+
+  const uint64_t loadOrdinal =
+      std::distance(function.getBody().front().begin(), load->getIterator());
+  const uint64_t reduceOrdinal =
+      std::distance(function.getBody().front().begin(), reduce->getIterator());
+  const uint64_t storeOrdinal =
+      std::distance(function.getBody().front().begin(), store->getIterator());
+  SmallVector<ResourceId> resourceIds;
+  auto addResource = [&](StringRef debugName, int64_t bytes,
+                         StringRef origin, MaterializationKind kind,
+                         uint64_t birth, uint64_t lastUse,
+                         StringRef consumer) -> LogicalResult {
+    MandatoryUBResource resource;
+    resource.debugName = debugName.str();
+    resource.minPayloadBytes = bytes;
+    resource.minInstances = 1;
+    resource.origin = origin.str();
+    resource.kind = kind;
+    resource.birth.ordinal = birth;
+    resource.lastRequiredUse.ordinal = lastUse;
+    resource.sourceElements = inputType.getNumElements();
+    resource.elementBitWidth = 32;
+    resource.consumer = consumer.str();
+    resource.contractTrace.push_back("ttir-reduction-sum-v1");
+    ResourceId id = graph.addResource(std::move(resource));
+    if (id == InvalidResourceId)
+      return failure();
+    resourceIds.push_back(id);
+    return success();
+  };
+  if (failed(addResource("reduction-sum-input", *payloadBytes, "tt.load",
+                         MaterializationKind::GMToUBLoad, loadOrdinal,
+                         reduceOrdinal, "tt.reduce")) ||
+      failed(addResource("reduction-sum-scratch", *payloadBytes / 2,
+                         "tt.reduce", MaterializationKind::ReductionScratch,
+                         reduceOrdinal, reduceOrdinal, "tt.reduce")) ||
+      failed(addResource("reduction-sum-accumulator", 4, "tt.reduce",
+                         MaterializationKind::ReductionAccumulator,
+                         reduceOrdinal, storeOrdinal, "tt.store")))
+    return defer(reasons, "malformed-resource-graph");
+  for (size_t lhs = 0; lhs < resourceIds.size(); ++lhs)
+    for (size_t rhs = lhs + 1; rhs < resourceIds.size(); ++rhs)
+      graph.addMayAlias(resourceIds[lhs], resourceIds[rhs]);
+  CoexistenceWitness witness;
+  witness.resources = resourceIds;
+  witness.contractTrace.push_back("ttir-reduction-sum-v1");
+  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
+    return defer(reasons, "malformed-resource-graph");
+
+  matched.insert(sourceChain->range);
+  matched.insert(sourceChain->splat);
+  matched.insert(sourceChain->addPtr);
+  matched.insert(load);
+  matched.insert(reduce);
+  matched.insert(add);
+  matched.insert(reduceReturn);
+  matched.insert(store);
+  return success();
 }
 
 LogicalResult materializeLoad(triton::LoadOp load,
@@ -620,9 +774,16 @@ LogicalResult materializeDirectTensorLoads(
     return defer(unsupportedReasons, "no-mandatory-load");
 
   llvm::DenseSet<Operation *> matched;
+  SmallVector<triton::ReduceOp> reductions;
+  module.walk([&](triton::ReduceOp reduce) { reductions.push_back(reduce); });
   SmallVector<arith::AddFOp> adds;
   module.walk([&](arith::AddFOp add) { adds.push_back(add); });
-  if (!adds.empty()) {
+  if (!reductions.empty()) {
+    if (reductions.size() != 1 || loads.size() != 1 ||
+        failed(materializeReductionSum(loads.front(), reductions.front(),
+                                       graph, matched, unsupportedReasons)))
+      return failure();
+  } else if (!adds.empty()) {
     if (adds.size() != 1 ||
         failed(materializeBinaryAdd(loads, adds.front(), graph, matched,
                                     unsupportedReasons)))

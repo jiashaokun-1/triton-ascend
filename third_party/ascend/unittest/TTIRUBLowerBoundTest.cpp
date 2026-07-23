@@ -113,6 +113,24 @@ module {
 }
 )mlir";
 
+constexpr StringLiteral kReductionSum = R"mlir(
+module {
+  tt.func public @reduction_sum(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %srcs = tt.splat %src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %src_ptrs = tt.addptr %srcs, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>
+    %sum = "tt.reduce" (%value) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %add = arith.addf %lhs, %rhs : f32
+      tt.reduce.return %add : f32
+    }) {axis = 0 : i32} : (tensor<65536xf32>) -> f32
+    tt.store %dst, %sum : !tt.ptr<f32>
+    tt.return
+  }
+}
+)mlir";
+
 std::string replaceOnce(StringRef source, StringRef from, StringRef to) {
   std::string result = source.str();
   size_t position = result.find(from.str());
@@ -694,6 +712,84 @@ TEST(UBResourceContract, ReshapeCopyPreserveKeepsPreMaterializationMayAlias) {
   EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 4096);
 }
 
+void addReductionSumResources(MandatoryUBResourceGraph &graph) {
+  MandatoryUBResource input{"reduction-input", 262144, 1};
+  input.origin = "tt.load";
+  input.kind = MaterializationKind::GMToUBLoad;
+  input.birth.ordinal = 1;
+  input.lastRequiredUse.ordinal = 3;
+  input.sourceElements = 65536;
+  input.elementBitWidth = 32;
+  input.consumer = "tt.reduce";
+  input.contractTrace = {"ttir-reduction-sum-v1"};
+  ResourceId inputId = graph.addResource(std::move(input));
+
+  MandatoryUBResource scratch{"reduction-scratch", 131072, 1};
+  scratch.origin = "tt.reduce";
+  scratch.kind = MaterializationKind::ReductionScratch;
+  scratch.birth.ordinal = 3;
+  scratch.lastRequiredUse.ordinal = 3;
+  scratch.sourceElements = 65536;
+  scratch.elementBitWidth = 32;
+  scratch.consumer = "tt.reduce";
+  scratch.contractTrace = {"ttir-reduction-sum-v1"};
+  ResourceId scratchId = graph.addResource(std::move(scratch));
+
+  MandatoryUBResource accumulator{"reduction-accumulator", 4, 1};
+  accumulator.origin = "tt.reduce";
+  accumulator.kind = MaterializationKind::ReductionAccumulator;
+  accumulator.birth.ordinal = 3;
+  accumulator.lastRequiredUse.ordinal = 4;
+  accumulator.sourceElements = 65536;
+  accumulator.elementBitWidth = 32;
+  accumulator.consumer = "tt.store";
+  accumulator.contractTrace = {"ttir-reduction-sum-v1"};
+  ResourceId accumulatorId = graph.addResource(std::move(accumulator));
+
+  for (auto [lhs, rhs] :
+       {std::pair{inputId, scratchId}, std::pair{inputId, accumulatorId},
+        std::pair{scratchId, accumulatorId}})
+    graph.addMayAlias(lhs, rhs);
+  CoexistenceWitness witness;
+  witness.resources = {inputId, scratchId, accumulatorId};
+  witness.contractTrace = {"ttir-reduction-sum-v1"};
+  graph.addWitness(std::move(witness));
+}
+
+TEST(UBResourceContract, ReductionSumExtraBufferProvesThreeWayPeak) {
+  MandatoryUBResourceGraph graph;
+  addReductionSumResources(graph);
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeReductionSumExtraBufferContract(
+      {.stageName = "suffix"}, 3, 65536, 32, 262144, 131072, 4));
+
+  ASSERT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "suffix"})));
+  EXPECT_TRUE(graph.hasPairwiseDistinctWitness(0));
+  auto result = graph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->kind, "witness");
+  EXPECT_EQ(result->bytes, 393220);
+  EXPECT_EQ(result->resourceIds, SmallVector<ResourceId>({0, 1, 2}));
+  EXPECT_EQ(result->contractTrace,
+            SmallVector<std::string>({"ttir-reduction-sum-v1",
+                                      "reduction-sum-extra-buffer"}));
+}
+
+TEST(UBResourceContract, ReductionSumPreserveCannotInventDistinctness) {
+  MandatoryUBResourceGraph graph;
+  addReductionSumResources(graph);
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeReductionSumPreserveContract(
+      {.stageName = "preserve"}, 3, 65536, 32, 262144, 131072, 4));
+
+  ASSERT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "preserve"})));
+  EXPECT_TRUE(graph.hasPairwiseMayAliasWitness(0));
+  EXPECT_EQ(graph.solveWitnessLowerBound()->kind, "singleton");
+  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 262144);
+}
+
 TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
   MandatoryUBResourceGraph graph;
   graph.addResource({"load0", 262144, 1});
@@ -908,6 +1004,59 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
   EXPECT_EQ(result.certificates[0].contractTrace,
             SmallVector<std::string>({"ttir-reshape-copy-v1",
                                       "reshape-copy-max-tiles"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ReductionSumUsesInputScratchAndAccumulatorWitness) {
+  TTIRUBAnalysisOptions analysisOptions = options("Ascend910B1");
+  analysisOptions.stages = {{.stageName = "materialize"},
+                            {.stageName = "suffix"}};
+  PipelineContractRegistry reductionRegistry;
+  reductionRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(reductionRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[0],
+       .contractId = "reduction-sum-max-tiles",
+       .contractVersion = "1"},
+      makeReductionSumMaxTilesContract(analysisOptions.stages[0], 3, 65536,
+                                       32, 262144, 131072, 4, 1))));
+  ASSERT_TRUE(succeeded(reductionRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[1],
+       .contractId = "reduction-sum-extra-buffer",
+       .contractVersion = "1"},
+      makeReductionSumExtraBufferContract(analysisOptions.stages[1], 3, 65536,
+                                          32, 262144, 131072, 4))));
+  OwningOpRef<ModuleOp> module = parse(kReductionSum);
+  ASSERT_TRUE(module);
+
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, reductionRegistry);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Reject);
+  EXPECT_EQ(result.lowerBoundBytes, 393220);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "witness");
+  EXPECT_EQ(result.certificates[0].resourceIds,
+            SmallVector<ResourceId>({0, 1, 2}));
+  EXPECT_EQ(result.certificates[0].contractTrace,
+            SmallVector<std::string>({"ttir-reduction-sum-v1",
+                                      "reduction-sum-max-tiles",
+                                      "reduction-sum-extra-buffer"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ReductionSumOddInputDefers) {
+  std::string source = replaceAll(kReductionSum, "65536", "65535");
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-reduction-shape"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ReductionSumFastMathDefers) {
+  std::string source = replaceOnce(
+      kReductionSum, "%add = arith.addf %lhs, %rhs : f32",
+      "%add = arith.addf %lhs, %rhs fastmath<fast> : f32");
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-reduction-combiner"));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,

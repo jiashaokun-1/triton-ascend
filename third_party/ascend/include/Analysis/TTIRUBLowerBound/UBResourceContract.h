@@ -110,6 +110,21 @@ std::unique_ptr<UBResourceContract> makeReshapeCopyMaxTilesContract(
     const PipelineStageContext &stage, int64_t expectedResourceCount,
     int64_t expectedSourceElements, unsigned expectedElementBitWidth,
     int64_t expectedInputPayloadBytes, int64_t maxTiles);
+std::unique_ptr<UBResourceContract> makeReductionSumPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedScratchPayloadBytes,
+    int64_t expectedAccumulatorPayloadBytes);
+std::unique_ptr<UBResourceContract> makeReductionSumMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedScratchPayloadBytes,
+    int64_t expectedAccumulatorPayloadBytes, int64_t maxTiles);
+std::unique_ptr<UBResourceContract> makeReductionSumExtraBufferContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedScratchPayloadBytes,
+    int64_t expectedAccumulatorPayloadBytes);
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch);
 

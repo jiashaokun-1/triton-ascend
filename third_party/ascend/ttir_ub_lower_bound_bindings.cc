@@ -154,12 +154,27 @@ makeProfileContract(const PipelineContractBinding &binding) {
   const bool reshapeTransform =
       binding.contractId == "reshape-copy-max-tiles" &&
       binding.contractVersion == "1";
+  const bool reductionPreserve =
+      binding.contractId == "reduction-sum-preserve" &&
+      binding.contractVersion == "1";
+  const bool reductionTransform =
+      binding.contractId == "reduction-sum-max-tiles" &&
+      binding.contractVersion == "1";
+  const bool reductionExtraBuffer =
+      binding.contractId == "reduction-sum-extra-buffer" &&
+      binding.contractVersion == "1";
   SmallVector<StringRef> expectedNames(resourceParameters.begin(),
                                        resourceParameters.end());
-  if (transform || binaryTransform || reshapeTransform)
+  if (reductionPreserve || reductionTransform || reductionExtraBuffer) {
+    expectedNames.push_back("expected_scratch_payload_bytes");
+    expectedNames.push_back("expected_accumulator_payload_bytes");
+  }
+  if (transform || binaryTransform || reshapeTransform ||
+      reductionTransform)
     expectedNames.push_back("max_tiles");
   if ((!preserve && !transform && !binaryPreserve && !binaryTransform &&
-       !reshapePreserve && !reshapeTransform) ||
+       !reshapePreserve && !reshapeTransform && !reductionPreserve &&
+       !reductionTransform && !reductionExtraBuffer) ||
       !hasExactParameters(binding, expectedNames))
     return nullptr;
 
@@ -175,6 +190,16 @@ makeProfileContract(const PipelineContractBinding &binding) {
       !inputPayload ||
       *elementBitWidth > std::numeric_limits<unsigned>::max())
     return nullptr;
+  std::optional<int64_t> scratchPayload;
+  std::optional<int64_t> accumulatorPayload;
+  if (reductionPreserve || reductionTransform || reductionExtraBuffer) {
+    scratchPayload = getPositiveInt64Parameter(
+        binding, "expected_scratch_payload_bytes");
+    accumulatorPayload = getPositiveInt64Parameter(
+        binding, "expected_accumulator_payload_bytes");
+    if (!scratchPayload || !accumulatorPayload)
+      return nullptr;
+  }
   if (preserve)
     return makeDirectCopyPreserveContract(
         binding.stage, *resourceCount, *sourceElements,
@@ -187,6 +212,16 @@ makeProfileContract(const PipelineContractBinding &binding) {
     return makeReshapeCopyPreserveContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload);
+  if (reductionPreserve)
+    return makeReductionSumPreserveContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload,
+        *scratchPayload, *accumulatorPayload);
+  if (reductionExtraBuffer)
+    return makeReductionSumExtraBufferContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload,
+        *scratchPayload, *accumulatorPayload);
 
   auto maxTiles = getPositiveInt64Parameter(binding, "max_tiles");
   if (!maxTiles)
@@ -199,6 +234,11 @@ makeProfileContract(const PipelineContractBinding &binding) {
     return makeReshapeCopyMaxTilesContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
+  if (reductionTransform)
+    return makeReductionSumMaxTilesContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload,
+        *scratchPayload, *accumulatorPayload, *maxTiles);
   return makeDirectCopyMaxTilesContract(
       binding.stage, *resourceCount, *sourceElements,
       static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
@@ -298,7 +338,10 @@ bool loadMatchingProfile(const py::handle &value,
                binding.contractId == "binary-add-preserve" ||
                binding.contractId == "binary-add-max-tiles" ||
                binding.contractId == "reshape-copy-preserve" ||
-               binding.contractId == "reshape-copy-max-tiles";
+               binding.contractId == "reshape-copy-max-tiles" ||
+               binding.contractId == "reduction-sum-preserve" ||
+               binding.contractId == "reduction-sum-max-tiles" ||
+               binding.contractId == "reduction-sum-extra-buffer";
       });
   if (containsActiveContract && !allowUncertifiedActiveContracts &&
       !matchedProfileIsCertified)
