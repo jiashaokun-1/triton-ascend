@@ -1,6 +1,7 @@
 #include "Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
 #include <cassert>
@@ -64,6 +65,22 @@ uint64_t relationKey(ResourceId lhs, ResourceId rhs) {
   if (rhs < lhs)
     std::swap(lhs, rhs);
   return (static_cast<uint64_t>(lhs) << 32) | rhs;
+}
+
+template <typename Range>
+bool containsRelation(const Range &relations, ResourceId lhs,
+                      ResourceId rhs) {
+  const uint64_t expected = relationKey(lhs, rhs);
+  return llvm::any_of(relations, [&](const auto &relation) {
+    return relationKey(relation.first, relation.second) == expected;
+  });
+}
+
+void appendUnique(SmallVectorImpl<std::string> &destination,
+                  ArrayRef<std::string> source) {
+  for (const std::string &item : source)
+    if (!llvm::is_contained(destination, item))
+      destination.push_back(item);
 }
 
 template <typename Id> FailureOr<Id> checkedId(size_t ordinal) {
@@ -165,6 +182,69 @@ LogicalResult MandatoryUBResourceGraph::appendResourceTrace(
   }
   resources_[id].contractTrace.push_back(contractId.str());
   return success();
+}
+
+LogicalResult MandatoryUBResourceGraph::refineWitnessToMustDistinct(
+    WitnessId id, StringRef contractId) {
+  if (contractId.empty() || !hasPairwiseMayAliasWitness(id)) {
+    malformed_ = true;
+    return failure();
+  }
+  const ArrayRef<ResourceId> resources = witnesses_[id].resources;
+  for (size_t lhsIndex = 0; lhsIndex < resources.size(); ++lhsIndex) {
+    for (size_t rhsIndex = lhsIndex + 1; rhsIndex < resources.size();
+         ++rhsIndex) {
+      ResourceId lhs = resources[lhsIndex];
+      ResourceId rhs = resources[rhsIndex];
+      const uint64_t key = relationKey(lhs, rhs);
+      llvm::erase_if(mayAliases_, [&](const ResourcePair &relation) {
+        return relationKey(relation.first, relation.second) == key;
+      });
+      if (!containsRelation(mustDistinct_, lhs, rhs))
+        addMustDistinct(lhs, rhs);
+    }
+  }
+  witnesses_[id].contractTrace.push_back(contractId.str());
+  return success();
+}
+
+bool MandatoryUBResourceGraph::hasPairwiseMayAliasWitness(WitnessId id) const {
+  if (malformed_ || id >= witnesses_.size() ||
+      witnesses_[id].resources.size() < 2)
+    return false;
+  const ArrayRef<ResourceId> resources = witnesses_[id].resources;
+  for (size_t lhsIndex = 0; lhsIndex < resources.size(); ++lhsIndex) {
+    for (size_t rhsIndex = lhsIndex + 1; rhsIndex < resources.size();
+         ++rhsIndex) {
+      ResourceId lhs = resources[lhsIndex];
+      ResourceId rhs = resources[rhsIndex];
+      if (lhs >= resources_.size() || rhs >= resources_.size() || lhs == rhs ||
+          !containsRelation(mayAliases_, lhs, rhs) ||
+          containsRelation(mustAliases_, lhs, rhs) ||
+          containsRelation(mustDistinct_, lhs, rhs))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool MandatoryUBResourceGraph::hasPairwiseDistinctWitness(WitnessId id) const {
+  if (malformed_ || id >= witnesses_.size() ||
+      witnesses_[id].resources.size() < 2)
+    return false;
+  const ArrayRef<ResourceId> resources = witnesses_[id].resources;
+  for (size_t lhsIndex = 0; lhsIndex < resources.size(); ++lhsIndex) {
+    for (size_t rhsIndex = lhsIndex + 1; rhsIndex < resources.size();
+         ++rhsIndex) {
+      ResourceId lhs = resources[lhsIndex];
+      ResourceId rhs = resources[rhsIndex];
+      if (lhs >= resources_.size() || rhs >= resources_.size() || lhs == rhs ||
+          containsRelation(mayAliases_, lhs, rhs) ||
+          !containsRelation(mustDistinct_, lhs, rhs))
+        return false;
+    }
+  }
+  return true;
 }
 
 FailureOr<LowerBoundCertificate>
@@ -289,10 +369,10 @@ MandatoryUBResourceGraph::solveWitnessLowerBound() const {
       result.bytes = bytes;
       result.resourceIds = std::move(resourceIds);
       result.kind = "witness";
-      result.contractTrace = witness.contractTrace;
+      result.contractTrace.clear();
+      appendUnique(result.contractTrace, witness.contractTrace);
       for (ResourceId id : result.resourceIds)
-        result.contractTrace.append(resources_[id].contractTrace.begin(),
-                                    resources_[id].contractTrace.end());
+        appendUnique(result.contractTrace, resources_[id].contractTrace);
     }
   }
 
@@ -301,6 +381,10 @@ MandatoryUBResourceGraph::solveWitnessLowerBound() const {
 
 ArrayRef<MandatoryUBResource> MandatoryUBResourceGraph::resources() const {
   return resources_;
+}
+
+ArrayRef<CoexistenceWitness> MandatoryUBResourceGraph::witnesses() const {
+  return witnesses_;
 }
 
 } // namespace mlir::triton::ascend::ub

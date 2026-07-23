@@ -84,6 +84,14 @@ def test_direct_copy_boundary_extracts_one_static_local_allocation():
     ) == 34
 
 
+def test_binary_add_boundary_extracts_two_static_local_allocations():
+    text = (
+        '%0 = "memref.alloc"() : () -> memref<1024xf32>\n'
+        '%1 = "memref.alloc"() : () -> memref<1024xf32>\n'
+    )
+    assert oracle.parse_boundary_allocation_bytes(text) == [4096, 4096]
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -216,6 +224,7 @@ def _write_manifest(root, **updates):
     (root / "case.mlir").write_text("module {}", encoding="utf-8")
     case = {
         "name": "case",
+        "operation_family": "direct-copy",
         "ttir": "case.ttir",
         "before_cvpipelining": "case.mlir",
         "arch": "Ascend910B",
@@ -242,6 +251,12 @@ def test_manifest_resolves_files_and_rejects_identity_override(tmp_path):
     assert manifest["cases"][0]["ttir"] == (tmp_path / "case.ttir").resolve()
     path = _write_manifest(tmp_path, pipeline_identity="caller-value")
     with pytest.raises(oracle.ManifestError):
+        oracle.load_manifest(path)
+
+
+def test_manifest_requires_family_specific_resource_count(tmp_path):
+    path = _write_manifest(tmp_path, operation_family="binary-add")
+    with pytest.raises(oracle.ManifestError, match="resource_count"):
         oracle.load_manifest(path)
 
 
@@ -292,6 +307,31 @@ def test_proposed_contract_chain_transitions_at_materialization_stage():
     assert bindings[2]["contract_parameters"]["expected_input_payload_bytes"] == "4096"
 
 
+def test_binary_add_contract_chain_uses_binary_contracts():
+    identity = {"sha256": "identity"}
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "after", "options": {}},
+    ]
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 64,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    profile = oracle.build_proposed_contract_profile(
+        identity, stages, proposal, "binary-add"
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+    assert [binding["contract_id"] for binding in bindings] == [
+        "binary-add-max-tiles", "binary-add-preserve"
+    ]
+    assert bindings[1]["contract_parameters"]["expected_input_payload_bytes"] == "4096"
+
+
 def test_proposed_contract_chain_requires_unique_materialization_stage():
     with pytest.raises(oracle.OracleUnavailable, match="exactly once"):
         oracle.build_proposed_contract_profile(
@@ -309,14 +349,19 @@ def test_proposed_contract_chain_requires_unique_materialization_stage():
         )
 
 
-def _analysis(decision="defer", lower_bound_bytes=0):
+def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-copy"):
+    is_binary_add = operation_family == "binary-add"
     certificate = {
-        "kind": "singleton",
+        "kind": "witness" if is_binary_add else "singleton",
         "bytes": lower_bound_bytes,
-        "resource_ids": [0],
-        "contract_trace": ["ttir-direct-load-v1", "direct-copy-max-tiles"],
+        "resource_ids": [0, 1] if is_binary_add else [0],
+        "contract_trace": [
+            "ttir-binary-add-v1" if is_binary_add else "ttir-direct-load-v1",
+            "binary-add-max-tiles" if is_binary_add else "direct-copy-max-tiles",
+        ],
     }
     return {
+        "operation_family": operation_family,
         "decision": decision,
         "lower_bound_bytes": lower_bound_bytes,
         "capacity_bytes": 196608,
@@ -327,10 +372,10 @@ def _analysis(decision="defer", lower_bound_bytes=0):
         "pipeline_stages_detail": [{
             "stage_name": "ttir.triton-to-linalg",
             "options": {},
-            "contract_id": "direct-copy-max-tiles",
+            "contract_id": "binary-add-max-tiles" if is_binary_add else "direct-copy-max-tiles",
             "contract_version": "1",
             "contract_parameters": {
-                "expected_resource_count": "1",
+                "expected_resource_count": "2" if is_binary_add else "1",
                 "expected_source_elements": "65536",
                 "expected_element_bit_width": "32",
                 "expected_input_payload_bytes": "262144",
@@ -338,11 +383,29 @@ def _analysis(decision="defer", lower_bound_bytes=0):
             },
         }],
         "auto_tile_and_bind_subblock_outcome": False,
-        "before_cvpipelining_allocation_bytes": 4096,
+        "before_cvpipelining_allocations_bytes": [4096, 4096] if is_binary_add else [4096],
+        "before_cvpipelining_allocation_bytes": 8192 if is_binary_add else 4096,
         "ttir_fixture_sha256": "a" * 64,
         "before_cvpipelining_sha256": "b" * 64,
         "contract_version": "ttir-ub-lb-v1",
     }
+
+
+def test_binary_add_certificate_requires_two_resource_witness():
+    analysis = _analysis("defer", 8192, "binary-add")
+    assert oracle.has_valid_certificate(analysis)
+    analysis["certificates"][0]["kind"] = "singleton"
+    assert not oracle.has_valid_certificate(analysis)
+    analysis["certificates"][0]["kind"] = "witness"
+    analysis["certificates"][0]["resource_ids"] = [0, 0]
+    assert not oracle.has_valid_certificate(analysis)
+
+
+def test_binary_add_materialization_bridge_requires_two_exact_allocations():
+    analysis = _analysis("defer", 8192, "binary-add")
+    assert oracle.has_valid_materialization_bridge(analysis)
+    analysis["before_cvpipelining_allocations_bytes"] = [8192]
+    assert not oracle.has_valid_materialization_bridge(analysis)
 
 
 def test_evaluate_accepts_available_defer_results(tmp_path):
@@ -418,6 +481,23 @@ def test_evaluate_rejects_certificate_from_a_different_contract_chain(tmp_path):
     report = oracle.evaluate(manifest, Path("compiler"), [0], False, lambda _case: analysis, run)
     assert {item["kind"] for item in report["violations"]} == {
         "invalid-certificate-contract-trace"
+    }
+
+
+def test_evaluate_rejects_invalid_materialization_bridge(tmp_path):
+    manifest = oracle.load_manifest(_write_manifest(tmp_path))
+    analysis = _analysis()
+    analysis["before_cvpipelining_allocations_bytes"] = [2048]
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed, "status": "success", "overflow_scope": None,
+            "actual_peak_bits": 4096, "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(manifest, Path("compiler"), [0], False, lambda _case: analysis, run)
+    assert {item["kind"] for item in report["violations"]} == {
+        "invalid-materialization-bridge"
     }
 
 

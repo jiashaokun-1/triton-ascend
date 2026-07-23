@@ -2,6 +2,7 @@
 #include "Analysis/TTIRUBLowerBound/VerifierSafety.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Verifier.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -166,6 +167,11 @@ StringRef getVerifierPreflightFailure(Operation *root) {
       if (!detail::hasValidStoreOperandSegments(
               segments, operation->getNumOperands()))
         return "malformed-ir";
+    } else if (name == arith::AddFOp::getOperationName()) {
+      if (!hasExactRegisteredType<arith::AddFOp>(operation) ||
+          !hasExactShape(operation, 2, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
     } else {
       // Raw names are used only to reject unsupported operations. Never walk
       // into them or expose their structure/properties to the verifier.
@@ -241,7 +247,7 @@ analyzeTTIRUBLowerBound(ModuleOp module, const TTIRUBAnalysisOptions &options,
     return result;
 
   FailureOr<LowerBoundCertificate> certificate =
-      graph.solveSingletonLowerBound();
+      graph.solveWitnessLowerBound();
   if (failed(certificate)) {
     addReason(result.unsupportedReasons, "malformed-resource-graph");
     return result;

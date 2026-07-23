@@ -60,6 +60,25 @@ module {
 }
 )mlir";
 
+constexpr StringLiteral kBinaryAdd = R"mlir(
+module {
+  tt.func public @add(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %lhs_splat = tt.splat %lhs : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %lhs_ptrs = tt.addptr %lhs_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %rhs_splat = tt.splat %rhs : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %rhs_ptrs = tt.addptr %rhs_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dst_splat = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dst_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %lhs_value = tt.load %lhs_ptrs : tensor<65536x!tt.ptr<f32>>
+    %rhs_value = tt.load %rhs_ptrs : tensor<65536x!tt.ptr<f32>>
+    %sum = arith.addf %lhs_value, %rhs_value : tensor<65536xf32>
+    tt.store %dst_ptrs, %sum : tensor<65536x!tt.ptr<f32>>
+    tt.return
+  }
+}
+)mlir";
+
 std::string replaceOnce(StringRef source, StringRef from, StringRef to) {
   std::string result = source.str();
   size_t position = result.find(from.str());
@@ -245,6 +264,48 @@ TEST(MandatoryUBResourceGraph, PossibleAliasCannotBeSummed) {
 }
 
 TEST(MandatoryUBResourceGraph,
+     MaterializationCanRefineMayAliasWitnessToMustDistinct) {
+  MandatoryUBResourceGraph graph;
+  MandatoryUBResource lhs{"lhs", 64, 1};
+  lhs.contractTrace = {"binary-elementwise-source"};
+  auto lhsId = graph.addResource(std::move(lhs));
+  MandatoryUBResource rhs{"rhs", 128, 1};
+  rhs.contractTrace = {"binary-elementwise-source"};
+  auto rhsId = graph.addResource(std::move(rhs));
+  graph.addMayAlias(lhsId, rhsId);
+  CoexistenceWitness witness;
+  witness.resources = {lhsId, rhsId};
+  witness.contractTrace = {"binary-elementwise-source"};
+  WitnessId witnessId = graph.addWitness(std::move(witness));
+
+  ASSERT_FALSE(graph.hasPairwiseDistinctWitness(witnessId));
+  ASSERT_TRUE(succeeded(graph.refineWitnessToMustDistinct(
+      witnessId, "binary-elementwise-materialize")));
+  ASSERT_TRUE(graph.hasPairwiseDistinctWitness(witnessId));
+  auto result = graph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->kind, "witness");
+  EXPECT_EQ(result->bytes, 192);
+  EXPECT_EQ(result->resourceIds,
+            SmallVector<ResourceId>({lhsId, rhsId}));
+  EXPECT_EQ(result->contractTrace,
+            SmallVector<std::string>({"binary-elementwise-source",
+                                      "binary-elementwise-materialize"}));
+}
+
+TEST(MandatoryUBResourceGraph,
+     DistinctRefinementRequiresExplicitMayAliasWitnessFacts) {
+  MandatoryUBResourceGraph graph;
+  auto lhs = graph.addResource({"lhs", 64, 1});
+  auto rhs = graph.addResource({"rhs", 128, 1});
+  WitnessId witness = graph.addWitness({lhs, rhs});
+
+  EXPECT_TRUE(failed(
+      graph.refineWitnessToMustDistinct(witness, "unproven-distinct")));
+  EXPECT_TRUE(failed(graph.solveWitnessLowerBound()));
+}
+
+TEST(MandatoryUBResourceGraph,
      InvalidWitnessMemberDoesNotCreateSubsetWitness) {
   MandatoryUBResourceGraph graph;
   auto a = graph.addResource({"a", 100, 1});
@@ -359,6 +420,7 @@ MandatoryUBResource directCopyResource(int64_t payloadBytes = 262144) {
   resource.kind = MaterializationKind::GMToUBLoad;
   resource.sourceElements = 65536;
   resource.elementBitWidth = 32;
+  resource.consumer = "tt.store";
   return resource;
 }
 
@@ -420,6 +482,61 @@ TEST(UBResourceContract, DirectCopyMaxTilesRejectsResourceCountDrift) {
   EXPECT_EQ(graph.resources()[first].validity, ValidityState::Invalid);
   EXPECT_EQ(graph.resources()[first].invalidReason,
             "direct-copy-max-tiles");
+}
+
+MandatoryUBResource binaryAddResource(int64_t payloadBytes = 262144) {
+  MandatoryUBResource resource{"binary-input", payloadBytes, 1};
+  resource.origin = "tt.load";
+  resource.kind = MaterializationKind::GMToUBLoad;
+  resource.sourceElements = 65536;
+  resource.elementBitWidth = 32;
+  resource.consumer = "arith.addf";
+  resource.contractTrace = {"ttir-binary-add-v1"};
+  return resource;
+}
+
+TEST(UBResourceContract, BinaryAddMaxTilesProvesDistinctCoexistence) {
+  MandatoryUBResourceGraph graph;
+  ResourceId lhs = graph.addResource(binaryAddResource());
+  ResourceId rhs = graph.addResource(binaryAddResource());
+  graph.addMayAlias(lhs, rhs);
+  CoexistenceWitness witness;
+  witness.resources = {lhs, rhs};
+  witness.contractTrace = {"ttir-binary-add-v1"};
+  graph.addWitness(std::move(witness));
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeBinaryAddMaxTilesContract(
+      {.stageName = "materialize"}, 2, 65536, 32, 262144, 64));
+
+  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "materialize"})));
+  EXPECT_EQ(graph.resources()[lhs].minPayloadBytes, 4096);
+  EXPECT_EQ(graph.resources()[rhs].minPayloadBytes, 4096);
+  ASSERT_TRUE(graph.hasPairwiseDistinctWitness(0));
+  auto result = graph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->kind, "witness");
+  EXPECT_EQ(result->bytes, 8192);
+  EXPECT_EQ(result->contractTrace,
+            SmallVector<std::string>({"ttir-binary-add-v1",
+                                      "binary-add-max-tiles"}));
+}
+
+TEST(UBResourceContract, BinaryAddPreserveRequiresPriorDistinctProof) {
+  MandatoryUBResourceGraph graph;
+  ResourceId lhs = graph.addResource(binaryAddResource(4096));
+  ResourceId rhs = graph.addResource(binaryAddResource(4096));
+  graph.addMayAlias(lhs, rhs);
+  graph.addWitness({lhs, rhs});
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeBinaryAddPreserveContract(
+      {.stageName = "suffix"}, 2, 65536, 32, 4096));
+
+  ASSERT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "suffix"})));
+  EXPECT_EQ(graph.resources()[lhs].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[rhs].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[lhs].invalidReason, "binary-add-preserve");
 }
 
 TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
@@ -497,6 +614,56 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, DirectLoadOverflowIsRejected) {
   EXPECT_EQ(*result.capacityBytes, 192 * 1024);
   EXPECT_EQ(result.decision, TTIRUBDecision::Reject);
   EXPECT_TRUE(result.unsupportedReasons.empty());
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       BinaryAddUsesDistinctCoexistenceWitnessAfterMaterialization) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages = {{.stageName = "materialize"}};
+  PipelineContractRegistry binaryRegistry;
+  binaryRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(binaryRegistry.addProfileContract(
+      {.stage = analysisOptions.stages.front(),
+       .contractId = "binary-add-max-tiles",
+       .contractVersion = "1"},
+      makeBinaryAddMaxTilesContract(analysisOptions.stages.front(), 2, 65536,
+                                    32, 262144, 2))));
+  OwningOpRef<ModuleOp> module = parse(kBinaryAdd);
+  ASSERT_TRUE(module);
+
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, binaryRegistry);
+  EXPECT_EQ(result.lowerBoundBytes, 262144);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Reject);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "witness");
+  EXPECT_EQ(result.certificates[0].resourceIds,
+            SmallVector<ResourceId>({0, 1}));
+  EXPECT_EQ(result.certificates[0].contractTrace,
+            SmallVector<std::string>({"ttir-binary-add-v1",
+                                      "binary-add-max-tiles"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       BinaryAddWithoutDistinctContractCannotSumInputs) {
+  TTIRUBAnalysisResult result = analyze(kBinaryAdd, options());
+
+  EXPECT_EQ(result.lowerBoundBytes, 262144);
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "singleton");
+  EXPECT_EQ(result.certificates[0].resourceIds.size(), 1u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       BinaryAddRejectsOneLoadUsedForBothOperands) {
+  std::string source = replaceOnce(
+      kBinaryAdd, "%sum = arith.addf %lhs_value, %rhs_value",
+      "%sum = arith.addf %lhs_value, %lhs_value");
+
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-elementwise-dataflow"));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest, MaskedLoadDefersWithNamedReason) {
@@ -893,6 +1060,19 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraMatchedRegionDefersAsMalformedIR) {
   ASSERT_TRUE(module);
   triton::AddPtrOp addPtr = findOnlyOp<triton::AddPtrOp>(*module);
   replaceWithMalformedOperation(addPtr, addPtr->getResultTypes(), true);
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraAddFResultDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse(kBinaryAdd);
+  ASSERT_TRUE(module);
+  arith::AddFOp add = findOnlyOp<arith::AddFOp>(*module);
+  SmallVector<Type> resultTypes(add->getResultTypes());
+  resultTypes.push_back(add.getType());
+  replaceWithMalformedOperation(add, resultTypes);
 
   TTIRUBAnalysisResult result = analyzeModule(*module, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);

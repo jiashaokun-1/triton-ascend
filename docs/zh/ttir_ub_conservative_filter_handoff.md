@@ -457,7 +457,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - 只在完整、零违规且存在非空证书时生成 profile candidate；
 - oracle 使用 candidate-only analyzer 入口运行未安装的候选合同链，打破“空 profile 无法认证”的循环依赖；
 - oracle 从真实 `post-TileAndBindSubBlock` stage snapshot 检测 `get_sub_block_idx`，manifest 标签本身不算 outcome 证据；
-- 严格解析配对 before-CVPipelining snapshot 中唯一的静态 1-D local allocation，先验证合同下界不超过 materialization boundary；
+- 按 `operation_family` 严格解析配对 before-CVPipelining snapshot：direct-copy 必须有一个、binary-add 必须有两个静态 1-D local allocation；每个 allocation 都必须等于 materialization contract 推导的单资源 payload；
 - 只有 seeds `0..19`、retry 对该精确 TTIR identity 的实际 outcome 全部验证一致，且
   identity 唯一时才生成可安装 candidate；
 - 每个 seed 上语义重放与真实 suffix compiler 的 status、overflow scope、UB peak 和 capacity
@@ -477,8 +477,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 ### 10.4 当前验证结果
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
-- UB/策略/oracle 聚焦 Python 测试：276 项通过；
-- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：70 项通过；
+- UB/策略/oracle 聚焦 Python 测试：285 项通过；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：78 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
   `32768 bits`，逐次精确相等，且下界不超过两者；
@@ -493,9 +493,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 本次基线已执行：
 
-- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：276 项通过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：285 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
-- 普通 C++ GTest：70 项通过；
+- 普通 C++ GTest：78 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
   0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
@@ -529,10 +529,16 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - production/candidate analyzer API 分离，未认证 active contract 不能由生产入口装载；
 - canonical TTIR 全文 SHA256 已进入 pipeline identity；
 - 参数化 `direct-copy-preserve@1` / `direct-copy-max-tiles@1` 候选合同及严格 source-fact 校验；
+- 严格的 `load(lhs) + load(rhs) -> arith.addf -> store` matcher，以及两条 GM→UB resource、
+  mayAlias、CoexistenceWitness 和逐资源 lifetime facts；
+- 参数化 `binary-add-preserve@1` / `binary-add-max-tiles@1` 候选合同；只有物化阶段验证
+  source facts 后才能把同一 witness 内的 mayAlias 精化为 mustDistinct；
+- witness solver 只允许对同一 CoexistenceWitness 且 pairwise mustDistinct 的资源求和；
 - oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
 - oracle 已接入 `cvpipeline_ub_model_cpp` exact semantic replay；promotion 要求 replay 与真实
   PlanMemory 逐 seed 一致，并把 semantic model SHA256 写入 profile；
-- oracle promotion 要求 singleton certificate 的 bytes/resource ID 合法，且
+- oracle promotion 按 operation family 要求 singleton 或双资源 witness certificate 的
+  bytes/resource ID 合法，且
   `contract_trace` 精确等于 source matcher 与 ordered candidate contracts；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
@@ -579,6 +585,15 @@ Preserve/Transform 合同。因此：
 6. 每个合同分别准备正向 fixture 和 defer fixture。
 
 任何阶段无法证明时，整份证书失效并 defer。
+
+### P2：双输入 elementwise 与 alias/coexistence
+
+第一条 binary-add 本地可执行切片已经完成，但尚未生产认证。下一步需要在目标 CANN
+环境从同一次真实编译保存 canonical TTIR 与 before-CVPipelining snapshot，确认边界上存在
+两个与合同 payload 一致的独立 local allocations，再运行 analyzer、semantic replay 和真实
+suffix compiler 的 seeds `0..19` + retry 联合门禁。验证完成前不得把 binary-add candidate
+写入 packaged profile。之后再扩展 view/reshape/broadcast 和可复用的 InPlaceAlias/Lifetime
+contracts。
 
 ### P1：扩大真实 oracle corpus
 

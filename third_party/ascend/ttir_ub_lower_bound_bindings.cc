@@ -136,18 +136,23 @@ makeProfileContract(const PipelineContractBinding &binding) {
       binding.contractVersion == "1" && binding.parameters.empty())
     return makeInvalidateContract(binding.stage);
 
-  constexpr std::array<StringRef, 4> directCopyParameters = {
+  constexpr std::array<StringRef, 4> resourceParameters = {
       "expected_resource_count", "expected_source_elements",
       "expected_element_bit_width", "expected_input_payload_bytes"};
   const bool preserve = binding.contractId == "direct-copy-preserve" &&
                         binding.contractVersion == "1";
   const bool transform = binding.contractId == "direct-copy-max-tiles" &&
                          binding.contractVersion == "1";
-  SmallVector<StringRef> expectedNames(directCopyParameters.begin(),
-                                       directCopyParameters.end());
-  if (transform)
+  const bool binaryPreserve = binding.contractId == "binary-add-preserve" &&
+                              binding.contractVersion == "1";
+  const bool binaryTransform =
+      binding.contractId == "binary-add-max-tiles" &&
+      binding.contractVersion == "1";
+  SmallVector<StringRef> expectedNames(resourceParameters.begin(),
+                                       resourceParameters.end());
+  if (transform || binaryTransform)
     expectedNames.push_back("max_tiles");
-  if ((!preserve && !transform) ||
+  if ((!preserve && !transform && !binaryPreserve && !binaryTransform) ||
       !hasExactParameters(binding, expectedNames))
     return nullptr;
 
@@ -167,10 +172,18 @@ makeProfileContract(const PipelineContractBinding &binding) {
     return makeDirectCopyPreserveContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload);
+  if (binaryPreserve)
+    return makeBinaryAddPreserveContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload);
 
   auto maxTiles = getPositiveInt64Parameter(binding, "max_tiles");
   if (!maxTiles)
     return nullptr;
+  if (binaryTransform)
+    return makeBinaryAddMaxTilesContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
   return makeDirectCopyMaxTilesContract(
       binding.stage, *resourceCount, *sourceElements,
       static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
@@ -266,7 +279,9 @@ bool loadMatchingProfile(const py::handle &value,
   const bool containsActiveContract = llvm::any_of(
       *matchedBindings, [](const PipelineContractBinding &binding) {
         return binding.contractId == "direct-copy-preserve" ||
-               binding.contractId == "direct-copy-max-tiles";
+               binding.contractId == "direct-copy-max-tiles" ||
+               binding.contractId == "binary-add-preserve" ||
+               binding.contractId == "binary-add-max-tiles";
       });
   if (containsActiveContract && !allowUncertifiedActiveContracts &&
       !matchedProfileIsCertified)

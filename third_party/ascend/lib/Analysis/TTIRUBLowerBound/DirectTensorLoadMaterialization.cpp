@@ -3,6 +3,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include <climits>
@@ -169,7 +170,7 @@ LogicalResult rejectUnsupportedOperations(
       return WalkResult::interrupt();
     }
     if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp,
-            triton::LoadOp, triton::StoreOp>(operation)) {
+            triton::LoadOp, triton::StoreOp, arith::AddFOp>(operation)) {
       triton::FuncOp function = operation->getParentOfType<triton::FuncOp>();
       if (matched.contains(operation) && function &&
           isDirectlyInEntryBlock(operation, function) &&
@@ -272,6 +273,7 @@ LogicalResult materializeLoad(triton::LoadOp load,
   resource.kind = MaterializationKind::GMToUBLoad;
   resource.sourceElements = resultType.getNumElements();
   resource.elementBitWidth = resultType.getElementType().getIntOrFloatBitWidth();
+  resource.consumer = "tt.store";
   resource.contractTrace.push_back("ttir-direct-load-v1");
   if (graph.addResource(std::move(resource)) == InvalidResourceId)
     return defer(reasons, "malformed-resource-graph");
@@ -282,6 +284,134 @@ LogicalResult materializeLoad(triton::LoadOp load,
   matched.insert(destinationChain->splat);
   matched.insert(destinationChain->addPtr);
   matched.insert(load);
+  matched.insert(store);
+  return success();
+}
+
+FailureOr<ContiguousPointerChain> matchBinaryInputLoad(
+    triton::LoadOp load, arith::AddFOp add, triton::FuncOp function,
+    RankedTensorType resultType, SmallVectorImpl<std::string> &reasons) {
+  if (!isDirectlyInEntryBlock(load, function) ||
+      load->getNumOperands() != 1 || load->getNumResults() != 1 ||
+      load->getNumRegions() != 0 || load->getNumSuccessors() != 0)
+    return defer(reasons, "unsupported-elementwise-load");
+  if (load.getOther() || !load.getBoundaryCheck().empty() ||
+      load.getPadding() || load.getIsVolatile() ||
+      load.getCache() != triton::CacheModifier::NONE ||
+      load.getEvict() != triton::EvictionPolicy::NORMAL)
+    return defer(reasons, "unsupported-load-semantics");
+  if (load.getType() != resultType || !load.getResult().hasOneUse() ||
+      *load.getResult().getUsers().begin() != add.getOperation() ||
+      !load->isBeforeInBlock(add))
+    return defer(reasons, "unsupported-elementwise-dataflow");
+
+  FailureOr<ContiguousPointerChain> chain = matchContiguousPointer(
+      load.getPtr(), function, resultType.getNumElements(),
+      resultType.getElementType(), reasons);
+  if (failed(chain))
+    return failure();
+  if (!chain->addPtr.getResult().hasOneUse() ||
+      !chain->addPtr->isBeforeInBlock(load))
+    return defer(reasons, "load-pointer-has-extra-use");
+  return chain;
+}
+
+LogicalResult materializeBinaryAdd(
+    ArrayRef<triton::LoadOp> loads, arith::AddFOp add,
+    MandatoryUBResourceGraph &graph, llvm::DenseSet<Operation *> &matched,
+    SmallVectorImpl<std::string> &reasons) {
+  if (loads.size() != 2 || !add || add->getNumOperands() != 2 ||
+      add->getNumResults() != 1 || add->getNumRegions() != 0 ||
+      add->getNumSuccessors() != 0 ||
+      add.getFastmath() != arith::FastMathFlags::none)
+    return defer(reasons, "unsupported-elementwise-op");
+  triton::FuncOp function = add->getParentOfType<triton::FuncOp>();
+  if (!function || !isDirectlyInEntryBlock(add, function))
+    return defer(reasons, "nested-region");
+  auto resultType = dyn_cast<RankedTensorType>(add.getType());
+  if (!resultType || add.getLhs().getType() != resultType ||
+      add.getRhs().getType() != resultType)
+    return defer(reasons, "unsupported-elementwise-shape");
+  FailureOr<int64_t> payloadBytes = getPayloadBytes(resultType, reasons);
+  if (failed(payloadBytes))
+    return failure();
+
+  auto lhsLoad = add.getLhs().getDefiningOp<triton::LoadOp>();
+  auto rhsLoad = add.getRhs().getDefiningOp<triton::LoadOp>();
+  if (!lhsLoad || !rhsLoad || lhsLoad == rhsLoad ||
+      !llvm::is_contained(loads, lhsLoad) ||
+      !llvm::is_contained(loads, rhsLoad))
+    return defer(reasons, "unsupported-elementwise-dataflow");
+  FailureOr<ContiguousPointerChain> lhsChain = matchBinaryInputLoad(
+      lhsLoad, add, function, resultType, reasons);
+  FailureOr<ContiguousPointerChain> rhsChain = matchBinaryInputLoad(
+      rhsLoad, add, function, resultType, reasons);
+  if (failed(lhsChain) || failed(rhsChain))
+    return failure();
+
+  if (!add.getResult().hasOneUse())
+    return defer(reasons, "unsupported-elementwise-dataflow");
+  auto store = dyn_cast<triton::StoreOp>(*add.getResult().getUsers().begin());
+  if (!store || store->getNumOperands() != 2 || store->getNumResults() != 0 ||
+      store->getNumRegions() != 0 || store->getNumSuccessors() != 0 ||
+      store.getValue() != add.getResult() ||
+      !isDirectlyInEntryBlock(store, function) ||
+      !add->isBeforeInBlock(store) || !store.getBoundaryCheck().empty() ||
+      store.getCache() != triton::CacheModifier::NONE ||
+      store.getEvict() != triton::EvictionPolicy::NORMAL)
+    return defer(reasons, "unsupported-elementwise-store");
+  FailureOr<ContiguousPointerChain> destinationChain = matchContiguousPointer(
+      store.getPtr(), function, resultType.getNumElements(),
+      resultType.getElementType(), reasons);
+  if (failed(destinationChain))
+    return failure();
+  if (!destinationChain->addPtr.getResult().hasOneUse() ||
+      !destinationChain->addPtr->isBeforeInBlock(store) ||
+      lhsChain->range != rhsChain->range ||
+      lhsChain->range != destinationChain->range ||
+      std::distance(lhsChain->range.getResult().use_begin(),
+                    lhsChain->range.getResult().use_end()) != 3)
+    return defer(reasons, "non-contiguous-pointer");
+
+  const uint64_t addOrdinal =
+      std::distance(function.getBody().front().begin(), add->getIterator());
+  SmallVector<ResourceId> resourceIds;
+  for (triton::LoadOp load : {lhsLoad, rhsLoad}) {
+    MandatoryUBResource resource;
+    resource.debugName = "binary-add-input";
+    resource.minPayloadBytes = *payloadBytes;
+    resource.minInstances = 1;
+    resource.origin = "tt.load";
+    resource.kind = MaterializationKind::GMToUBLoad;
+    resource.birth.ordinal =
+        std::distance(function.getBody().front().begin(), load->getIterator());
+    resource.lastRequiredUse.ordinal = addOrdinal;
+    resource.sourceElements = resultType.getNumElements();
+    resource.elementBitWidth =
+        resultType.getElementType().getIntOrFloatBitWidth();
+    resource.consumer = "arith.addf";
+    resource.contractTrace.push_back("ttir-binary-add-v1");
+    ResourceId id = graph.addResource(std::move(resource));
+    if (id == InvalidResourceId)
+      return defer(reasons, "malformed-resource-graph");
+    resourceIds.push_back(id);
+  }
+  graph.addMayAlias(resourceIds[0], resourceIds[1]);
+  CoexistenceWitness witness;
+  witness.resources = resourceIds;
+  witness.contractTrace.push_back("ttir-binary-add-v1");
+  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
+    return defer(reasons, "malformed-resource-graph");
+
+  matched.insert(lhsChain->range);
+  for (const ContiguousPointerChain &chain :
+       {*lhsChain, *rhsChain, *destinationChain}) {
+    matched.insert(chain.splat);
+    matched.insert(chain.addPtr);
+  }
+  matched.insert(lhsLoad);
+  matched.insert(rhsLoad);
+  matched.insert(add);
   matched.insert(store);
   return success();
 }
@@ -315,9 +445,18 @@ LogicalResult materializeDirectTensorLoads(
     return defer(unsupportedReasons, "no-mandatory-load");
 
   llvm::DenseSet<Operation *> matched;
-  for (triton::LoadOp load : loads) {
-    if (failed(materializeLoad(load, graph, matched, unsupportedReasons)))
+  SmallVector<arith::AddFOp> adds;
+  module.walk([&](arith::AddFOp add) { adds.push_back(add); });
+  if (!adds.empty()) {
+    if (adds.size() != 1 ||
+        failed(materializeBinaryAdd(loads, adds.front(), graph, matched,
+                                    unsupportedReasons)))
       return failure();
+  } else {
+    for (triton::LoadOp load : loads) {
+      if (failed(materializeLoad(load, graph, matched, unsupportedReasons)))
+        return failure();
+    }
   }
   for (BlockArgument argument :
        functions.front().getBody().front().getArguments()) {

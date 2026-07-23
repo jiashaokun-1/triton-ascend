@@ -49,6 +49,7 @@ struct MandatoryUBResource {
   std::string invalidReason;
   int64_t sourceElements = -1;
   unsigned elementBitWidth = 0;
+  std::string consumer;
 };
 
 struct CoexistenceWitness {
@@ -83,9 +84,14 @@ public:
   LogicalResult lowerResourcePayload(ResourceId id, int64_t minPayloadBytes,
                                      StringRef contractId);
   LogicalResult appendResourceTrace(ResourceId id, StringRef contractId);
+  LogicalResult refineWitnessToMustDistinct(WitnessId id,
+                                            StringRef contractId);
+  bool hasPairwiseMayAliasWitness(WitnessId id) const;
+  bool hasPairwiseDistinctWitness(WitnessId id) const;
   FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;
   FailureOr<LowerBoundCertificate> solveWitnessLowerBound() const;
   ArrayRef<MandatoryUBResource> resources() const;
+  ArrayRef<CoexistenceWitness> witnesses() const;
 
 private:
   using ResourcePair = std::pair<ResourceId, ResourceId>;

@@ -5,6 +5,7 @@ add_triton_library(TTIRUBLowerBound
   UBResourceContract.cpp
 
   LINK_LIBS PUBLIC
+  MLIRArithDialect
   MLIRIR
   MLIRSupport
   TritonIR

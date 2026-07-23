@@ -3,6 +3,7 @@
   "cases": [
     {
       "name": "direct-copy-f32-65536-a2",
+      "operation_family": "direct-copy",
       "ttir": "direct_copy.ttir.mlir",
       "before_cvpipelining": "direct_copy.before_cvpipelining.mlir",
       "arch": "Ascend910B",

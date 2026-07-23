@@ -94,6 +94,14 @@ std::unique_ptr<UBResourceContract> makeDirectCopyMaxTilesContract(
     const PipelineStageContext &stage, int64_t expectedResourceCount,
     int64_t expectedSourceElements, unsigned expectedElementBitWidth,
     int64_t expectedInputPayloadBytes, int64_t maxTiles);
+std::unique_ptr<UBResourceContract> makeBinaryAddPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes);
+std::unique_ptr<UBResourceContract> makeBinaryAddMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t maxTiles);
 
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch);
 

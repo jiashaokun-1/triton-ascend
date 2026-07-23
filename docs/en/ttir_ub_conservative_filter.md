@@ -88,6 +88,7 @@ Run the comparison with:
 python third_party/ascend/tools/ttir_ub_oracle.py \
   --manifest third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json \
   --suffix-compiler /path/to/bishengir-cvpipeline-suffix-compile \
+  --semantic-model /path/to/cvpipeline_ub_model \
   --seeds 0-19 --check-retry \
   --report /tmp/ttir-ub-oracle-report.json \
   --profile-candidate /tmp/ttir-ub-profile-candidate.json

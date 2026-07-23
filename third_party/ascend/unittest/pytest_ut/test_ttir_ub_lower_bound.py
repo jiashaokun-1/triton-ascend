@@ -56,6 +56,25 @@ module {
 }
 """
 
+BINARY_ADD = """
+module {
+  tt.func public @add(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %lhs_splat = tt.splat %lhs : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %lhs_ptrs = tt.addptr %lhs_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %rhs_splat = tt.splat %rhs : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %rhs_ptrs = tt.addptr %rhs_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dst_splat = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dst_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %lhs_value = tt.load %lhs_ptrs : tensor<65536x!tt.ptr<f32>>
+    %rhs_value = tt.load %rhs_ptrs : tensor<65536x!tt.ptr<f32>>
+    %sum = arith.addf %lhs_value, %rhs_value : tensor<65536xf32>
+    tt.store %dst_ptrs, %sum : tensor<65536x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 INT64_MAX = (1 << 63) - 1
 UINT32_MAX = (1 << 32) - 1
 
@@ -1148,6 +1167,22 @@ def test_capacity_boundary_is_not_rejected(monkeypatch):
     assert metadata["ub_lower_bound_bytes"] == metadata["ub_capacity_bytes"]
 
 
+def test_witness_certificate_is_preserved_by_policy_validation(monkeypatch):
+    result = _analysis_result()
+    result["certificates"][0].update({
+        "kind": "witness",
+        "resource_ids": [0, 1],
+        "contract_trace": ["ttir-binary-add-v1", "binary-add-max-tiles"],
+    })
+    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_args: result)
+    metadata = {}
+
+    with pytest.raises(UBLowerBoundOverflow) as raised:
+        apply_ub_lower_bound_policy(object(), metadata, Options("enforce"), "test-id")
+    assert raised.value.certificate["kind"] == "witness"
+    assert raised.value.certificate["resource_ids"] == [0, 1]
+
+
 def test_overflow_exception_pickles_across_process_pool():
     error = UBLowerBoundOverflow(262144, 196608, {"kind": "singleton"}, "test-id")
     with ProcessPoolExecutor(max_workers=1) as executor:
@@ -1292,6 +1327,22 @@ def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_pa
         "schema": "ttir-ub-lb-profile-v1",
         "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
         "profiles": [_direct_copy_profile_entry()],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
+def test_profile_loader_accepts_certified_binary_add_schema(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] = "binary-add-max-tiles"
+    stage["contract_parameters"]["expected_resource_count"] = "2"
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
     }
     profile_path.write_text(json.dumps(document))
     monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
@@ -1609,6 +1660,74 @@ def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):
     certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
     assert certified_result["lower_bound_bytes"] == 4096
     assert certified_result["unsupported_reasons"] == []
+
+
+def test_binding_runs_binary_add_witness_contract(tmp_path):
+    source = tmp_path / "binary-add.ttir"
+    source.write_text(BINARY_ADD)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p2-binary-add-test",
+        "canonical_ttir_sha256": hashlib.sha256(BINARY_ADD.encode()).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p2-binary-add-test-identity",
+    }
+    stages = [{"stage_name": "ttir.triton-to-linalg", "options": {}}]
+    profile_entry = {
+        "pipeline_identity": identity,
+        "pipeline_stages": [{
+            **stages[0],
+            "contract_id": "binary-add-max-tiles",
+            "contract_version": "1",
+            "contract_parameters": {
+                "expected_resource_count": "2",
+                "expected_source_elements": "65536",
+                "expected_element_bit_width": "32",
+                "expected_input_payload_bytes": "262144",
+                "max_tiles": "64",
+            },
+        }],
+    }
+    profile = {"schema": "ttir-ub-lb-profile-v1", "profiles": [profile_entry]}
+    raw_options = {
+        "arch": "Ascend910B",
+        "compile_mode": "aiv",
+        "pipeline_identity": identity,
+        "pipeline_stages": stages,
+        "contract_profile": profile,
+    }
+
+    production_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
+    assert production_result["lower_bound_bytes"] == 0
+    assert production_result["unsupported_reasons"] == ["unknown-pipeline-profile"]
+
+    candidate_result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module, raw_options)
+    assert candidate_result["lower_bound_bytes"] == 8192
+    assert candidate_result["unsupported_reasons"] == []
+    assert candidate_result["certificates"] == [{
+        "kind": "witness",
+        "bytes": 8192,
+        "resource_ids": [0, 1],
+        "contract_trace": ["ttir-binary-add-v1", "binary-add-max-tiles"],
+    }]
+
+    profile_entry.update({
+        "contract_version": "ttir-ub-lb-v1",
+        "oracle_report_sha256": "a" * 64,
+        "semantic_model_sha256": "b" * 64,
+        "validated_seeds": list(range(20)),
+        "retry_validated": True,
+        "auto_tile_and_bind_subblock_outcome": False,
+    })
+    certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
+    assert certified_result["lower_bound_bytes"] == 8192
+    assert certified_result["certificates"] == candidate_result["certificates"]
 
 
 def test_binding_direct_copy_contract_defers_on_parameter_drift(tmp_path):

@@ -111,6 +111,10 @@ def _is_valid_profile_stage(stage):
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
     if contract_id == "direct-copy-max-tiles":
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
+    if contract_id == "binary-add-preserve":
+        return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
+    if contract_id == "binary-add-max-tiles":
+        return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
     return False
 
 
@@ -194,7 +198,7 @@ def _is_valid_profile_entry(entry):
         return False
     if not all(_is_valid_profile_stage(stage) for stage in stages):
         return False
-    if any(stage["contract_id"].startswith("direct-copy-") for stage in stages):
+    if any(stage["contract_id"].startswith(("direct-copy-", "binary-add-")) for stage in stages):
         if relevant_options.get("compile_mode") != "simd" or relevant_options.get("multibuffer") is not False:
             return False
     if entry["contract_version"] != _CONTRACT_VERSION:
@@ -258,15 +262,20 @@ def _is_int64(value):
 def _normalize_certificate(certificate, lower_bound_bytes):
     if type(certificate) is not dict or set(certificate) != _CERTIFICATE_KEYS:
         return None
-    if type(certificate.get("kind")) is not str or certificate["kind"] != "singleton":
+    kind = certificate.get("kind")
+    if type(kind) is not str or kind not in ("singleton", "witness"):
         return None
     if not _is_int64(certificate.get("bytes")) or certificate["bytes"] != lower_bound_bytes:
         return None
     resource_ids = certificate.get("resource_ids")
-    if type(resource_ids) is not list or len(resource_ids) != 1:
+    expected_count = 1 if kind == "singleton" else None
+    if (type(resource_ids) is not list
+            or (expected_count is not None and len(resource_ids) != expected_count)
+            or (kind == "witness" and len(resource_ids) < 2)):
         return None
-    resource_id = resource_ids[0]
-    if type(resource_id) is not int or not 0 <= resource_id < _INVALID_RESOURCE_ID:
+    if (any(type(resource_id) is not int or not 0 <= resource_id < _INVALID_RESOURCE_ID
+            for resource_id in resource_ids)
+            or len(resource_ids) != len(set(resource_ids))):
         return None
     contract_trace = certificate.get("contract_trace")
     if (type(contract_trace) is not list or not contract_trace

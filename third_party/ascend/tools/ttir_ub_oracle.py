@@ -20,6 +20,7 @@ UB_SCOPE = "6"
 _MANIFEST_KEYS = frozenset({"schema", "cases"})
 _CASE_KEYS = frozenset({
     "name",
+    "operation_family",
     "ttir",
     "before_cvpipelining",
     "arch",
@@ -27,6 +28,20 @@ _CASE_KEYS = frozenset({
     "expected_analyzer_decision",
     "contract_proposal",
 })
+_OPERATION_FAMILIES = {
+    "direct-copy": {
+        "matcher_trace": "ttir-direct-load-v1",
+        "certificate_kind": "singleton",
+        "resource_count": 1,
+        "contract_prefix": "direct-copy",
+    },
+    "binary-add": {
+        "matcher_trace": "ttir-binary-add-v1",
+        "certificate_kind": "witness",
+        "resource_count": 2,
+        "contract_prefix": "binary-add",
+    },
+}
 _CONTRACT_PROPOSAL_KEYS = frozenset({
     "expected_resource_count",
     "expected_source_elements",
@@ -123,22 +138,32 @@ def detect_auto_tile_outcome(input_ir: str, after_tile_ir: str) -> bool:
     return _SUB_BLOCK_INDEX_OP in after_tile_ir
 
 
-def parse_direct_copy_boundary_allocation_bytes(text: str) -> int:
-    """Extract the one local static allocation admitted by the P1 fixture."""
-    if text.count('"memref.alloc"') != 1:
-        raise OracleUnavailable("direct-copy boundary must contain exactly one memref.alloc")
+def parse_boundary_allocation_bytes(text: str) -> list[int]:
+    """Extract every supported local static allocation at the CVPipeline boundary."""
     matches = _STATIC_ALLOC_RE.findall(text)
-    if len(matches) != 1:
-        raise OracleUnavailable("direct-copy boundary allocation is not a supported static 1-D memref")
-    elements_text, element_type = matches[0]
-    bit_width = 16 if element_type == "bf16" else int(re.search(r"\d+", element_type).group())
-    elements = int(elements_text)
-    if elements <= 0 or bit_width < 8 or bit_width % 8 != 0:
-        raise OracleUnavailable("direct-copy boundary allocation has an unsupported element type")
-    allocation_bytes = elements * (bit_width // 8)
-    if allocation_bytes > (1 << 63) - 1:
-        raise OracleUnavailable("direct-copy boundary allocation overflows int64")
-    return allocation_bytes
+    if not matches or len(matches) != text.count('"memref.alloc"'):
+        raise OracleUnavailable(
+            "boundary allocations must all be supported static 1-D memrefs"
+        )
+    allocations = []
+    for elements_text, element_type in matches:
+        bit_width = 16 if element_type == "bf16" else int(re.search(r"\d+", element_type).group())
+        elements = int(elements_text)
+        if elements <= 0 or bit_width < 8 or bit_width % 8 != 0:
+            raise OracleUnavailable("boundary allocation has an unsupported element type")
+        allocation_bytes = elements * (bit_width // 8)
+        if allocation_bytes > (1 << 63) - 1:
+            raise OracleUnavailable("boundary allocation overflows int64")
+        allocations.append(allocation_bytes)
+    return allocations
+
+
+def parse_direct_copy_boundary_allocation_bytes(text: str) -> int:
+    """Compatibility helper for the one-resource direct-copy fixture."""
+    allocations = parse_boundary_allocation_bytes(text)
+    if len(allocations) != 1:
+        raise OracleUnavailable("direct-copy boundary must contain exactly one memref.alloc")
+    return allocations[0]
 
 
 def classify_failure(text: str, attempt: int = 0) -> dict:
@@ -212,12 +237,15 @@ def load_manifest(path: Path) -> dict:
         if type(item["name"]) is not str or not item["name"] or item["name"] in names:
             raise ManifestError("case names must be unique non-empty strings")
         names.add(item["name"])
+        family = item["operation_family"]
+        if family not in _OPERATION_FAMILIES:
+            raise ManifestError("operation_family must be direct-copy or binary-add")
         if type(item["arch"]) is not str or not item["arch"]:
             raise ManifestError("arch must be a non-empty string")
         if type(item["options"]) is not dict:
             raise ManifestError("options must be an object")
         if item["options"].get("compile_mode") != "simd" or item["options"].get("multibuffer") is not False:
-            raise ManifestError("P1 direct-copy cases require compile_mode=simd and multibuffer=false")
+            raise ManifestError("UB oracle cases require compile_mode=simd and multibuffer=false")
         if item["expected_analyzer_decision"] not in ("defer", "reject"):
             raise ManifestError("expected_analyzer_decision must be defer or reject")
         proposal = item["contract_proposal"]
@@ -236,6 +264,10 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError("contract_proposal.materialization_stage must be non-empty")
         if type(proposal["auto_tile_and_bind_subblock_outcome"]) is not bool:
             raise ManifestError("contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean")
+        if proposal["expected_resource_count"] != _OPERATION_FAMILIES[family]["resource_count"]:
+            raise ManifestError(
+                "contract_proposal.expected_resource_count disagrees with operation_family"
+            )
         case = dict(item)
         case["ttir"] = _fixture_path(root, item["ttir"], "ttir")
         case["before_cvpipelining"] = _fixture_path(
@@ -245,8 +277,14 @@ def load_manifest(path: Path) -> dict:
     return {"schema": raw["schema"], "cases": cases}
 
 
-def build_proposed_contract_profile(identity: dict, pipeline_stages: list[dict], proposal: dict) -> dict:
+def build_proposed_contract_profile(
+    identity: dict, pipeline_stages: list[dict], proposal: dict,
+    operation_family: str = "direct-copy",
+) -> dict:
     """Build an uninstalled, reviewable contract chain for oracle evaluation."""
+    family = _OPERATION_FAMILIES.get(operation_family)
+    if family is None:
+        raise OracleUnavailable(f"unsupported operation family: {operation_family}")
     materialization_stage = proposal["materialization_stage"]
     if sum(stage["stage_name"] == materialization_stage for stage in pipeline_stages) != 1:
         raise OracleUnavailable("materialization stage must occur exactly once in the real pipeline")
@@ -265,9 +303,9 @@ def build_proposed_contract_profile(identity: dict, pipeline_stages: list[dict],
             **common,
             "expected_input_payload_bytes": str(output_payload if materialized else input_payload),
         }
-        contract_id = "direct-copy-preserve"
+        contract_id = f"{family['contract_prefix']}-preserve"
         if is_materialization:
-            contract_id = "direct-copy-max-tiles"
+            contract_id = f"{family['contract_prefix']}-max-tiles"
             parameters["max_tiles"] = str(proposal["max_tiles"])
             materialized = True
         bindings.append({
@@ -285,8 +323,11 @@ def build_proposed_contract_profile(identity: dict, pipeline_stages: list[dict],
     }
 
 
-def expected_direct_copy_contract_trace(analysis: dict) -> list[str]:
+def expected_contract_trace(analysis: dict) -> list[str]:
     """Return the exact matcher + ordered stage chain required for promotion."""
+    family = _OPERATION_FAMILIES.get(analysis.get("operation_family"))
+    if family is None:
+        raise OracleUnavailable("analyzer omitted a supported operation family")
     stages = analysis.get("pipeline_stages_detail")
     if type(stages) is not list or not stages:
         raise OracleUnavailable("analyzer omitted the proposed pipeline contract stages")
@@ -298,11 +339,14 @@ def expected_direct_copy_contract_trace(analysis: dict) -> list[str]:
         if type(contract_id) is not str or not contract_id:
             raise OracleUnavailable("analyzer returned an invalid stage contract id")
         contract_ids.append(contract_id)
-    return ["ttir-direct-load-v1", *contract_ids]
+    return [family["matcher_trace"], *contract_ids]
 
 
-def has_valid_direct_copy_certificate(analysis: dict) -> bool:
+def has_valid_certificate(analysis: dict) -> bool:
     """Require the certificate to be produced by this exact candidate chain."""
+    family = _OPERATION_FAMILIES.get(analysis.get("operation_family"))
+    if family is None:
+        return False
     lower_bound = analysis.get("lower_bound_bytes")
     certificates = analysis.get("certificates")
     if type(lower_bound) is not int or lower_bound <= 0:
@@ -314,18 +358,60 @@ def has_valid_direct_copy_certificate(analysis: dict) -> bool:
         return False
     resource_ids = certificate.get("resource_ids")
     try:
-        expected_trace = expected_direct_copy_contract_trace(analysis)
+        expected_trace = expected_contract_trace(analysis)
     except OracleUnavailable:
         return False
     return (
-        certificate.get("kind") == "singleton"
+        certificate.get("kind") == family["certificate_kind"]
         and certificate.get("bytes") == lower_bound
         and type(resource_ids) is list
-        and len(resource_ids) == 1
-        and type(resource_ids[0]) is int
-        and resource_ids[0] >= 0
+        and len(resource_ids) == family["resource_count"]
+        and all(type(resource_id) is int and resource_id >= 0 for resource_id in resource_ids)
+        and len(set(resource_ids)) == len(resource_ids)
         and certificate.get("contract_trace") == expected_trace
     )
+
+
+def has_valid_direct_copy_certificate(analysis: dict) -> bool:
+    """Compatibility wrapper retained for callers of the P1 oracle helper."""
+    return analysis.get("operation_family", "direct-copy") == "direct-copy" and has_valid_certificate({
+        **analysis, "operation_family": "direct-copy",
+    })
+
+
+def has_valid_materialization_bridge(analysis: dict) -> bool:
+    """Tie each MURG resource to one exact before-CVPipelining allocation."""
+    family = _OPERATION_FAMILIES.get(analysis.get("operation_family"))
+    allocations = analysis.get("before_cvpipelining_allocations_bytes")
+    total = analysis.get("before_cvpipelining_allocation_bytes")
+    lower_bound = analysis.get("lower_bound_bytes")
+    stages = analysis.get("pipeline_stages_detail")
+    if (family is None or type(allocations) is not list
+            or len(allocations) != family["resource_count"]
+            or not all(type(value) is int and value > 0 for value in allocations)
+            or type(total) is not int or total != sum(allocations)
+            or type(lower_bound) is not int or lower_bound > total
+            or type(stages) is not list):
+        return False
+    materialization_id = f"{family['contract_prefix']}-max-tiles"
+    materialization_stages = [
+        stage for stage in stages
+        if type(stage) is dict and stage.get("contract_id") == materialization_id
+    ]
+    if len(materialization_stages) != 1:
+        return False
+    parameters = materialization_stages[0].get("contract_parameters")
+    if type(parameters) is not dict:
+        return False
+    try:
+        input_payload = int(parameters["expected_input_payload_bytes"])
+        max_tiles = int(parameters["max_tiles"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if input_payload <= 0 or max_tiles <= 0:
+        return False
+    expected = (input_payload + max_tiles - 1) // max_tiles
+    return all(value == expected for value in allocations)
 
 
 def run_suffix_compiler(compiler: Path, input_path: Path, seed: int, timeout: float = 120.0) -> dict:
@@ -492,7 +578,9 @@ def analyze_case(case: dict) -> dict:
         identity = ascend_compiler._ttir_ub_pipeline_identity(
             pipeline.get_pipeline_str(), metadata, str(module)
         )
-        profile = build_proposed_contract_profile(identity, pipeline_stages, case["contract_proposal"])
+        profile = build_proposed_contract_profile(
+            identity, pipeline_stages, case["contract_proposal"], case["operation_family"]
+        )
         result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
             module,
             {
@@ -508,6 +596,7 @@ def analyze_case(case: dict) -> dict:
     if type(result) is not dict or result.get("decision") not in ("defer", "reject"):
         raise OracleUnavailable("analyzer returned an unsupported result")
     result = dict(result)
+    result["operation_family"] = case["operation_family"]
     result["pipeline_identity_detail"] = identity
     result["pipeline_stages_detail"] = profile["profiles"][0]["pipeline_stages"]
     result["auto_tile_and_bind_subblock_outcome"] = \
@@ -516,8 +605,19 @@ def analyze_case(case: dict) -> dict:
         boundary_ir = case["before_cvpipelining"].read_text(encoding="utf-8")
     except OSError as error:
         raise OracleUnavailable(f"cannot read before-CVPipelining fixture: {error}") from error
-    result["before_cvpipelining_allocation_bytes"] = \
-        parse_direct_copy_boundary_allocation_bytes(boundary_ir)
+    allocations = parse_boundary_allocation_bytes(boundary_ir)
+    proposal = case["contract_proposal"]
+    expected_resource_count = proposal["expected_resource_count"]
+    expected_allocation_bytes = (
+        proposal["expected_input_payload_bytes"] + proposal["max_tiles"] - 1
+    ) // proposal["max_tiles"]
+    if (len(allocations) != expected_resource_count
+            or any(value != expected_allocation_bytes for value in allocations)):
+        raise OracleUnavailable(
+            "before-CVPipelining allocations do not match the proposed materialized resources"
+        )
+    result["before_cvpipelining_allocations_bytes"] = allocations
+    result["before_cvpipelining_allocation_bytes"] = sum(allocations)
     result["ttir_fixture_sha256"] = file_sha256(case["ttir"])
     result["before_cvpipelining_sha256"] = file_sha256(case["before_cvpipelining"])
     return result
@@ -560,13 +660,17 @@ def evaluate(
             boundary_bytes = analysis.get("before_cvpipelining_allocation_bytes")
             if type(boundary_bytes) is not int or boundary_bytes <= 0:
                 raise OracleUnavailable("analyzer omitted the before-CVPipelining allocation")
+            if not has_valid_materialization_bridge(analysis):
+                report["violations"].append({
+                    "case": case["name"], "kind": "invalid-materialization-bridge",
+                })
             if analysis.get("lower_bound_bytes", 0) > boundary_bytes:
                 report["violations"].append({
                     "case": case["name"], "kind": "lower-bound-exceeds-before-cvpipelining-allocation",
                     "lower_bound_bytes": analysis.get("lower_bound_bytes", 0),
                     "allocation_bytes": boundary_bytes,
                 })
-            if analysis.get("lower_bound_bytes", 0) > 0 and not has_valid_direct_copy_certificate(analysis):
+            if analysis.get("lower_bound_bytes", 0) > 0 and not has_valid_certificate(analysis):
                 report["violations"].append({
                     "case": case["name"], "kind": "invalid-certificate-contract-trace",
                 })
@@ -676,11 +780,10 @@ def build_profile_candidate(report: dict) -> dict:
         analysis = case.get("analysis", {})
         identity = analysis.get("pipeline_identity_detail")
         stages = analysis.get("pipeline_stages_detail")
-        if (not has_valid_direct_copy_certificate(analysis)
+        if (not has_valid_certificate(analysis)
                 or type(identity) is not dict or type(stages) is not list or not stages):
             raise OracleUnavailable("profile candidate requires an exact-chain analyzer certificate")
-        boundary_bytes = analysis.get("before_cvpipelining_allocation_bytes")
-        if type(boundary_bytes) is not int or analysis["lower_bound_bytes"] > boundary_bytes:
+        if not has_valid_materialization_bridge(analysis):
             raise OracleUnavailable("profile candidate lacks a valid materialization bridge")
         if not _is_sha256(analysis.get("ttir_fixture_sha256")) or not _is_sha256(
                 analysis.get("before_cvpipelining_sha256")):
