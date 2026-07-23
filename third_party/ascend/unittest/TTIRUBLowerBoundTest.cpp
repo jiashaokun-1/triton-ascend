@@ -835,6 +835,18 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, ExpandDimsDefersWithNamedReason) {
   EXPECT_TRUE(hasReason(result, "unsupported-op-expand-dims"));
 }
 
+TEST_F(TTIRUBLowerBoundAnalysisTest, BitcastDefersWithNamedReason) {
+  std::string source = replaceOnce(
+      kDirectLoadCopy,
+      "    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>",
+      R"mlir(    %bits = tt.bitcast %value : tensor<65536xf32> -> tensor<65536xi32>
+    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>)mlir");
+
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-op-bitcast"));
+}
+
 TEST_F(TTIRUBLowerBoundAnalysisTest,
        BinaryAddRejectsOneLoadUsedForBothOperands) {
   std::string source = replaceOnce(

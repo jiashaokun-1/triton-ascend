@@ -478,7 +478,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
 - UB/策略/oracle 聚焦 Python 测试：289 项通过；
-- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：88 项通过；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：89 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
   `32768 bits`，逐次精确相等，且下界不超过两者；
@@ -495,7 +495,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：289 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
-- 普通 C++ GTest：88 项通过；
+- 普通 C++ GTest：89 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
   0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：

@@ -568,7 +568,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
             <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
-            <tr><td>本地完整 oracle gate</td><td><span class="tag fact">已通过</span></td><td>精确 LLVM 原生构建；289 项 Python 测试、88 项 C++ GTest；contract / semantic replay / real PlanMemory 三方在 direct-copy 20 seeds + retry 上为 0 violation / 0 unavailable</td></tr>
+            <tr><td>本地完整 oracle gate</td><td><span class="tag fact">已通过</span></td><td>精确 LLVM 原生构建；289 项 Python 测试、89 项 C++ GTest；contract / semantic replay / real PlanMemory 三方在 direct-copy 20 seeds + retry 上为 0 violation / 0 unavailable</td></tr>
             <tr><td>Production contracts</td><td><span class="tag plan">候选合同 6 / 已认证 0</span></td><td>direct-copy、binary-add 与 reshape-copy 的 Preserve / max-tiles transfer function 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
