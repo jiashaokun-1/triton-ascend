@@ -421,7 +421,8 @@ protected:
            source.kind == MaterializationKind::GMToUBLoad &&
            source.consumer == "tt.reshape" && view.origin == "tt.reshape" &&
            view.kind == MaterializationKind::ViewAlias &&
-           view.consumer == "tt.store";
+           (view.consumer == "tt.store" ||
+            view.consumer == "tt.reshape");
   }
 
   LogicalResult appendTrace(MandatoryUBResourceGraph &graph,

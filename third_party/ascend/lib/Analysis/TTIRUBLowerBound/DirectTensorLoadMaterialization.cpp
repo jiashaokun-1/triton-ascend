@@ -346,38 +346,63 @@ LogicalResult materializeReshapeCopy(
       !sourceChain->addPtr->isBeforeInBlock(load))
     return defer(reasons, "load-pointer-has-extra-use");
 
-  auto store = dyn_cast<triton::StoreOp>(
-      *valueReshape.getResult().getUsers().begin());
+  Value storedValue = valueReshape.getResult();
+  triton::ReshapeOp inverseReshape;
+  Operation *valueUser = *valueReshape.getResult().getUsers().begin();
+  if (auto candidate = dyn_cast<triton::ReshapeOp>(valueUser)) {
+    if (!isStrictNoReorderReshape(candidate, valueReshape.getResult(),
+                                  numElements, elementType, 1, function) ||
+        candidate.getType() != sourceType ||
+        !valueReshape->isBeforeInBlock(candidate))
+      return defer(reasons, "unsupported-view-dataflow");
+    inverseReshape = candidate;
+    storedValue = candidate.getResult();
+    valueUser = *candidate.getResult().getUsers().begin();
+  }
+
+  auto store = dyn_cast<triton::StoreOp>(valueUser);
   if (!store || store->getNumOperands() != 2 || store->getNumResults() != 0 ||
       store->getNumRegions() != 0 || store->getNumSuccessors() != 0 ||
-      store.getValue() != valueReshape.getResult() ||
+      store.getValue() != storedValue ||
       !isDirectlyInEntryBlock(store, function) ||
-      !valueReshape->isBeforeInBlock(store) ||
+      !(inverseReshape ? inverseReshape->isBeforeInBlock(store)
+                       : valueReshape->isBeforeInBlock(store)) ||
       !store.getBoundaryCheck().empty() ||
       store.getCache() != triton::CacheModifier::NONE ||
       store.getEvict() != triton::EvictionPolicy::NORMAL)
     return defer(reasons, "unsupported-view-store");
 
   auto pointerReshape = store.getPtr().getDefiningOp<triton::ReshapeOp>();
-  auto pointerResultType =
-      dyn_cast<RankedTensorType>(store.getPtr().getType());
-  auto pointerElementType =
-      pointerResultType
-          ? dyn_cast<triton::PointerType>(pointerResultType.getElementType())
-          : triton::PointerType();
   auto valueResultType = dyn_cast<RankedTensorType>(valueReshape.getType());
-  if (!pointerReshape || !pointerResultType || !pointerElementType ||
-      !valueResultType ||
-      pointerResultType.getShape() != valueResultType.getShape() ||
-      pointerElementType.getPointeeType() != elementType ||
-      pointerElementType.getAddressSpace() != 1 ||
-      !isStrictNoReorderReshape(
-          pointerReshape, pointerReshape.getSrc(), numElements,
-          pointerResultType.getElementType(), 2, function) ||
-      !pointerReshape->isBeforeInBlock(store))
+  if (!valueResultType)
+    return defer(reasons, "unsupported-view-shape");
+
+  Value destinationPointer = store.getPtr();
+  if (pointerReshape) {
+    auto pointerResultType =
+        dyn_cast<RankedTensorType>(pointerReshape.getType());
+    auto pointerElementType =
+        pointerResultType
+            ? dyn_cast<triton::PointerType>(pointerResultType.getElementType())
+            : triton::PointerType();
+    if (!pointerResultType || !pointerElementType ||
+        pointerResultType.getShape() != valueResultType.getShape() ||
+        pointerElementType.getPointeeType() != elementType ||
+        pointerElementType.getAddressSpace() != 1 ||
+        !isStrictNoReorderReshape(
+            pointerReshape, pointerReshape.getSrc(), numElements,
+            pointerResultType.getElementType(), 2, function) ||
+        !pointerReshape->isBeforeInBlock(store))
+      return defer(reasons, "unsupported-view-pointer");
+    destinationPointer = pointerReshape.getSrc();
+  } else if (!inverseReshape) {
+    // A rank-changing value must be paired either with an identically-shaped
+    // pointer view or with a strict inverse value reshape before a flat store.
     return defer(reasons, "unsupported-view-pointer");
+  }
+
   FailureOr<ContiguousPointerChain> destinationChain = matchContiguousPointer(
-      pointerReshape.getSrc(), function, numElements, elementType, reasons);
+      destinationPointer, function, numElements, elementType, reasons);
   if (failed(destinationChain))
     return failure();
   if (!destinationChain->addPtr.getResult().hasOneUse() ||
@@ -410,11 +435,12 @@ LogicalResult materializeReshapeCopy(
   viewResource.kind = MaterializationKind::ViewAlias;
   viewResource.birth.ordinal = std::distance(
       function.getBody().front().begin(), valueReshape->getIterator());
-  viewResource.lastRequiredUse.ordinal =
-      std::distance(function.getBody().front().begin(), store->getIterator());
+  viewResource.lastRequiredUse.ordinal = std::distance(
+      function.getBody().front().begin(),
+      inverseReshape ? inverseReshape->getIterator() : store->getIterator());
   viewResource.sourceElements = numElements;
   viewResource.elementBitWidth = elementType.getIntOrFloatBitWidth();
-  viewResource.consumer = "tt.store";
+  viewResource.consumer = inverseReshape ? "tt.reshape" : "tt.store";
   viewResource.contractTrace.push_back("ttir-reshape-copy-v1");
   ResourceId viewId = graph.addResource(std::move(viewResource));
   if (sourceId == InvalidResourceId || viewId == InvalidResourceId)
@@ -429,7 +455,10 @@ LogicalResult materializeReshapeCopy(
   }
   matched.insert(load);
   matched.insert(valueReshape);
-  matched.insert(pointerReshape);
+  if (inverseReshape)
+    matched.insert(inverseReshape);
+  if (pointerReshape)
+    matched.insert(pointerReshape);
   matched.insert(store);
   return success();
 }

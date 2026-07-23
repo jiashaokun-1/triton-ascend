@@ -96,6 +96,23 @@ module {
 }
 )mlir";
 
+constexpr StringLiteral kReshapeCopyRoundTrip = R"mlir(
+module {
+  tt.func public @reshape_copy_round_trip(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %srcs = tt.splat %src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %src_ptrs = tt.addptr %srcs, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dsts = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dsts, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>
+    %view = tt.reshape %value : tensor<65536xf32> -> tensor<256x256xf32>
+    %flat = tt.reshape %view : tensor<256x256xf32> -> tensor<65536xf32>
+    tt.store %dst_ptrs, %flat : tensor<65536x!tt.ptr<f32>>
+    tt.return
+  }
+}
+)mlir";
+
 std::string replaceOnce(StringRef source, StringRef from, StringRef to) {
   std::string result = source.str();
   size_t position = result.find(from.str());
@@ -610,7 +627,8 @@ TEST(UBResourceContract, BinaryAddContractRejectsLifetimeDrift) {
 
 std::pair<ResourceId, ResourceId>
 addReshapeCopyResources(MandatoryUBResourceGraph &graph,
-                        int64_t payloadBytes = 262144) {
+                        int64_t payloadBytes = 262144,
+                        StringRef viewConsumer = "tt.store") {
   MandatoryUBResource source{"reshape-source", payloadBytes, 1};
   source.origin = "tt.load";
   source.kind = MaterializationKind::GMToUBLoad;
@@ -625,7 +643,7 @@ addReshapeCopyResources(MandatoryUBResourceGraph &graph,
   view.kind = MaterializationKind::ViewAlias;
   view.sourceElements = 65536;
   view.elementBitWidth = 32;
-  view.consumer = "tt.store";
+  view.consumer = viewConsumer.str();
   view.contractTrace = {"ttir-reshape-copy-v1"};
   ResourceId viewId = graph.addResource(std::move(view));
   graph.addMayAlias(sourceId, viewId);
@@ -644,6 +662,20 @@ TEST(UBResourceContract, ReshapeCopyMaxTilesProvesSingleAllocationAlias) {
   EXPECT_TRUE(graph.hasMustAlias(source, view));
   EXPECT_EQ(graph.resources()[source].minPayloadBytes, 4096);
   EXPECT_EQ(graph.resources()[view].minPayloadBytes, 4096);
+  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 4096);
+}
+
+TEST(UBResourceContract, ReshapeCopyMaxTilesAcceptsStrictInverseView) {
+  MandatoryUBResourceGraph graph;
+  auto [source, view] =
+      addReshapeCopyResources(graph, 262144, "tt.reshape");
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeReshapeCopyMaxTilesContract(
+      {.stageName = "materialize"}, 2, 65536, 32, 262144, 64));
+
+  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "materialize"})));
+  EXPECT_TRUE(graph.hasMustAlias(source, view));
   EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 4096);
 }
 
@@ -835,6 +867,34 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
       makeReshapeCopyMaxTilesContract(analysisOptions.stages.front(), 2,
                                       65536, 32, 262144, 64))));
   OwningOpRef<ModuleOp> module = parse(kReshapeCopy);
+  ASSERT_TRUE(module);
+
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, reshapeRegistry);
+  EXPECT_EQ(result.lowerBoundBytes, 4096);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "singleton");
+  EXPECT_EQ(result.certificates[0].resourceIds.size(), 1u);
+  EXPECT_EQ(result.certificates[0].contractTrace,
+            SmallVector<std::string>({"ttir-reshape-copy-v1",
+                                      "reshape-copy-max-tiles"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ReshapeCopyRoundTripUsesOneAliasClassWithoutPointerReshape) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages = {{.stageName = "materialize"}};
+  PipelineContractRegistry reshapeRegistry;
+  reshapeRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(reshapeRegistry.addProfileContract(
+      {.stage = analysisOptions.stages.front(),
+       .contractId = "reshape-copy-max-tiles",
+       .contractVersion = "1"},
+      makeReshapeCopyMaxTilesContract(analysisOptions.stages.front(), 2,
+                                      65536, 32, 262144, 64))));
+  OwningOpRef<ModuleOp> module = parse(kReshapeCopyRoundTrip);
   ASSERT_TRUE(module);
 
   TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(

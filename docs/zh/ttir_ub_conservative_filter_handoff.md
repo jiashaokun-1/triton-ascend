@@ -480,8 +480,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
 - UB/策略/oracle 聚焦 Python 测试：313 项通过；
-- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：90 项通过；
-- 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：92 项通过；
+- 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：
+  direct-copy、binary-add、reshape-copy 三类 fixture 各执行 seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
   `32768 bits`，逐次精确相等，且下界不超过两者；
 - 21 次均由真实 `post-TileAndBindSubBlock` snapshot 确认 auto-tile outcome 为 `false`；
@@ -492,7 +493,12 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - binary-add 的目标 CANN candidate 也已完成 seeds `0..19` + retry：analyzer 下界
   `524288 bytes`，真实 PlanMemory 与语义模型均为 UB overflow，required/peak 都是
   `4194304 bits`，capacity 为 `1572864 bits`，21 次逐次一致，auto-tile outcome 均为 `false`；
-- 两份 candidate 都只生成在构建目录供人工审核，没有写入 packaged profile；
+- reshape-copy 使用真实可编译的
+  `1-D load -> 2-D value reshape -> inverse reshape -> 1-D store` canonical TTIR，避免对 pointer
+  tensor 做 `tt.reshape`；真实 before-CVPipelining 边界只有一个 `262144-byte` local allocation，
+  analyzer singleton 下界为 `262144 bytes`，真实 PlanMemory 与语义模型的 required/peak 均为
+  `2097152 bits`，capacity 为 `1572864 bits`，21 次逐次一致，auto-tile outcome 均为 `false`；
+- 三份 candidate 都只生成在构建目录供人工审核，没有写入 packaged profile；
 - outcome=`true` 只属于未来 split MIX AIV profile，不是当前纯 AIV direct-copy profile 的认证前置条件。
 
 ## 11. 测试与质量状态
@@ -501,9 +507,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 - UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：313 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
-- 普通 C++ GTest：90 项通过；
-- analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
-  0 violation / 0 unavailable；
+- 普通 C++ GTest：92 项通过；
+- direct-copy、binary-add、reshape-copy 的 analyzer + semantic replay + 真实 suffix compiler
+  联合 oracle：20 seeds + retry，0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
   - p50 `0.002542 ms`
   - p95 `0.003334 ms`
@@ -546,9 +552,10 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - binary-add 合同同时验证 lifetime facts：两个资源必须有不同 birth、相同 lastRequiredUse，
   且 birth 都早于共同 use；任一漂移会 Invalidate；
 - witness solver 只允许对同一 CoexistenceWitness 且 pairwise mustDistinct 的资源求和；
-- 严格的无 reorder `load -> reshape -> store` matcher；load/view 先建 mayAlias，
-  `reshape-copy-max-tiles@1` 在物化阶段证明单 allocation 后才精化为 mustAlias，solver
-  按 alias class 计数一次；
+- 严格的无 reorder `load -> reshape -> [inverse reshape] -> store` matcher；真实认证 fixture
+  使用 value tensor 的 rank-1→rank-2→rank-1 严格逆变换，让 pointer 保持在已验证的连续 1-D
+  lowering 路径。load/view 先建 mayAlias，`reshape-copy-max-tiles@1` 在物化阶段证明单 allocation
+  后才精化为 mustAlias，solver 按 alias class 计数一次；
 - oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
 - oracle 已接入 `cvpipeline_ub_model_cpp` exact semantic replay；promotion 要求 replay 与真实
   PlanMemory 逐 seed 一致，并把 semantic model SHA256 写入 profile；
@@ -616,19 +623,20 @@ candidate，再决定是否写入 packaged profile；不能由 oracle 自动安�
 binary-add 已完成目标 CANN 的 20 seeds + retry 联合验证并生成未安装 candidate：边界包含两个
 `262144-byte` local allocations，analyzer witness 下界为 `524288 bytes`，真实 PlanMemory 与
 语义模型都得到 `4194304-bit` UB overflow，且所有 auto-tile outcome 为 `false`。reshape-copy
-本地合同切片已完成，但真实 canonical TTIR 目前仍在 open-source lowering 的
-`TritonToUnstructure` 路径触发上游断言，尚未形成可认证的配对 fixture。broadcast、expand_dims、
-bitcast 当前均以具名 unsupported reason 明确 defer，避免把尚未证明的 view/materialization 语义误当成
-已支持。下一步需要先生成能通过真实 open-source lowering 的 reshape-copy canonical TTIR，再从同一次
-真实编译保存 before-CVPipelining snapshot，确认边界上的单个 alias allocation，并运行同一联合门禁。
-人工审核完成前不得把 binary-add candidate 或未验证的 reshape-copy candidate 写入 packaged profile。
-同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，确认各路径究竟
+也已完成相同门禁：canonical TTIR 采用
+`1-D load -> 2-D value reshape -> inverse reshape -> 1-D store`，通过真实 open-source lowering；
+同次编译捕获的 before-CVPipelining 边界只有一个 `262144-byte` allocation，analyzer 下界为
+`262144 bytes`，真实 PlanMemory 与语义模型均得到 `2097152-bit` UB overflow，21 次结果精确一致，
+auto-tile outcome 均为 `false`。这证明两个逻辑 resource 在物化后属于同一 mustAlias class，
+solver 只计数一次。broadcast、expand_dims、bitcast 当前仍以具名 unsupported reason 明确 defer，
+避免把尚未证明的 view/materialization 语义误当成已支持。人工审核完成前不得把三类 candidate
+写入 packaged profile。下一步保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，确认各路径究竟
 是 mustAlias view、独立 allocation 还是 materialized broadcast，再决定是否扩展合同；证据不足时继续 defer。
 
 ### P1：扩大真实 oracle corpus
 
-当前只有一个手工配对 fixture。下一步应从同一次真实编译自动保存 canonical TTIR 和
-before-CVPipelining IR，避免两端配置漂移。
+当前已有 direct-copy、binary-add、reshape-copy 三个配对 fixture。下一步应把同一次真实编译中
+自动保存 canonical TTIR 和 before-CVPipelining IR 的流程接入常规回归，继续避免两端配置漂移。
 
 建议矩阵：
 
