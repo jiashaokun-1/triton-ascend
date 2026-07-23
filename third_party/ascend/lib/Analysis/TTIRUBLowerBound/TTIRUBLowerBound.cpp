@@ -124,6 +124,11 @@ StringRef getVerifierPreflightFailure(Operation *root) {
       if (!hasExactRegisteredType<triton::SplatOp>(operation) ||
           !hasExactShape(operation, 1, 1, 0, 0))
         return "malformed-ir";
+    } else if (name == triton::ReshapeOp::getOperationName()) {
+      if (!hasExactRegisteredType<triton::ReshapeOp>(operation) ||
+          !hasExactShape(operation, 1, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
     } else if (name == triton::AddPtrOp::getOperationName()) {
       if (!hasExactRegisteredType<triton::AddPtrOp>(operation) ||
           !hasExactShape(operation, 2, 1, 0, 0))

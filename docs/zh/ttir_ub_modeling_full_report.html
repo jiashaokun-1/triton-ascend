@@ -568,8 +568,8 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
             <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
-            <tr><td>本地完整 oracle gate</td><td><span class="tag fact">已通过</span></td><td>精确 LLVM 原生构建；285 项 Python 测试、78 项 C++ GTest；contract / semantic replay / real PlanMemory 三方在 direct-copy 20 seeds + retry 上为 0 violation / 0 unavailable</td></tr>
-            <tr><td>Production contracts</td><td><span class="tag plan">候选合同 4 / 已认证 0</span></td><td>direct-copy 与 binary-add 的 Preserve / max-tiles transfer function 已可执行；packaged profile 仍为空</td></tr>
+            <tr><td>本地完整 oracle gate</td><td><span class="tag fact">已通过</span></td><td>精确 LLVM 原生构建；289 项 Python 测试、85 项 C++ GTest；contract / semantic replay / real PlanMemory 三方在 direct-copy 20 seeds + retry 上为 0 violation / 0 unavailable</td></tr>
+            <tr><td>Production contracts</td><td><span class="tag plan">候选合同 6 / 已认证 0</span></td><td>direct-copy、binary-add 与 reshape-copy 的 Preserve / max-tiles transfer function 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
         </table></div>
@@ -593,8 +593,9 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <div class="phase">
             <h3>P2 · Elementwise 与 alias/coexistence <span class="tag plan">In progress</span></h3>
             <p>第一条最小切片已实现：严格匹配 <span class="mono">load(lhs) + load(rhs) → arith.addf → store</span>，生成两条 GM→UB resource、pairwise mayAlias 和同一 program point 的 CoexistenceWitness；<span class="mono">binary-add-max-tiles@1</span> 只有在物化阶段验证完整 source facts 后，才把该 witness 从 mayAlias 精化为 mustDistinct，并按 <span class="mono">ceil(payload/maxTiles)</span> 传递两条资源。后续 preserve 合同要求 mustDistinct 证明继续有效；否则整图 Invalidate/defer。</p>
-            <p class="small"><strong>当前门禁：</strong>solver 仅对同一 witness 且 pairwise mustDistinct 的资源求和；mayAlias、重复 resource id、缺少 witness、合同顺序或参数漂移均不能产生双资源证书。oracle 已支持 binary-add family，并要求 certificate kind 为 witness、恰有两个不同 resource id、contract_trace 精确匹配，以及 before-CVPipelining 边界恰有两个与 materialized payload 等大的静态 allocation。尚缺目标 CANN 环境生成的精确配对 snapshot 和 seeds 0..19 + retry 联合验证，因此 binary-add profile 仍不得安装。</p>
-            <p class="small"><strong>下一步：</strong>在目标 CANN 服务器完成 binary-add 配对 fixture 与真实 identity 晋升；随后再扩展 view/reshape/broadcast 及可复用的 InPlaceAlias / Lifetime contracts。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加；真实可编译误拒绝数为 0。</p>
+            <p>第二条最小切片也已实现：严格匹配无 <span class="mono">allow_reorder</span> / <span class="mono">efficient_layout</span> 的 <span class="mono">load → reshape → store</span>。matcher 为 load 和 view 建立两个逻辑 resource node，但只先记录 mayAlias；<span class="mono">reshape-copy-max-tiles@1</span> 必须在 materialization stage 证明二者落到同一个 allocation，才精化为 mustAlias。solver 按 alias class 取一次大小，因此不会把逻辑 view 重复计入 UB。</p>
+            <p class="small"><strong>当前门禁：</strong>solver 仅对同一 witness 且 pairwise mustDistinct 的资源求和；mayAlias、重复 resource id、缺少 witness、合同顺序或参数漂移均不能产生双资源证书。oracle 已区分 logical resource count、certificate resource count 与 physical allocation count：binary-add 是 2/2/2，reshape-copy 是 2/1/1。before-CVPipelining allocation 数量或 payload 不匹配即禁止晋升。尚缺目标 CANN 环境生成的精确配对 snapshot 和 seeds 0..19 + retry 联合验证，因此两类 P2 profile 均不得安装。</p>
+            <p class="small"><strong>下一步：</strong>在目标 CANN 服务器完成 binary-add、reshape-copy 配对 fixture 与真实 identity 晋升；随后扩展 broadcast 物化分支及可复用的 Lifetime contracts。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加，也禁止把 mustAlias view 重复计数；真实可编译误拒绝数为 0。</p>
           </div>
           <div class="phase">
             <h3>P3 · Reduction、loop 与 multibuffer</h3>

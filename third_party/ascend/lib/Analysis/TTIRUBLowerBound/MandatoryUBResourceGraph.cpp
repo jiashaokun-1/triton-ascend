@@ -208,6 +208,40 @@ LogicalResult MandatoryUBResourceGraph::refineWitnessToMustDistinct(
   return success();
 }
 
+LogicalResult MandatoryUBResourceGraph::refineMayAliasToMustAlias(
+    ResourceId lhs, ResourceId rhs, StringRef contractId) {
+  if (contractId.empty() || lhs >= resources_.size() ||
+      rhs >= resources_.size() || lhs == rhs ||
+      !containsRelation(mayAliases_, lhs, rhs) ||
+      containsRelation(mustAliases_, lhs, rhs) ||
+      containsRelation(mustDistinct_, lhs, rhs)) {
+    malformed_ = true;
+    return failure();
+  }
+  const uint64_t key = relationKey(lhs, rhs);
+  llvm::erase_if(mayAliases_, [&](const ResourcePair &relation) {
+    return relationKey(relation.first, relation.second) == key;
+  });
+  addMustAlias(lhs, rhs);
+  return success();
+}
+
+bool MandatoryUBResourceGraph::hasMayAlias(ResourceId lhs,
+                                           ResourceId rhs) const {
+  return !malformed_ && lhs < resources_.size() && rhs < resources_.size() &&
+         lhs != rhs && containsRelation(mayAliases_, lhs, rhs) &&
+         !containsRelation(mustAliases_, lhs, rhs) &&
+         !containsRelation(mustDistinct_, lhs, rhs);
+}
+
+bool MandatoryUBResourceGraph::hasMustAlias(ResourceId lhs,
+                                            ResourceId rhs) const {
+  return !malformed_ && lhs < resources_.size() && rhs < resources_.size() &&
+         lhs != rhs && containsRelation(mustAliases_, lhs, rhs) &&
+         !containsRelation(mayAliases_, lhs, rhs) &&
+         !containsRelation(mustDistinct_, lhs, rhs);
+}
+
 bool MandatoryUBResourceGraph::hasPairwiseMayAliasWitness(WitnessId id) const {
   if (malformed_ || id >= witnesses_.size() ||
       witnesses_[id].resources.size() < 2)

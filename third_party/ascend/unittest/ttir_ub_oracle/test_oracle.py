@@ -332,6 +332,26 @@ def test_binary_add_contract_chain_uses_binary_contracts():
     assert bindings[1]["contract_parameters"]["expected_input_payload_bytes"] == "4096"
 
 
+def test_reshape_copy_contract_chain_uses_view_contracts():
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 64,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"},
+        [{"stage_name": "ttir.triton-to-linalg", "options": {}}],
+        proposal,
+        "reshape-copy",
+    )
+    assert profile["profiles"][0]["pipeline_stages"][0]["contract_id"] == \
+        "reshape-copy-max-tiles"
+
+
 def test_proposed_contract_chain_requires_unique_materialization_stage():
     with pytest.raises(oracle.OracleUnavailable, match="exactly once"):
         oracle.build_proposed_contract_profile(
@@ -351,13 +371,16 @@ def test_proposed_contract_chain_requires_unique_materialization_stage():
 
 def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-copy"):
     is_binary_add = operation_family == "binary-add"
+    is_reshape_copy = operation_family == "reshape-copy"
     certificate = {
         "kind": "witness" if is_binary_add else "singleton",
         "bytes": lower_bound_bytes,
         "resource_ids": [0, 1] if is_binary_add else [0],
         "contract_trace": [
-            "ttir-binary-add-v1" if is_binary_add else "ttir-direct-load-v1",
-            "binary-add-max-tiles" if is_binary_add else "direct-copy-max-tiles",
+            ("ttir-binary-add-v1" if is_binary_add else
+             "ttir-reshape-copy-v1" if is_reshape_copy else "ttir-direct-load-v1"),
+            ("binary-add-max-tiles" if is_binary_add else
+             "reshape-copy-max-tiles" if is_reshape_copy else "direct-copy-max-tiles"),
         ],
     }
     return {
@@ -372,10 +395,12 @@ def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-co
         "pipeline_stages_detail": [{
             "stage_name": "ttir.triton-to-linalg",
             "options": {},
-            "contract_id": "binary-add-max-tiles" if is_binary_add else "direct-copy-max-tiles",
+            "contract_id": ("binary-add-max-tiles" if is_binary_add else
+                            "reshape-copy-max-tiles" if is_reshape_copy else
+                            "direct-copy-max-tiles"),
             "contract_version": "1",
             "contract_parameters": {
-                "expected_resource_count": "2" if is_binary_add else "1",
+                "expected_resource_count": "2" if (is_binary_add or is_reshape_copy) else "1",
                 "expected_source_elements": "65536",
                 "expected_element_bit_width": "32",
                 "expected_input_payload_bytes": "262144",
@@ -406,6 +431,12 @@ def test_binary_add_materialization_bridge_requires_two_exact_allocations():
     assert oracle.has_valid_materialization_bridge(analysis)
     analysis["before_cvpipelining_allocations_bytes"] = [8192]
     assert not oracle.has_valid_materialization_bridge(analysis)
+
+
+def test_reshape_copy_bridge_maps_two_logical_resources_to_one_allocation():
+    analysis = _analysis("defer", 4096, "reshape-copy")
+    assert oracle.has_valid_certificate(analysis)
+    assert oracle.has_valid_materialization_bridge(analysis)
 
 
 def test_evaluate_accepts_available_defer_results(tmp_path):

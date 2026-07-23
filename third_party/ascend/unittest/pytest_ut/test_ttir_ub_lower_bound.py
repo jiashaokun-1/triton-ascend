@@ -75,6 +75,23 @@ module {
 }
 """
 
+RESHAPE_COPY = """
+module {
+  tt.func public @reshape_copy(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %srcs = tt.splat %src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %src_ptrs = tt.addptr %srcs, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dsts = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dsts, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>
+    %view = tt.reshape %value : tensor<65536xf32> -> tensor<256x256xf32>
+    %dst_view = tt.reshape %dst_ptrs : tensor<65536x!tt.ptr<f32>> -> tensor<256x256x!tt.ptr<f32>>
+    tt.store %dst_view, %view : tensor<256x256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 INT64_MAX = (1 << 63) - 1
 UINT32_MAX = (1 << 32) - 1
 
@@ -1349,6 +1366,22 @@ def test_profile_loader_accepts_certified_binary_add_schema(monkeypatch, tmp_pat
     assert load_contract_profiles() == document
 
 
+def test_profile_loader_accepts_certified_reshape_copy_schema(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] = "reshape-copy-max-tiles"
+    stage["contract_parameters"]["expected_resource_count"] = "2"
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
 @pytest.mark.parametrize("value", [None, "x" * 64, "A" * 64])
 def test_profile_loader_rejects_invalid_semantic_model_hash(monkeypatch, tmp_path, value):
     profile_path = tmp_path / "profiles.json"
@@ -1727,6 +1760,69 @@ def test_binding_runs_binary_add_witness_contract(tmp_path):
     })
     certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
     assert certified_result["lower_bound_bytes"] == 8192
+    assert certified_result["certificates"] == candidate_result["certificates"]
+
+
+def test_binding_runs_reshape_copy_alias_contract(tmp_path):
+    source = tmp_path / "reshape-copy.ttir"
+    source.write_text(RESHAPE_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p2-reshape-copy-test",
+        "canonical_ttir_sha256": hashlib.sha256(RESHAPE_COPY.encode()).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p2-reshape-copy-test-identity",
+    }
+    stages = [{"stage_name": "ttir.triton-to-linalg", "options": {}}]
+    profile_entry = {
+        "pipeline_identity": identity,
+        "pipeline_stages": [{
+            **stages[0],
+            "contract_id": "reshape-copy-max-tiles",
+            "contract_version": "1",
+            "contract_parameters": {
+                "expected_resource_count": "2",
+                "expected_source_elements": "65536",
+                "expected_element_bit_width": "32",
+                "expected_input_payload_bytes": "262144",
+                "max_tiles": "64",
+            },
+        }],
+    }
+    profile = {"schema": "ttir-ub-lb-profile-v1", "profiles": [profile_entry]}
+    raw_options = {
+        "arch": "Ascend910B",
+        "compile_mode": "aiv",
+        "pipeline_identity": identity,
+        "pipeline_stages": stages,
+        "contract_profile": profile,
+    }
+
+    candidate_result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module, raw_options)
+    assert candidate_result["lower_bound_bytes"] == 4096
+    assert candidate_result["unsupported_reasons"] == []
+    assert candidate_result["certificates"] == [{
+        "kind": "singleton",
+        "bytes": 4096,
+        "resource_ids": [0],
+        "contract_trace": ["ttir-reshape-copy-v1", "reshape-copy-max-tiles"],
+    }]
+
+    profile_entry.update({
+        "contract_version": "ttir-ub-lb-v1",
+        "oracle_report_sha256": "a" * 64,
+        "semantic_model_sha256": "b" * 64,
+        "validated_seeds": list(range(20)),
+        "retry_validated": True,
+        "auto_tile_and_bind_subblock_outcome": False,
+    })
+    certified_result = ascend.analysis.ttir_ub_lower_bound(module, raw_options)
     assert certified_result["certificates"] == candidate_result["certificates"]
 
 

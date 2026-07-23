@@ -360,6 +360,131 @@ private:
   int64_t maxTiles;
 };
 
+class ReshapeCopyContractBase : public UBResourceContract {
+public:
+  ReshapeCopyContractBase(const PipelineStageContext &stage,
+                          int64_t expectedResourceCount,
+                          int64_t expectedSourceElements,
+                          unsigned expectedElementBitWidth,
+                          int64_t expectedInputPayloadBytes)
+      : stageName(stage.stageName),
+        expectedResourceCount(expectedResourceCount),
+        expectedSourceElements(expectedSourceElements),
+        expectedElementBitWidth(expectedElementBitWidth),
+        expectedInputPayloadBytes(expectedInputPayloadBytes) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef version() const final { return "1"; }
+
+  bool matches(const PipelineStageContext &context) const final {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+
+protected:
+  bool matchesResources(const MandatoryUBResourceGraph &graph,
+                        bool requireMustAlias) const {
+    if (expectedResourceCount != 2 || expectedSourceElements <= 0 ||
+        expectedElementBitWidth == 0 || expectedInputPayloadBytes <= 0 ||
+        graph.resources().size() != 2 || !graph.witnesses().empty() ||
+        (requireMustAlias ? !graph.hasMustAlias(0, 1)
+                          : !graph.hasMayAlias(0, 1)))
+      return false;
+    const MandatoryUBResource &source = graph.resources()[0];
+    const MandatoryUBResource &view = graph.resources()[1];
+    auto matchesCommon = [&](const MandatoryUBResource &resource) {
+      return resource.validity == ValidityState::Valid &&
+             resource.minInstances == 1 &&
+             resource.sourceElements == expectedSourceElements &&
+             resource.elementBitWidth == expectedElementBitWidth &&
+             resource.minPayloadBytes == expectedInputPayloadBytes;
+    };
+    return matchesCommon(source) && matchesCommon(view) &&
+           source.origin == "tt.load" &&
+           source.kind == MaterializationKind::GMToUBLoad &&
+           source.consumer == "tt.reshape" && view.origin == "tt.reshape" &&
+           view.kind == MaterializationKind::ViewAlias &&
+           view.consumer == "tt.store";
+  }
+
+  LogicalResult appendTrace(MandatoryUBResourceGraph &graph,
+                            StringRef contractId) const {
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
+      if (failed(graph.appendResourceTrace(static_cast<ResourceId>(ordinal),
+                                           contractId)))
+        return failure();
+    return success();
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+  int64_t expectedResourceCount;
+  int64_t expectedSourceElements;
+  unsigned expectedElementBitWidth;
+  int64_t expectedInputPayloadBytes;
+};
+
+class ReshapeCopyPreserveContract final : public ReshapeCopyContractBase {
+public:
+  using ReshapeCopyContractBase::ReshapeCopyContractBase;
+
+  StringRef id() const override { return "reshape-copy-preserve"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (!matchesResources(graph, /*requireMustAlias=*/true))
+      return ContractDisposition::Invalidate;
+    if (failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Preserve;
+  }
+};
+
+class ReshapeCopyMaxTilesContract final : public ReshapeCopyContractBase {
+public:
+  ReshapeCopyMaxTilesContract(const PipelineStageContext &stage,
+                              int64_t expectedResourceCount,
+                              int64_t expectedSourceElements,
+                              unsigned expectedElementBitWidth,
+                              int64_t expectedInputPayloadBytes,
+                              int64_t maxTiles)
+      : ReshapeCopyContractBase(stage, expectedResourceCount,
+                                expectedSourceElements,
+                                expectedElementBitWidth,
+                                expectedInputPayloadBytes),
+        maxTiles(maxTiles) {}
+
+  StringRef id() const override { return "reshape-copy-max-tiles"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (maxTiles <= 0)
+      return ContractDisposition::InternalError;
+    if (!matchesResources(graph, /*requireMustAlias=*/false))
+      return ContractDisposition::Invalidate;
+    if (failed(graph.refineMayAliasToMustAlias(0, 1, id())))
+      return ContractDisposition::InternalError;
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal) {
+      const int64_t payload = graph.resources()[ordinal].minPayloadBytes;
+      int64_t transformed = payload / maxTiles;
+      if (payload % maxTiles != 0)
+        ++transformed;
+      if (failed(graph.lowerResourcePayload(static_cast<ResourceId>(ordinal),
+                                            transformed, id())))
+        return ContractDisposition::InternalError;
+    }
+    return ContractDisposition::Transform;
+  }
+
+private:
+  int64_t maxTiles;
+};
+
 } // namespace
 
 void PipelineContractRegistry::setProfileIdentity(PipelineIdentity identity) {
@@ -486,6 +611,24 @@ std::unique_ptr<UBResourceContract> makeBinaryAddMaxTilesContract(
     int64_t expectedSourceElements, unsigned expectedElementBitWidth,
     int64_t expectedInputPayloadBytes, int64_t maxTiles) {
   return std::make_unique<BinaryAddMaxTilesContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeReshapeCopyPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes) {
+  return std::make_unique<ReshapeCopyPreserveContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes);
+}
+
+std::unique_ptr<UBResourceContract> makeReshapeCopyMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t maxTiles) {
+  return std::make_unique<ReshapeCopyMaxTilesContract>(
       stage, expectedResourceCount, expectedSourceElements,
       expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
 }

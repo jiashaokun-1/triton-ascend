@@ -477,8 +477,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 ### 10.4 当前验证结果
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
-- UB/策略/oracle 聚焦 Python 测试：285 项通过；
-- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：78 项通过；
+- UB/策略/oracle 聚焦 Python 测试：289 项通过；
+- `TestAscendTTIRUBLowerBound` 原生 C++ GTest：85 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
   `32768 bits`，逐次精确相等，且下界不超过两者；
@@ -493,9 +493,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 本次基线已执行：
 
-- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：285 项通过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：289 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
-- 普通 C++ GTest：78 项通过；
+- 普通 C++ GTest：85 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
   0 violation / 0 unavailable；
 - analyzer profile-miss 路径 100 次测量，去掉前 10 次后：
@@ -534,6 +534,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - 参数化 `binary-add-preserve@1` / `binary-add-max-tiles@1` 候选合同；只有物化阶段验证
   source facts 后才能把同一 witness 内的 mayAlias 精化为 mustDistinct；
 - witness solver 只允许对同一 CoexistenceWitness 且 pairwise mustDistinct 的资源求和；
+- 严格的无 reorder `load -> reshape -> store` matcher；load/view 先建 mayAlias，
+  `reshape-copy-max-tiles@1` 在物化阶段证明单 allocation 后才精化为 mustAlias，solver
+  按 alias class 计数一次；
 - oracle 可构造未安装 candidate chain，且对 seed/retry/outcome/identity 做 promotion gate；
 - oracle 已接入 `cvpipeline_ub_model_cpp` exact semantic replay；promotion 要求 replay 与真实
   PlanMemory 逐 seed 一致，并把 semantic model SHA256 写入 profile；
@@ -588,12 +591,12 @@ Preserve/Transform 合同。因此：
 
 ### P2：双输入 elementwise 与 alias/coexistence
 
-第一条 binary-add 本地可执行切片已经完成，但尚未生产认证。下一步需要在目标 CANN
+binary-add 和 reshape-copy 两条本地可执行切片已经完成，但尚未生产认证。下一步需要在目标 CANN
 环境从同一次真实编译保存 canonical TTIR 与 before-CVPipelining snapshot，确认边界上存在
-两个与合同 payload 一致的独立 local allocations，再运行 analyzer、semantic replay 和真实
-suffix compiler 的 seeds `0..19` + retry 联合门禁。验证完成前不得把 binary-add candidate
+binary-add 边界存在两个独立 local allocations、reshape-copy 边界只有一个 alias allocation，
+再运行 analyzer、semantic replay 和真实 suffix compiler 的 seeds `0..19` + retry 联合门禁。验证完成前不得把 P2 candidate
 写入 packaged profile。之后再扩展 view/reshape/broadcast 和可复用的 InPlaceAlias/Lifetime
-contracts。
+contracts；broadcast 仍保持明确 defer。
 
 ### P1：扩大真实 oracle corpus
 

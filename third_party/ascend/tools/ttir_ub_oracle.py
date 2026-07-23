@@ -32,14 +32,26 @@ _OPERATION_FAMILIES = {
     "direct-copy": {
         "matcher_trace": "ttir-direct-load-v1",
         "certificate_kind": "singleton",
+        "certificate_resource_count": 1,
         "resource_count": 1,
+        "allocation_count": 1,
         "contract_prefix": "direct-copy",
     },
     "binary-add": {
         "matcher_trace": "ttir-binary-add-v1",
         "certificate_kind": "witness",
+        "certificate_resource_count": 2,
         "resource_count": 2,
+        "allocation_count": 2,
         "contract_prefix": "binary-add",
+    },
+    "reshape-copy": {
+        "matcher_trace": "ttir-reshape-copy-v1",
+        "certificate_kind": "singleton",
+        "certificate_resource_count": 1,
+        "resource_count": 2,
+        "allocation_count": 1,
+        "contract_prefix": "reshape-copy",
     },
 }
 _CONTRACT_PROPOSAL_KEYS = frozenset({
@@ -239,7 +251,9 @@ def load_manifest(path: Path) -> dict:
         names.add(item["name"])
         family = item["operation_family"]
         if family not in _OPERATION_FAMILIES:
-            raise ManifestError("operation_family must be direct-copy or binary-add")
+            raise ManifestError(
+                "operation_family must be direct-copy, binary-add, or reshape-copy"
+            )
         if type(item["arch"]) is not str or not item["arch"]:
             raise ManifestError("arch must be a non-empty string")
         if type(item["options"]) is not dict:
@@ -365,7 +379,7 @@ def has_valid_certificate(analysis: dict) -> bool:
         certificate.get("kind") == family["certificate_kind"]
         and certificate.get("bytes") == lower_bound
         and type(resource_ids) is list
-        and len(resource_ids) == family["resource_count"]
+        and len(resource_ids) == family["certificate_resource_count"]
         and all(type(resource_id) is int and resource_id >= 0 for resource_id in resource_ids)
         and len(set(resource_ids)) == len(resource_ids)
         and certificate.get("contract_trace") == expected_trace
@@ -387,7 +401,7 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
     lower_bound = analysis.get("lower_bound_bytes")
     stages = analysis.get("pipeline_stages_detail")
     if (family is None or type(allocations) is not list
-            or len(allocations) != family["resource_count"]
+            or len(allocations) != family["allocation_count"]
             or not all(type(value) is int and value > 0 for value in allocations)
             or type(total) is not int or total != sum(allocations)
             or type(lower_bound) is not int or lower_bound > total
@@ -607,11 +621,13 @@ def analyze_case(case: dict) -> dict:
         raise OracleUnavailable(f"cannot read before-CVPipelining fixture: {error}") from error
     allocations = parse_boundary_allocation_bytes(boundary_ir)
     proposal = case["contract_proposal"]
-    expected_resource_count = proposal["expected_resource_count"]
+    expected_allocation_count = _OPERATION_FAMILIES[
+        case["operation_family"]
+    ]["allocation_count"]
     expected_allocation_bytes = (
         proposal["expected_input_payload_bytes"] + proposal["max_tiles"] - 1
     ) // proposal["max_tiles"]
-    if (len(allocations) != expected_resource_count
+    if (len(allocations) != expected_allocation_count
             or any(value != expected_allocation_bytes for value in allocations)):
         raise OracleUnavailable(
             "before-CVPipelining allocations do not match the proposed materialized resources"

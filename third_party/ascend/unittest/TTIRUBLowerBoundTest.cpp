@@ -79,6 +79,23 @@ module {
 }
 )mlir";
 
+constexpr StringLiteral kReshapeCopy = R"mlir(
+module {
+  tt.func public @reshape_copy(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %srcs = tt.splat %src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %src_ptrs = tt.addptr %srcs, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dsts = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dsts, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>
+    %view = tt.reshape %value : tensor<65536xf32> -> tensor<256x256xf32>
+    %dst_view = tt.reshape %dst_ptrs : tensor<65536x!tt.ptr<f32>> -> tensor<256x256x!tt.ptr<f32>>
+    tt.store %dst_view, %view : tensor<256x256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+)mlir";
+
 std::string replaceOnce(StringRef source, StringRef from, StringRef to) {
   std::string result = source.str();
   size_t position = result.find(from.str());
@@ -302,6 +319,32 @@ TEST(MandatoryUBResourceGraph,
 
   EXPECT_TRUE(failed(
       graph.refineWitnessToMustDistinct(witness, "unproven-distinct")));
+  EXPECT_TRUE(failed(graph.solveWitnessLowerBound()));
+}
+
+TEST(MandatoryUBResourceGraph,
+     MaterializationCanRefineMayAliasToMustAlias) {
+  MandatoryUBResourceGraph graph;
+  auto source = graph.addResource({"source", 128, 1});
+  auto view = graph.addResource({"view", 128, 1});
+  graph.addMayAlias(source, view);
+
+  ASSERT_TRUE(graph.hasMayAlias(source, view));
+  ASSERT_TRUE(succeeded(graph.refineMayAliasToMustAlias(
+      source, view, "view-materialize")));
+  EXPECT_FALSE(graph.hasMayAlias(source, view));
+  EXPECT_TRUE(graph.hasMustAlias(source, view));
+  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 128);
+}
+
+TEST(MandatoryUBResourceGraph,
+     AliasRefinementRequiresExplicitMayAliasFact) {
+  MandatoryUBResourceGraph graph;
+  auto source = graph.addResource({"source", 128, 1});
+  auto view = graph.addResource({"view", 128, 1});
+
+  EXPECT_TRUE(failed(graph.refineMayAliasToMustAlias(
+      source, view, "unproven-alias")));
   EXPECT_TRUE(failed(graph.solveWitnessLowerBound()));
 }
 
@@ -539,6 +582,58 @@ TEST(UBResourceContract, BinaryAddPreserveRequiresPriorDistinctProof) {
   EXPECT_EQ(graph.resources()[lhs].invalidReason, "binary-add-preserve");
 }
 
+std::pair<ResourceId, ResourceId>
+addReshapeCopyResources(MandatoryUBResourceGraph &graph,
+                        int64_t payloadBytes = 262144) {
+  MandatoryUBResource source{"reshape-source", payloadBytes, 1};
+  source.origin = "tt.load";
+  source.kind = MaterializationKind::GMToUBLoad;
+  source.sourceElements = 65536;
+  source.elementBitWidth = 32;
+  source.consumer = "tt.reshape";
+  source.contractTrace = {"ttir-reshape-copy-v1"};
+  ResourceId sourceId = graph.addResource(std::move(source));
+
+  MandatoryUBResource view{"reshape-view", payloadBytes, 1};
+  view.origin = "tt.reshape";
+  view.kind = MaterializationKind::ViewAlias;
+  view.sourceElements = 65536;
+  view.elementBitWidth = 32;
+  view.consumer = "tt.store";
+  view.contractTrace = {"ttir-reshape-copy-v1"};
+  ResourceId viewId = graph.addResource(std::move(view));
+  graph.addMayAlias(sourceId, viewId);
+  return {sourceId, viewId};
+}
+
+TEST(UBResourceContract, ReshapeCopyMaxTilesProvesSingleAllocationAlias) {
+  MandatoryUBResourceGraph graph;
+  auto [source, view] = addReshapeCopyResources(graph);
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeReshapeCopyMaxTilesContract(
+      {.stageName = "materialize"}, 2, 65536, 32, 262144, 64));
+
+  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
+      graph, {.stageName = "materialize"})));
+  EXPECT_TRUE(graph.hasMustAlias(source, view));
+  EXPECT_EQ(graph.resources()[source].minPayloadBytes, 4096);
+  EXPECT_EQ(graph.resources()[view].minPayloadBytes, 4096);
+  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 4096);
+}
+
+TEST(UBResourceContract, ReshapeCopyPreserveRequiresPriorAliasProof) {
+  MandatoryUBResourceGraph graph;
+  auto [source, view] = addReshapeCopyResources(graph, 4096);
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeReshapeCopyPreserveContract(
+      {.stageName = "suffix"}, 2, 65536, 32, 4096));
+
+  ASSERT_TRUE(succeeded(
+      registry.applyOrInvalidateAll(graph, {.stageName = "suffix"})));
+  EXPECT_EQ(graph.resources()[source].validity, ValidityState::Invalid);
+  EXPECT_EQ(graph.resources()[view].validity, ValidityState::Invalid);
+}
+
 TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
   MandatoryUBResourceGraph graph;
   graph.addResource({"load0", 262144, 1});
@@ -653,6 +748,44 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
   ASSERT_EQ(result.certificates.size(), 1u);
   EXPECT_EQ(result.certificates[0].kind, "singleton");
   EXPECT_EQ(result.certificates[0].resourceIds.size(), 1u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ReshapeCopyUsesOneAliasClassAfterMaterialization) {
+  TTIRUBAnalysisOptions analysisOptions = options();
+  analysisOptions.stages = {{.stageName = "materialize"}};
+  PipelineContractRegistry reshapeRegistry;
+  reshapeRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(reshapeRegistry.addProfileContract(
+      {.stage = analysisOptions.stages.front(),
+       .contractId = "reshape-copy-max-tiles",
+       .contractVersion = "1"},
+      makeReshapeCopyMaxTilesContract(analysisOptions.stages.front(), 2,
+                                      65536, 32, 262144, 64))));
+  OwningOpRef<ModuleOp> module = parse(kReshapeCopy);
+  ASSERT_TRUE(module);
+
+  TTIRUBAnalysisResult result = analyzeTTIRUBLowerBound(
+      *module, analysisOptions, reshapeRegistry);
+  EXPECT_EQ(result.lowerBoundBytes, 4096);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "singleton");
+  EXPECT_EQ(result.certificates[0].resourceIds.size(), 1u);
+  EXPECT_EQ(result.certificates[0].contractTrace,
+            SmallVector<std::string>({"ttir-reshape-copy-v1",
+                                      "reshape-copy-max-tiles"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       ReshapeCopyWithReorderDefers) {
+  std::string source = replaceOnce(
+      kReshapeCopy, "%view = tt.reshape %value :",
+      "%view = tt.reshape %value allow_reorder :");
+  TTIRUBAnalysisResult result = analyze(source, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-view-dataflow"));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,
@@ -1073,6 +1206,19 @@ TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraAddFResultDefersAsMalformedIR) {
   SmallVector<Type> resultTypes(add->getResultTypes());
   resultTypes.push_back(add.getType());
   replaceWithMalformedOperation(add, resultTypes);
+
+  TTIRUBAnalysisResult result = analyzeModule(*module, options());
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "malformed-ir"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest, ExtraReshapeResultDefersAsMalformedIR) {
+  OwningOpRef<ModuleOp> module = parse(kReshapeCopy);
+  ASSERT_TRUE(module);
+  triton::ReshapeOp reshape = findOnlyOp<triton::ReshapeOp>(*module);
+  SmallVector<Type> resultTypes(reshape->getResultTypes());
+  resultTypes.push_back(reshape.getType());
+  replaceWithMalformedOperation(reshape, resultTypes);
 
   TTIRUBAnalysisResult result = analyzeModule(*module, options());
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);

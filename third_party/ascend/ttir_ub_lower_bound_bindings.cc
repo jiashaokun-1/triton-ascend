@@ -148,11 +148,18 @@ makeProfileContract(const PipelineContractBinding &binding) {
   const bool binaryTransform =
       binding.contractId == "binary-add-max-tiles" &&
       binding.contractVersion == "1";
+  const bool reshapePreserve =
+      binding.contractId == "reshape-copy-preserve" &&
+      binding.contractVersion == "1";
+  const bool reshapeTransform =
+      binding.contractId == "reshape-copy-max-tiles" &&
+      binding.contractVersion == "1";
   SmallVector<StringRef> expectedNames(resourceParameters.begin(),
                                        resourceParameters.end());
-  if (transform || binaryTransform)
+  if (transform || binaryTransform || reshapeTransform)
     expectedNames.push_back("max_tiles");
-  if ((!preserve && !transform && !binaryPreserve && !binaryTransform) ||
+  if ((!preserve && !transform && !binaryPreserve && !binaryTransform &&
+       !reshapePreserve && !reshapeTransform) ||
       !hasExactParameters(binding, expectedNames))
     return nullptr;
 
@@ -176,12 +183,20 @@ makeProfileContract(const PipelineContractBinding &binding) {
     return makeBinaryAddPreserveContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload);
+  if (reshapePreserve)
+    return makeReshapeCopyPreserveContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload);
 
   auto maxTiles = getPositiveInt64Parameter(binding, "max_tiles");
   if (!maxTiles)
     return nullptr;
   if (binaryTransform)
     return makeBinaryAddMaxTilesContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
+  if (reshapeTransform)
+    return makeReshapeCopyMaxTilesContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
   return makeDirectCopyMaxTilesContract(
@@ -281,7 +296,9 @@ bool loadMatchingProfile(const py::handle &value,
         return binding.contractId == "direct-copy-preserve" ||
                binding.contractId == "direct-copy-max-tiles" ||
                binding.contractId == "binary-add-preserve" ||
-               binding.contractId == "binary-add-max-tiles";
+               binding.contractId == "binary-add-max-tiles" ||
+               binding.contractId == "reshape-copy-preserve" ||
+               binding.contractId == "reshape-copy-max-tiles";
       });
   if (containsActiveContract && !allowUncertifiedActiveContracts &&
       !matchedProfileIsCertified)

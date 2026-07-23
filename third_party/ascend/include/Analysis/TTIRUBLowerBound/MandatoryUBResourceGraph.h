@@ -29,7 +29,7 @@ inline constexpr WitnessId InvalidWitnessId =
 
 enum class ValidityState { Valid, Invalid };
 enum class UBAddressSpace { UB };
-enum class MaterializationKind { GMToUBLoad };
+enum class MaterializationKind { GMToUBLoad, ViewAlias };
 
 struct ProgramPoint {
   uint64_t ordinal = 0;
@@ -86,6 +86,10 @@ public:
   LogicalResult appendResourceTrace(ResourceId id, StringRef contractId);
   LogicalResult refineWitnessToMustDistinct(WitnessId id,
                                             StringRef contractId);
+  LogicalResult refineMayAliasToMustAlias(ResourceId lhs, ResourceId rhs,
+                                          StringRef contractId);
+  bool hasMayAlias(ResourceId lhs, ResourceId rhs) const;
+  bool hasMustAlias(ResourceId lhs, ResourceId rhs) const;
   bool hasPairwiseMayAliasWitness(WitnessId id) const;
   bool hasPairwiseDistinctWitness(WitnessId id) const;
   FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;

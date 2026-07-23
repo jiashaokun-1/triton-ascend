@@ -170,7 +170,8 @@ LogicalResult rejectUnsupportedOperations(
       return WalkResult::interrupt();
     }
     if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp,
-            triton::LoadOp, triton::StoreOp, arith::AddFOp>(operation)) {
+            triton::LoadOp, triton::StoreOp, triton::ReshapeOp,
+            arith::AddFOp>(operation)) {
       triton::FuncOp function = operation->getParentOfType<triton::FuncOp>();
       if (matched.contains(operation) && function &&
           isDirectlyInEntryBlock(operation, function) &&
@@ -284,6 +285,151 @@ LogicalResult materializeLoad(triton::LoadOp load,
   matched.insert(destinationChain->splat);
   matched.insert(destinationChain->addPtr);
   matched.insert(load);
+  matched.insert(store);
+  return success();
+}
+
+bool isStrictNoReorderReshape(triton::ReshapeOp reshape, Value source,
+                              int64_t numElements, Type elementType,
+                              unsigned resultRank, triton::FuncOp function) {
+  auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+  auto resultType = dyn_cast<RankedTensorType>(reshape.getType());
+  return reshape && reshape.getSrc() == source && sourceType && resultType &&
+         sourceType.hasStaticShape() && resultType.hasStaticShape() &&
+         sourceType.getNumElements() == numElements &&
+         resultType.getNumElements() == numElements &&
+         sourceType.getElementType() == elementType &&
+         resultType.getElementType() == elementType &&
+         resultType.getRank() == resultRank && !reshape.getAllowReorder() &&
+         !reshape.getEfficientLayout() && reshape->getNumOperands() == 1 &&
+         reshape->getNumResults() == 1 && reshape->getNumRegions() == 0 &&
+         reshape->getNumSuccessors() == 0 &&
+         isDirectlyInEntryBlock(reshape, function) &&
+         reshape.getResult().hasOneUse();
+}
+
+LogicalResult materializeReshapeCopy(
+    triton::LoadOp load, triton::ReshapeOp valueReshape,
+    MandatoryUBResourceGraph &graph, llvm::DenseSet<Operation *> &matched,
+    SmallVectorImpl<std::string> &reasons) {
+  triton::FuncOp function = load->getParentOfType<triton::FuncOp>();
+  if (!function || !isDirectlyInEntryBlock(load, function) ||
+      load->getNumOperands() != 1 || load->getNumResults() != 1 ||
+      load->getNumRegions() != 0 || load->getNumSuccessors() != 0)
+    return defer(reasons, "unsupported-view-load");
+  if (load.getOther() || !load.getBoundaryCheck().empty() ||
+      load.getPadding() || load.getIsVolatile() ||
+      load.getCache() != triton::CacheModifier::NONE ||
+      load.getEvict() != triton::EvictionPolicy::NORMAL)
+    return defer(reasons, "unsupported-load-semantics");
+
+  auto sourceType = dyn_cast<RankedTensorType>(load.getType());
+  if (!sourceType || !sourceType.hasStaticShape() ||
+      sourceType.getRank() != 1)
+    return defer(reasons, "unsupported-view-shape");
+  FailureOr<int64_t> payloadBytes = getPayloadBytes(sourceType, reasons);
+  if (failed(payloadBytes))
+    return failure();
+  const int64_t numElements = sourceType.getNumElements();
+  Type elementType = sourceType.getElementType();
+  if (!load.getResult().hasOneUse() ||
+      !isStrictNoReorderReshape(valueReshape, load.getResult(), numElements,
+                                elementType, 2, function) ||
+      !load->isBeforeInBlock(valueReshape))
+    return defer(reasons, "unsupported-view-dataflow");
+
+  FailureOr<ContiguousPointerChain> sourceChain = matchContiguousPointer(
+      load.getPtr(), function, numElements, elementType, reasons);
+  if (failed(sourceChain))
+    return failure();
+  if (!sourceChain->addPtr.getResult().hasOneUse() ||
+      !sourceChain->addPtr->isBeforeInBlock(load))
+    return defer(reasons, "load-pointer-has-extra-use");
+
+  auto store = dyn_cast<triton::StoreOp>(
+      *valueReshape.getResult().getUsers().begin());
+  if (!store || store->getNumOperands() != 2 || store->getNumResults() != 0 ||
+      store->getNumRegions() != 0 || store->getNumSuccessors() != 0 ||
+      store.getValue() != valueReshape.getResult() ||
+      !isDirectlyInEntryBlock(store, function) ||
+      !valueReshape->isBeforeInBlock(store) ||
+      !store.getBoundaryCheck().empty() ||
+      store.getCache() != triton::CacheModifier::NONE ||
+      store.getEvict() != triton::EvictionPolicy::NORMAL)
+    return defer(reasons, "unsupported-view-store");
+
+  auto pointerReshape = store.getPtr().getDefiningOp<triton::ReshapeOp>();
+  auto pointerResultType =
+      dyn_cast<RankedTensorType>(store.getPtr().getType());
+  auto pointerElementType =
+      pointerResultType
+          ? dyn_cast<triton::PointerType>(pointerResultType.getElementType())
+          : triton::PointerType();
+  auto valueResultType = dyn_cast<RankedTensorType>(valueReshape.getType());
+  if (!pointerReshape || !pointerResultType || !pointerElementType ||
+      !valueResultType ||
+      pointerResultType.getShape() != valueResultType.getShape() ||
+      pointerElementType.getPointeeType() != elementType ||
+      pointerElementType.getAddressSpace() != 1 ||
+      !isStrictNoReorderReshape(
+          pointerReshape, pointerReshape.getSrc(), numElements,
+          pointerResultType.getElementType(), 2, function) ||
+      !pointerReshape->isBeforeInBlock(store))
+    return defer(reasons, "unsupported-view-pointer");
+  FailureOr<ContiguousPointerChain> destinationChain = matchContiguousPointer(
+      pointerReshape.getSrc(), function, numElements, elementType, reasons);
+  if (failed(destinationChain))
+    return failure();
+  if (!destinationChain->addPtr.getResult().hasOneUse() ||
+      sourceChain->range != destinationChain->range ||
+      std::distance(sourceChain->range.getResult().use_begin(),
+                    sourceChain->range.getResult().use_end()) != 2)
+    return defer(reasons, "non-contiguous-pointer");
+
+  MandatoryUBResource sourceResource;
+  sourceResource.debugName = "reshape-copy-input";
+  sourceResource.minPayloadBytes = *payloadBytes;
+  sourceResource.minInstances = 1;
+  sourceResource.origin = "tt.load";
+  sourceResource.kind = MaterializationKind::GMToUBLoad;
+  sourceResource.birth.ordinal =
+      std::distance(function.getBody().front().begin(), load->getIterator());
+  sourceResource.lastRequiredUse.ordinal = std::distance(
+      function.getBody().front().begin(), valueReshape->getIterator());
+  sourceResource.sourceElements = numElements;
+  sourceResource.elementBitWidth = elementType.getIntOrFloatBitWidth();
+  sourceResource.consumer = "tt.reshape";
+  sourceResource.contractTrace.push_back("ttir-reshape-copy-v1");
+  ResourceId sourceId = graph.addResource(std::move(sourceResource));
+
+  MandatoryUBResource viewResource;
+  viewResource.debugName = "reshape-copy-view";
+  viewResource.minPayloadBytes = *payloadBytes;
+  viewResource.minInstances = 1;
+  viewResource.origin = "tt.reshape";
+  viewResource.kind = MaterializationKind::ViewAlias;
+  viewResource.birth.ordinal = std::distance(
+      function.getBody().front().begin(), valueReshape->getIterator());
+  viewResource.lastRequiredUse.ordinal =
+      std::distance(function.getBody().front().begin(), store->getIterator());
+  viewResource.sourceElements = numElements;
+  viewResource.elementBitWidth = elementType.getIntOrFloatBitWidth();
+  viewResource.consumer = "tt.store";
+  viewResource.contractTrace.push_back("ttir-reshape-copy-v1");
+  ResourceId viewId = graph.addResource(std::move(viewResource));
+  if (sourceId == InvalidResourceId || viewId == InvalidResourceId)
+    return defer(reasons, "malformed-resource-graph");
+  graph.addMayAlias(sourceId, viewId);
+
+  matched.insert(sourceChain->range);
+  for (const ContiguousPointerChain &chain :
+       {*sourceChain, *destinationChain}) {
+    matched.insert(chain.splat);
+    matched.insert(chain.addPtr);
+  }
+  matched.insert(load);
+  matched.insert(valueReshape);
+  matched.insert(pointerReshape);
   matched.insert(store);
   return success();
 }
@@ -454,7 +600,17 @@ LogicalResult materializeDirectTensorLoads(
       return failure();
   } else {
     for (triton::LoadOp load : loads) {
-      if (failed(materializeLoad(load, graph, matched, unsupportedReasons)))
+      triton::ReshapeOp reshape;
+      if (load.getResult().hasOneUse())
+        reshape = dyn_cast<triton::ReshapeOp>(
+            *load.getResult().getUsers().begin());
+      LogicalResult result = reshape
+                                 ? materializeReshapeCopy(
+                                       load, reshape, graph, matched,
+                                       unsupportedReasons)
+                                 : materializeLoad(load, graph, matched,
+                                                   unsupportedReasons);
+      if (failed(result))
         return failure();
     }
   }
