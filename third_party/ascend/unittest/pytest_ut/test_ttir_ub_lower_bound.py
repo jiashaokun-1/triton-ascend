@@ -1338,8 +1338,14 @@ def test_profile_loader_rejects_duplicate_identity(monkeypatch, tmp_path):
         load_contract_profiles()
 
 
-def _direct_copy_profile_entry(*, compile_mode="simd", multibuffer=False):
-    relevant_options = {"compile_mode": compile_mode, "multibuffer": multibuffer}
+def _direct_copy_profile_entry(
+    *, compile_mode="simd", multibuffer=False, num_stages=2
+):
+    relevant_options = {
+        "compile_mode": compile_mode,
+        "multibuffer": multibuffer,
+        "num_stages": num_stages,
+    }
     identity = {
         "open_source_pipeline": "pipeline",
         "canonical_ttir_sha256": "a" * 64,
@@ -1442,6 +1448,25 @@ def test_profile_loader_accepts_certified_loop_multibuffer_schema(
         "expected_input_payload_bytes": "262144",
         "expected_step_input_instances": "2",
     }
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
+def test_profile_loader_accepts_num_stages_one_without_multibuffer_contract(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry(multibuffer=True, num_stages=1)
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] = "loop-carried-add-max-tiles"
+    stage["contract_parameters"]["expected_resource_count"] = "2"
+    stage["contract_parameters"]["max_tiles"] = "1"
     document = {
         "schema": "ttir-ub-lb-profile-v1",
         "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,

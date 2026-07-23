@@ -231,15 +231,19 @@ def _is_valid_profile_entry(entry):
     if active_contract_ids:
         if relevant_options.get("compile_mode") != "simd":
             return False
+        effective_multibuffer = (
+            relevant_options.get("multibuffer") is True
+            and relevant_options.get("num_stages") != 1
+        )
         has_multibuffer_contract = (
             "loop-carried-add-multibuffer" in active_contract_ids
         )
         if has_multibuffer_contract:
-            if relevant_options.get("multibuffer") is not True or any(
+            if not effective_multibuffer or any(
                     not contract_id.startswith("loop-carried-add-")
                     for contract_id in active_contract_ids):
                 return False
-        elif relevant_options.get("multibuffer") is not False:
+        elif effective_multibuffer:
             return False
     if entry["contract_version"] != _CONTRACT_VERSION:
         return False

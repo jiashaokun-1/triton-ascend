@@ -53,6 +53,7 @@ class BundleConfig:
     tile_mix_cube_loop: int = 2
     tile_mix_vector_loop: int = 2
     multibuffer: bool = False
+    num_stages: int = 2
 
 
 def _file_sha256(path: Path) -> str:
@@ -87,6 +88,7 @@ def _validate_config(config: BundleConfig) -> int:
         ("max tiles", config.max_tiles),
         ("tile mix cube loop", config.tile_mix_cube_loop),
         ("tile mix vector loop", config.tile_mix_vector_loop),
+        ("num stages", config.num_stages),
     ):
         if type(value) is not int or value <= 0:
             raise BundleError(f"{name} must be a positive integer")
@@ -193,7 +195,7 @@ def create_fixture_bundle(
             config.auto_tile_and_bind_subblock_outcome
         ),
     }
-    if config.multibuffer:
+    if config.multibuffer and config.num_stages != 1:
         contract_proposal["expected_step_input_instances"] = 2
 
     manifest = {
@@ -207,6 +209,7 @@ def create_fixture_bundle(
             "options": {
                 "compile_mode": "simd",
                 "multibuffer": config.multibuffer,
+                "num_stages": config.num_stages,
                 "tile_mix_cube_loop": config.tile_mix_cube_loop,
                 "tile_mix_vector_loop": config.tile_mix_vector_loop,
             },
@@ -265,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tile-mix-cube-loop", type=int, default=2)
     parser.add_argument("--tile-mix-vector-loop", type=int, default=2)
     parser.add_argument("--multibuffer", action="store_true")
+    parser.add_argument("--num-stages", type=int, default=2)
     parser.add_argument("--auto-tile-outcome", type=_parse_outcome, default=None)
     parser.add_argument(
         "--expected-analyzer-decision", choices=("defer", "reject"), default=None
@@ -290,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
                 tile_mix_cube_loop=arguments.tile_mix_cube_loop,
                 tile_mix_vector_loop=arguments.tile_mix_vector_loop,
                 multibuffer=arguments.multibuffer,
+                num_stages=arguments.num_stages,
             ),
             ttir_dump_name=arguments.ttir_dump_name,
             before_dump_name=arguments.before_dump_name,

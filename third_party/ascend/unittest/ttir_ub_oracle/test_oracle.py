@@ -195,6 +195,7 @@ def test_semantic_model_runner_parses_exact_result(monkeypatch, tmp_path):
 def test_suffix_pipeline_arguments_bind_multibuffer_mode():
     assert oracle.suffix_pipeline_arguments({
         "multibuffer": True,
+        "num_stages": 2,
         "tile_mix_cube_loop": 1,
         "tile_mix_vector_loop": 2,
     }) == [
@@ -202,6 +203,12 @@ def test_suffix_pipeline_arguments_bind_multibuffer_mode():
         "--tile-mix-cube-loop=1",
         "--tile-mix-vector-loop=2",
     ]
+    assert oracle.suffix_pipeline_arguments({
+        "multibuffer": True,
+        "num_stages": 1,
+        "tile_mix_cube_loop": 1,
+        "tile_mix_vector_loop": 2,
+    })[0] == "--enable-auto-multi-buffer=false"
 
 
 @pytest.mark.parametrize(
@@ -259,6 +266,7 @@ def _write_manifest(root, **updates):
         "options": {
             "compile_mode": "simd",
             "multibuffer": False,
+            "num_stages": 2,
             "tile_mix_cube_loop": 2,
             "tile_mix_vector_loop": 2,
         },
@@ -346,10 +354,12 @@ def test_manifest_paths_stay_with_fixtures(tmp_path):
     ("options", "error"),
     [
         ({"compile_mode": "simd", "multibuffer": True,
-          "tile_mix_cube_loop": 2, "tile_mix_vector_loop": 2},
+          "num_stages": 2, "tile_mix_cube_loop": 2,
+          "tile_mix_vector_loop": 2},
          "restricted"),
         ({"compile_mode": "simt", "multibuffer": False,
-          "tile_mix_cube_loop": 2, "tile_mix_vector_loop": 2},
+          "num_stages": 2, "tile_mix_cube_loop": 2,
+          "tile_mix_vector_loop": 2},
          "compile_mode=simd"),
         ({"compile_mode": "simd", "tile_mix_cube_loop": 2,
           "tile_mix_vector_loop": 2},
@@ -377,6 +387,22 @@ def test_manifest_accepts_exact_loop_multibuffer_slice(tmp_path):
     assert loaded["cases"][0]["contract_proposal"][
         "expected_step_input_instances"
     ] == 2
+
+
+def test_manifest_num_stages_one_disables_effective_multibuffer(tmp_path):
+    path = _write_manifest(tmp_path)
+    manifest = json.loads(path.read_text())
+    case = manifest["cases"][0]
+    case["operation_family"] = "loop-carried-add"
+    case["options"].update({"multibuffer": True, "num_stages": 1})
+    case["contract_proposal"].update({
+        "expected_resource_count": 2,
+        "max_tiles": 1,
+    })
+    path.write_text(json.dumps(manifest))
+
+    loaded = oracle.load_manifest(path)
+    assert not oracle.effective_auto_multibuffer(loaded["cases"][0]["options"])
 
 
 def test_proposed_contract_chain_transitions_at_materialization_stage():
@@ -483,6 +509,30 @@ def test_loop_carried_multibuffer_chain_raises_step_input_instances():
     assert bindings[1]["contract_parameters"][
         "expected_step_input_instances"
     ] == "2"
+
+
+def test_loop_carried_num_stages_one_keeps_single_buffer_chain():
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 1,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal, "loop-carried-add",
+        {"multibuffer": True, "num_stages": 1},
+    )
+    assert [
+        binding["contract_id"]
+        for binding in profile["profiles"][0]["pipeline_stages"]
+    ] == ["loop-carried-add-max-tiles", "loop-carried-add-preserve"]
 
 
 def test_reshape_copy_contract_chain_uses_view_contracts():

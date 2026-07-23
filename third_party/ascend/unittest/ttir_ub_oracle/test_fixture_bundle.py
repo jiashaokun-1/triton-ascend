@@ -61,6 +61,7 @@ def test_bundle_packages_one_same_dump_pair_for_the_oracle(tmp_path):
     assert case["options"] == {
         "compile_mode": "simd",
         "multibuffer": False,
+        "num_stages": 2,
         "tile_mix_cube_loop": 2,
         "tile_mix_vector_loop": 2,
     }
@@ -241,6 +242,28 @@ def test_bundle_packages_loop_carried_multibuffer_contract(tmp_path):
     case = oracle.load_manifest(Path(result["manifest"]))["cases"][0]
     assert case["options"]["multibuffer"] is True
     assert case["contract_proposal"]["expected_step_input_instances"] == 2
+
+
+def test_bundle_num_stages_one_disables_multibuffer_contract(tmp_path):
+    dump_dir = _dump_dir(
+        tmp_path / "loop-one-stage-dump",
+        allocation_count=2,
+        allocation_elements=65536,
+    )
+    result = bundle.create_fixture_bundle(
+        dump_dir,
+        tmp_path / "loop-one-stage-fixture",
+        _config(
+            name="loop-carried-add-f32-65536-a2-num-stages1",
+            operation_family="loop-carried-add",
+            max_tiles=1,
+            multibuffer=True,
+            num_stages=1,
+        ),
+    )
+    case = oracle.load_manifest(Path(result["manifest"]))["cases"][0]
+    assert case["options"]["num_stages"] == 1
+    assert "expected_step_input_instances" not in case["contract_proposal"]
 
 
 @pytest.mark.parametrize(
