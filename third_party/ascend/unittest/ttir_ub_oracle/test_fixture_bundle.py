@@ -167,4 +167,5 @@ def test_bundle_cli_emits_machine_readable_result(tmp_path, capsys):
     assert payload["before_cvpipelining_allocations_bytes"] == [4096]
     case = oracle.load_manifest(output_dir / "manifest.json")["cases"][0]
     assert case["operation_family"] == "reshape-copy"
+    assert case["expected_analyzer_decision"] is None
     assert case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] is None

@@ -261,8 +261,9 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError("options must be an object")
         if item["options"].get("compile_mode") != "simd" or item["options"].get("multibuffer") is not False:
             raise ManifestError("UB oracle cases require compile_mode=simd and multibuffer=false")
-        if item["expected_analyzer_decision"] not in ("defer", "reject"):
-            raise ManifestError("expected_analyzer_decision must be defer or reject")
+        expected_decision = item["expected_analyzer_decision"]
+        if expected_decision is not None and expected_decision not in ("defer", "reject"):
+            raise ManifestError("expected_analyzer_decision must be defer, reject, or null")
         proposal = item["contract_proposal"]
         if type(proposal) is not dict or set(proposal) != _CONTRACT_PROPOSAL_KEYS:
             raise ManifestError("contract_proposal fields do not match the schema")
@@ -684,11 +685,12 @@ def evaluate(
         try:
             analysis = analyzer(case)
             case_report["analysis"] = analysis
-            if analysis["decision"] != case["expected_analyzer_decision"]:
+            expected_decision = case["expected_analyzer_decision"]
+            if expected_decision is not None and analysis["decision"] != expected_decision:
                 report["violations"].append({
                     "case": case["name"],
                     "kind": "unexpected-analyzer-decision",
-                    "expected": case["expected_analyzer_decision"],
+                    "expected": expected_decision,
                     "actual": analysis["decision"],
                 })
             boundary_bytes = analysis.get("before_cvpipelining_allocation_bytes")

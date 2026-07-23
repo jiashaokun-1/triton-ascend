@@ -95,7 +95,9 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
 `kernel.ttadapter.mlir` 会被拒绝；同时自动推导 input payload、输出两个文件哈希，并拒绝覆盖
 已有 fixture。默认由 oracle 从所有 seed/retry 的真实 snapshot 推导 auto-tile outcome；结果
 不一致时禁止晋升。只有维护已知 golden fixture 时才显式传
-`--auto-tile-outcome true|false` 作为额外断言。
+`--auto-tile-outcome true|false` 作为额外断言。新 fixture 同样不预设 analyzer decision：实际
+`defer` 或 `reject` 会被记录，而每个 `reject` 仍必须由真实 UB overflow 证明。只有锁定 golden
+预期时才传 `--expected-analyzer-decision defer|reject`。
 
 校验命令：
 

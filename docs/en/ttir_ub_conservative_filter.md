@@ -105,7 +105,10 @@ also derives the input payload, emits both file hashes, and refuses to overwrite
 an existing fixture. By default, the oracle derives the auto-tile outcome from
 every real seed/retry snapshot and rejects nondeterministic outcomes. Use an
 explicit `--auto-tile-outcome true|false` only as an additional assertion for a
-known golden fixture.
+known golden fixture. A new fixture also leaves the expected analyzer decision
+unset: the actual `defer` or `reject` is recorded, and every `reject` must still
+be confirmed as a real UB overflow. Use
+`--expected-analyzer-decision defer|reject` only to lock a golden expectation.
 
 Run the comparison with:
 

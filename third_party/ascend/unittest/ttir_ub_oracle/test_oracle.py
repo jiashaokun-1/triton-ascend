@@ -295,6 +295,12 @@ def test_manifest_allows_oracle_to_derive_auto_tile_outcome(tmp_path):
     ] is None
 
 
+def test_manifest_allows_analyzer_decision_without_a_golden_expectation(tmp_path):
+    path = _write_manifest(tmp_path, expected_analyzer_decision=None)
+    loaded = oracle.load_manifest(path)
+    assert loaded["cases"][0]["expected_analyzer_decision"] is None
+
+
 def test_manifest_paths_stay_with_fixtures(tmp_path):
     outside = tmp_path.parent / "outside.ttir"
     outside.write_text("module {}", encoding="utf-8")
@@ -511,6 +517,48 @@ def test_evaluate_derives_one_consistent_auto_tile_outcome(tmp_path):
     assert report["cases"][0]["analysis"][
         "auto_tile_and_bind_subblock_outcome"
     ] is False
+
+
+def test_evaluate_accepts_actual_decision_when_fixture_has_no_golden_expectation(tmp_path):
+    manifest = oracle.load_manifest(
+        _write_manifest(tmp_path, expected_analyzer_decision=None)
+    )
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed,
+            "status": "overflow",
+            "overflow_scope": "UB",
+            "actual_peak_bits": 4096,
+            "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(
+        manifest, Path("compiler"), [0], False,
+        lambda _case: _analysis("reject", 256), run,
+    )
+    assert report["violations"] == []
+
+
+def test_evaluate_keeps_explicit_golden_decision_as_an_assertion(tmp_path):
+    manifest = oracle.load_manifest(_write_manifest(tmp_path))
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed,
+            "status": "overflow",
+            "overflow_scope": "UB",
+            "actual_peak_bits": 4096,
+            "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(
+        manifest, Path("compiler"), [0], False,
+        lambda _case: _analysis("reject", 256), run,
+    )
+    assert {item["kind"] for item in report["violations"]} == {
+        "unexpected-analyzer-decision"
+    }
 
 
 def test_evaluate_rejects_seed_dependent_auto_tile_outcome(tmp_path):

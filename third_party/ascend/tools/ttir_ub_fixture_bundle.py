@@ -44,7 +44,7 @@ class BundleConfig:
     element_bit_width: int
     max_tiles: int
     auto_tile_and_bind_subblock_outcome: bool | None = None
-    expected_analyzer_decision: str = "defer"
+    expected_analyzer_decision: str | None = None
     materialization_stage: str = "ttir.triton-to-linalg"
 
 
@@ -63,8 +63,9 @@ def _validate_config(config: BundleConfig) -> int:
         raise BundleError("unsupported operation family")
     if not config.arch:
         raise BundleError("arch must be non-empty")
-    if config.expected_analyzer_decision not in ("defer", "reject"):
-        raise BundleError("expected analyzer decision must be defer or reject")
+    if (config.expected_analyzer_decision is not None
+            and config.expected_analyzer_decision not in ("defer", "reject")):
+        raise BundleError("expected analyzer decision must be defer, reject, or None")
     if not config.materialization_stage:
         raise BundleError("materialization stage must be non-empty")
     for name, value in (
@@ -231,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tiles", type=int, required=True)
     parser.add_argument("--auto-tile-outcome", type=_parse_outcome, default=None)
     parser.add_argument(
-        "--expected-analyzer-decision", choices=("defer", "reject"), default="defer"
+        "--expected-analyzer-decision", choices=("defer", "reject"), default=None
     )
     parser.add_argument("--materialization-stage", default="ttir.triton-to-linalg")
     parser.add_argument("--ttir-dump-name", default="kernel.ttir.mlir")

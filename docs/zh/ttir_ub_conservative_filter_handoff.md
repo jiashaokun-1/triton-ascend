@@ -477,7 +477,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 ### 10.4 当前验证结果
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
-- UB/策略/oracle 聚焦 Python 测试：310 项通过；
+- UB/策略/oracle 聚焦 Python 测试：313 项通过；
 - `TestAscendTTIRUBLowerBound` 原生 C++ GTest：89 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
@@ -493,7 +493,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 本次基线已执行：
 
-- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：310 项通过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：313 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
 - 普通 C++ GTest：89 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
@@ -552,6 +552,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
   及 int64 边界，不能通过手写 proposal 绕过 source-fact 一致性；
 - 新 fixture 默认把 auto-tile outcome 留为 `null`，由 oracle 从所有 seed/retry 的真实
   `post-TileAndBindSubBlock` snapshot 推导；观察到不同 outcome 会产生 violation 并禁止晋升；
+- 新 fixture 默认也不预设 analyzer decision；实际 `defer/reject` 由 analyzer 产生，但每个
+  `reject` 仍必须在全部真实运行中得到 UB overflow。显式 golden expectation 漂移仍会产生 violation；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
 - debug certificate dump，并在每个 certificate 的 `contract_trace` 中保留实际参与
@@ -746,7 +748,8 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
 `kernel.ttadapter.mlir` 不能通过，也不会覆盖已有 fixture。reshape 路径把
 `--operation-family` 改成 `reshape-copy`。默认由 oracle
 从所有真实 snapshot 推导 outcome；只有维护已知 golden fixture 时才显式传
-`--auto-tile-outcome true|false` 增加预期值断言。
+`--auto-tile-outcome true|false` 增加预期值断言。analyzer decision 默认也不预设；只有维护
+golden fixture 时才传 `--expected-analyzer-decision defer|reject`。
 
 ### 15.4 真实 PlanMemory 对照
 
