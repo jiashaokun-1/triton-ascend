@@ -505,6 +505,40 @@ private:
   int64_t maxTiles;
 };
 
+class LoopCarriedAddMultiBufferContract final
+    : public LoopCarriedAddContractBase {
+public:
+  LoopCarriedAddMultiBufferContract(
+      const PipelineStageContext &stage, int64_t expectedResourceCount,
+      int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+      int64_t expectedInputPayloadBytes, int64_t expectedStepInputInstances)
+      : LoopCarriedAddContractBase(
+            stage, expectedResourceCount, expectedSourceElements,
+            expectedElementBitWidth, expectedInputPayloadBytes),
+        expectedStepInputInstances(expectedStepInputInstances) {}
+
+  StringRef id() const override { return "loop-carried-add-multibuffer"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    // MarkMultiBuffer gives the loop-local GM->UB load two physical buffers.
+    // PlanMemory expands that storage entry into two simultaneously reserved
+    // instances.  The loop-external accumulator remains single-buffered.
+    if (expectedStepInputInstances != 2 ||
+        !matchesResources(graph, /*requireDistinct=*/true))
+      return ContractDisposition::Invalidate;
+    if (failed(graph.raiseResourceInstances(
+            /*id=*/1, expectedStepInputInstances, id())) ||
+        failed(graph.appendResourceTrace(/*id=*/0, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Transform;
+  }
+
+private:
+  int64_t expectedStepInputInstances;
+};
+
 class ReshapeCopyContractBase : public UBResourceContract {
 public:
   ReshapeCopyContractBase(const PipelineStageContext &stage,
@@ -944,6 +978,16 @@ std::unique_ptr<UBResourceContract> makeLoopCarriedAddMaxTilesContract(
   return std::make_unique<LoopCarriedAddMaxTilesContract>(
       stage, expectedResourceCount, expectedSourceElements,
       expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeLoopCarriedAddMultiBufferContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedStepInputInstances) {
+  return std::make_unique<LoopCarriedAddMultiBufferContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes,
+      expectedStepInputInstances);
 }
 
 std::unique_ptr<UBResourceContract> makeReshapeCopyPreserveContract(

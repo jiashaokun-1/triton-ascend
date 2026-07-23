@@ -306,6 +306,25 @@ TEST(MandatoryUBResourceGraph, ArithmeticOverflowFailsClosed) {
   EXPECT_TRUE(failed(graph.solveSingletonLowerBound()));
 }
 
+TEST(MandatoryUBResourceGraph, ResourceInstancesAreMonotonicLowerBounds) {
+  MandatoryUBResourceGraph graph;
+  auto id = graph.addResource({"loop-step", 64, 1});
+  ASSERT_TRUE(
+      succeeded(graph.raiseResourceInstances(id, 2, "multibuffer-factor-2")));
+  EXPECT_EQ(graph.resources()[id].minInstances, 2);
+  auto result = graph.solveSingletonLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->bytes, 128);
+  EXPECT_EQ(result->contractTrace,
+            SmallVector<std::string>({"multibuffer-factor-2"}));
+
+  MandatoryUBResourceGraph invalid;
+  auto invalidId = invalid.addResource({"loop-step", 64, 2});
+  EXPECT_TRUE(
+      failed(invalid.raiseResourceInstances(invalidId, 1, "illegal-lowering")));
+  EXPECT_TRUE(failed(invalid.solveSingletonLowerBound()));
+}
+
 TEST(MandatoryUBResourceGraph, PairwiseOverlapIsNotAThreeWayWitness) {
   MandatoryUBResourceGraph graph;
   auto a = graph.addResource({"a", 32, 1});
@@ -1030,6 +1049,43 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
 
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unsupported-loop-bounds"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoopCarriedAddMultiBufferRaisesStepInputInstances) {
+  TTIRUBAnalysisOptions analysisOptions = options("Ascend910B1");
+  analysisOptions.stages = {{.stageName = "materialize"},
+                            {.stageName = "suffix"}};
+  PipelineContractRegistry loopRegistry;
+  loopRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(loopRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[0],
+       .contractId = "loop-carried-add-max-tiles",
+       .contractVersion = "1"},
+      makeLoopCarriedAddMaxTilesContract(analysisOptions.stages[0], 2, 65536,
+                                         32, 262144, 1))));
+  ASSERT_TRUE(succeeded(loopRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[1],
+       .contractId = "loop-carried-add-multibuffer",
+       .contractVersion = "1"},
+      makeLoopCarriedAddMultiBufferContract(
+          analysisOptions.stages[1], 2, 65536, 32, 262144, 2))));
+  OwningOpRef<ModuleOp> module = parse(kLoopCarriedAdd);
+  ASSERT_TRUE(module);
+
+  TTIRUBAnalysisResult result =
+      analyzeTTIRUBLowerBound(*module, analysisOptions, loopRegistry);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Reject);
+  EXPECT_EQ(result.lowerBoundBytes, 786432);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].resourceIds,
+            SmallVector<ResourceId>({0, 1}));
+  EXPECT_EQ(
+      result.certificates[0].contractTrace,
+      SmallVector<std::string>({"ttir-loop-carried-add-v1",
+                                "loop-carried-add-max-tiles",
+                                "loop-carried-add-multibuffer"}));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,

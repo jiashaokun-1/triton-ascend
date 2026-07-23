@@ -154,6 +154,9 @@ makeProfileContract(const PipelineContractBinding &binding) {
   const bool loopTransform =
       binding.contractId == "loop-carried-add-max-tiles" &&
       binding.contractVersion == "1";
+  const bool loopMultiBuffer =
+      binding.contractId == "loop-carried-add-multibuffer" &&
+      binding.contractVersion == "1";
   const bool reshapePreserve =
       binding.contractId == "reshape-copy-preserve" &&
       binding.contractVersion == "1";
@@ -178,8 +181,11 @@ makeProfileContract(const PipelineContractBinding &binding) {
   if (transform || binaryTransform || loopTransform || reshapeTransform ||
       reductionTransform)
     expectedNames.push_back("max_tiles");
+  if (loopMultiBuffer)
+    expectedNames.push_back("expected_step_input_instances");
   if ((!preserve && !transform && !binaryPreserve && !binaryTransform &&
-       !loopPreserve && !loopTransform && !reshapePreserve &&
+       !loopPreserve && !loopTransform && !loopMultiBuffer &&
+       !reshapePreserve &&
        !reshapeTransform && !reductionPreserve && !reductionTransform &&
        !reductionExtraBuffer) ||
       !hasExactParameters(binding, expectedNames))
@@ -233,6 +239,16 @@ makeProfileContract(const PipelineContractBinding &binding) {
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload,
         *scratchPayload, *accumulatorPayload);
+  if (loopMultiBuffer) {
+    auto stepInputInstances = getPositiveInt64Parameter(
+        binding, "expected_step_input_instances");
+    if (!stepInputInstances)
+      return nullptr;
+    return makeLoopCarriedAddMultiBufferContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload,
+        *stepInputInstances);
+  }
 
   auto maxTiles = getPositiveInt64Parameter(binding, "max_tiles");
   if (!maxTiles)
@@ -354,6 +370,7 @@ bool loadMatchingProfile(const py::handle &value,
                binding.contractId == "binary-add-max-tiles" ||
                binding.contractId == "loop-carried-add-preserve" ||
                binding.contractId == "loop-carried-add-max-tiles" ||
+               binding.contractId == "loop-carried-add-multibuffer" ||
                binding.contractId == "reshape-copy-preserve" ||
                binding.contractId == "reshape-copy-max-tiles" ||
                binding.contractId == "reduction-sum-preserve" ||

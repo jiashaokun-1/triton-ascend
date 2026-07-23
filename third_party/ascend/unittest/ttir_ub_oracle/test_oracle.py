@@ -192,6 +192,18 @@ def test_semantic_model_runner_parses_exact_result(monkeypatch, tmp_path):
     }
 
 
+def test_suffix_pipeline_arguments_bind_multibuffer_mode():
+    assert oracle.suffix_pipeline_arguments({
+        "multibuffer": True,
+        "tile_mix_cube_loop": 1,
+        "tile_mix_vector_loop": 2,
+    }) == [
+        "--enable-auto-multi-buffer=true",
+        "--tile-mix-cube-loop=1",
+        "--tile-mix-vector-loop=2",
+    ]
+
+
 @pytest.mark.parametrize(
     "update",
     [
@@ -335,7 +347,7 @@ def test_manifest_paths_stay_with_fixtures(tmp_path):
     [
         ({"compile_mode": "simd", "multibuffer": True,
           "tile_mix_cube_loop": 2, "tile_mix_vector_loop": 2},
-         "compile_mode=simd"),
+         "restricted"),
         ({"compile_mode": "simt", "multibuffer": False,
           "tile_mix_cube_loop": 2, "tile_mix_vector_loop": 2},
          "compile_mode=simd"),
@@ -347,6 +359,24 @@ def test_manifest_paths_stay_with_fixtures(tmp_path):
 def test_manifest_restricts_first_direct_copy_profile(options, error, tmp_path):
     with pytest.raises(oracle.ManifestError, match=error):
         oracle.load_manifest(_write_manifest(tmp_path, options=options))
+
+
+def test_manifest_accepts_exact_loop_multibuffer_slice(tmp_path):
+    path = _write_manifest(tmp_path)
+    manifest = json.loads(path.read_text())
+    case = manifest["cases"][0]
+    case["operation_family"] = "loop-carried-add"
+    case["options"]["multibuffer"] = True
+    proposal = case["contract_proposal"]
+    proposal["expected_resource_count"] = 2
+    proposal["max_tiles"] = 1
+    proposal["expected_step_input_instances"] = 2
+    path.write_text(json.dumps(manifest))
+
+    loaded = oracle.load_manifest(path)
+    assert loaded["cases"][0]["contract_proposal"][
+        "expected_step_input_instances"
+    ] == 2
 
 
 def test_proposed_contract_chain_transitions_at_materialization_stage():
@@ -427,6 +457,34 @@ def test_loop_carried_contract_chain_keeps_full_iteration_payload():
     ] == "262144"
 
 
+def test_loop_carried_multibuffer_chain_raises_step_input_instances():
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 1,
+        "expected_step_input_instances": 2,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal, "loop-carried-add"
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+    assert [binding["contract_id"] for binding in bindings] == [
+        "loop-carried-add-max-tiles",
+        "loop-carried-add-multibuffer",
+    ]
+    assert bindings[1]["contract_parameters"][
+        "expected_step_input_instances"
+    ] == "2"
+
+
 def test_reshape_copy_contract_chain_uses_view_contracts():
     proposal = {
         "expected_resource_count": 2,
@@ -494,7 +552,10 @@ def test_proposed_contract_chain_requires_unique_materialization_stage():
         )
 
 
-def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-copy"):
+def _analysis(
+    decision="defer", lower_bound_bytes=0, operation_family="direct-copy",
+    multibuffer=False,
+):
     is_binary_add = operation_family == "binary-add"
     is_loop_carried = operation_family == "loop-carried-add"
     is_reshape_copy = operation_family == "reshape-copy"
@@ -516,6 +577,8 @@ def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-co
     contract_trace = [matcher_trace, materialization_id]
     if is_reduction:
         contract_trace.append("reduction-sum-extra-buffer")
+    elif is_loop_carried and multibuffer:
+        contract_trace.append("loop-carried-add-multibuffer")
     certificate = {
         "kind": "witness" if (
             is_binary_add or is_loop_carried or is_reduction
@@ -558,6 +621,17 @@ def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-co
             "contract_id": "reduction-sum-extra-buffer",
             "contract_version": "1",
             "contract_parameters": common_parameters,
+        })
+    elif is_loop_carried and multibuffer:
+        stages.append({
+            "stage_name": "bisheng.ub-affecting-suffix",
+            "options": {},
+            "contract_id": "loop-carried-add-multibuffer",
+            "contract_version": "1",
+            "contract_parameters": {
+                **common_parameters,
+                "expected_step_input_instances": "2",
+            },
         })
     return {
         "operation_family": operation_family,
@@ -614,6 +688,18 @@ def test_reduction_sum_bridge_adds_validated_suffix_resources():
     assert oracle.has_valid_certificate(analysis)
     assert oracle.has_valid_materialization_bridge(analysis)
     analysis["lower_bound_bytes"] -= 4
+    assert not oracle.has_valid_materialization_bridge(analysis)
+
+
+def test_loop_multibuffer_bridge_counts_two_step_input_instances():
+    analysis = _analysis(
+        "reject", 786432, "loop-carried-add", multibuffer=True
+    )
+    assert oracle.has_valid_certificate(analysis)
+    assert oracle.has_valid_materialization_bridge(analysis)
+    analysis["pipeline_stages_detail"][1]["contract_parameters"][
+        "expected_step_input_instances"
+    ] = "3"
     assert not oracle.has_valid_materialization_bridge(analysis)
 
 

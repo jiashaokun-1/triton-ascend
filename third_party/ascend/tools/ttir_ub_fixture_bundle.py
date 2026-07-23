@@ -52,6 +52,7 @@ class BundleConfig:
     materialization_stage: str = "ttir.triton-to-linalg"
     tile_mix_cube_loop: int = 2
     tile_mix_vector_loop: int = 2
+    multibuffer: bool = False
 
 
 def _file_sha256(path: Path) -> str:
@@ -74,6 +75,12 @@ def _validate_config(config: BundleConfig) -> int:
         raise BundleError("expected analyzer decision must be defer, reject, or None")
     if not config.materialization_stage:
         raise BundleError("materialization stage must be non-empty")
+    if type(config.multibuffer) is not bool:
+        raise BundleError("multibuffer must be boolean")
+    if config.multibuffer and config.operation_family != "loop-carried-add":
+        raise BundleError(
+            "multibuffer is currently restricted to loop-carried-add"
+        )
     for name, value in (
         ("source elements", config.source_elements),
         ("element bit width", config.element_bit_width),
@@ -173,6 +180,22 @@ def create_fixture_bundle(
     if existing:
         raise BundleError(f"refusing to overwrite existing fixture files: {', '.join(existing)}")
 
+    contract_proposal = {
+        "expected_resource_count": _OPERATION_FAMILY_RESOURCE_COUNTS[
+            config.operation_family
+        ],
+        "expected_source_elements": config.source_elements,
+        "expected_element_bit_width": config.element_bit_width,
+        "expected_input_payload_bytes": payload_bytes,
+        "materialization_stage": config.materialization_stage,
+        "max_tiles": config.max_tiles,
+        "auto_tile_and_bind_subblock_outcome": (
+            config.auto_tile_and_bind_subblock_outcome
+        ),
+    }
+    if config.multibuffer:
+        contract_proposal["expected_step_input_instances"] = 2
+
     manifest = {
         "schema": "ttir-ub-oracle-v1",
         "cases": [{
@@ -183,24 +206,12 @@ def create_fixture_bundle(
             "arch": config.arch,
             "options": {
                 "compile_mode": "simd",
-                "multibuffer": False,
+                "multibuffer": config.multibuffer,
                 "tile_mix_cube_loop": config.tile_mix_cube_loop,
                 "tile_mix_vector_loop": config.tile_mix_vector_loop,
             },
             "expected_analyzer_decision": config.expected_analyzer_decision,
-            "contract_proposal": {
-                "expected_resource_count": _OPERATION_FAMILY_RESOURCE_COUNTS[
-                    config.operation_family
-                ],
-                "expected_source_elements": config.source_elements,
-                "expected_element_bit_width": config.element_bit_width,
-                "expected_input_payload_bytes": payload_bytes,
-                "materialization_stage": config.materialization_stage,
-                "max_tiles": config.max_tiles,
-                "auto_tile_and_bind_subblock_outcome": (
-                    config.auto_tile_and_bind_subblock_outcome
-                ),
-            },
+            "contract_proposal": contract_proposal,
         }],
     }
 
@@ -253,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tiles", type=int, required=True)
     parser.add_argument("--tile-mix-cube-loop", type=int, default=2)
     parser.add_argument("--tile-mix-vector-loop", type=int, default=2)
+    parser.add_argument("--multibuffer", action="store_true")
     parser.add_argument("--auto-tile-outcome", type=_parse_outcome, default=None)
     parser.add_argument(
         "--expected-analyzer-decision", choices=("defer", "reject"), default=None
@@ -277,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
                 materialization_stage=arguments.materialization_stage,
                 tile_mix_cube_loop=arguments.tile_mix_cube_loop,
                 tile_mix_vector_loop=arguments.tile_mix_vector_loop,
+                multibuffer=arguments.multibuffer,
             ),
             ttir_dump_name=arguments.ttir_dump_name,
             before_dump_name=arguments.before_dump_name,

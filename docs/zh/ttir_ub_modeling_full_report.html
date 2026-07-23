@@ -172,7 +172,7 @@
         <div class="grid-3">
           <div class="card blue"><h3>模型定位</h3><p>以抽象解释/语义事实传播为主，辅以解析公式；不是统计回归，也不是完整后端模拟器。</p></div>
           <div class="card violet"><h3>核心资产</h3><p><span class="mono">MURG</span> 保存资源下界事实；<span class="mono">UBResourceContract</span> 负责逐 lowering stage 更新这些事实。</p></div>
-          <div class="card amber"><h3>当前事实</h3><p>P0 可执行合同链已接通；direct-copy、binary-add、reshape-copy、reduction-sum 与 loop-carried-add 五类切片均已在目标 CANN 环境完成 analyzer + 独立 semantic replay + 真实 PlanMemory 的 20 seeds/retry 零违规验证，并生成待人工审核 candidate。packaged profile 仍为空，因此真实运行继续安全 <span class="mono">defer</span>。</p></div>
+          <div class="card amber"><h3>当前事实</h3><p>P0 可执行合同链已接通；direct-copy、binary-add、reshape-copy、reduction-sum 与 loop-carried-add 五类切片，以及 loop-carried-add 的固定双缓冲子切片，均已在目标 CANN 环境完成 analyzer + 独立 semantic replay + 真实 PlanMemory 的 20 seeds/retry 零违规验证，并生成待人工审核 candidate。packaged profile 仍为空，因此真实运行继续安全 <span class="mono">defer</span>。</p></div>
         </div>
         <div class="meta">
           <span class="pill">分支：codex/ttir-ub-conservative-filter</span>
@@ -369,12 +369,12 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="table-wrap"><table>
           <thead><tr><th>字段/关系</th><th>目标来源</th><th>当前实现</th></tr></thead>
           <tbody>
-            <tr><td><span class="mono">minPayloadBytes</span></td><td>TTIR static shape × element bytes；后续由 tiling/materialization contracts 单调转换</td><td>direct load 已实现</td></tr>
-            <tr><td><span class="mono">minInstances</span></td><td>pipeline depth、loop、CV/multibuffer contracts</td><td>固定为 1</td></tr>
-            <tr><td><span class="mono">birth / lastRequiredUse</span></td><td>SSA liveness 候选 + lowering/bufferization 后置保证</td><td>字段存在，未有效填充</td></tr>
-            <tr><td><span class="mono">mustAlias / mayAlias</span></td><td>view/inplace 语义、bufferization alias contract</td><td>图 API 存在，matcher 未填充</td></tr>
-            <tr><td><span class="mono">mustDistinct</span></td><td>独立 allocation 或语义上不可复用的证明</td><td>图 API 存在，生产未使用</td></tr>
-            <tr><td><span class="mono">CoexistenceWitness</span></td><td>同一 program point 的 liveness/operation 输入需求与 contract trace</td><td>solver 已实现，生产未启用</td></tr>
+            <tr><td><span class="mono">minPayloadBytes</span></td><td>TTIR static shape × element bytes；后续由 tiling/materialization contracts 单调转换</td><td>五类严格 matcher 与 materialization 切片已实现</td></tr>
+            <tr><td><span class="mono">minInstances</span></td><td>pipeline depth、loop、CV/multibuffer contracts</td><td>默认 1；受限 loop step-input 已由 suffix contract 单调提升为 2</td></tr>
+            <tr><td><span class="mono">birth / lastRequiredUse</span></td><td>SSA liveness 候选 + lowering/bufferization 后置保证</td><td>binary、reduction、loop 切片已填充并由合同核对</td></tr>
+            <tr><td><span class="mono">mustAlias / mayAlias</span></td><td>view/inplace 语义、bufferization alias contract</td><td>reshape mustAlias 与多输入 mayAlias 已实现</td></tr>
+            <tr><td><span class="mono">mustDistinct</span></td><td>独立 allocation 或语义上不可复用的证明</td><td>binary、reduction、loop 物化合同已实现</td></tr>
+            <tr><td><span class="mono">CoexistenceWitness</span></td><td>同一 program point 的 liveness/operation 输入需求与 contract trace</td><td>binary、reduction、loop 已进入 witness solver</td></tr>
             <tr><td><span class="mono">validity / trace</span></td><td>matcher + 每个 stage contract</td><td>基础能力已实现</td></tr>
           </tbody>
         </table></div>
@@ -526,10 +526,10 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct；binary-add 与 loop-carried-add 候选链已实现双 allocation 证明，reduction-sum 候选链由 suffix extra-buffer 合同证明 input/scratch/accumulator 三者 pairwise mustDistinct。</span><span class="status now">P2/P3 slices implemented</span></div>
         <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness；binary-add 要求两个不同 birth、同一 lastRequiredUse；reduction-sum 要求 input/scratch/accumulator 在 reduce 点共存；loop-carried-add 要求 accumulator 跨越整个 loop，iteration input 在 loop program point 产生并消费。</span><span class="status now">Binary/reduction/loop slices implemented</span></div>
         <div class="contract"><code>AlignmentContract</code><span>证明 planner 强制 alignment 的最小 padding；首版可忽略以保持更小下界。</span><span class="status todo">P5</span></div>
-        <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存。</span><span class="status todo">P3/P4</span></div>
+        <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存；当前 <span class="mono">loop-carried-add-multibuffer@1</span> 只接受 loop-local step load 的固定 factor=2，并把该资源的 <span class="mono">minInstances</span> 从 1 提升为 2。</span><span class="status now">P3 factor=2 slice implemented</span></div>
         <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status todo">P0</span></div>
 
-        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 12 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>；direct-copy、binary-add、reshape-copy、loop-carried-add 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>；以及 <span class="mono">reduction-sum-preserve@1</span>、<span class="mono">reduction-sum-max-tiles@1</span>、<span class="mono">reduction-sum-extra-buffer@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入/临时 payload 和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证后自动安装的合同仍为 0。</div>
+        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 13 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>；direct-copy、binary-add、reshape-copy、loop-carried-add 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>；<span class="mono">loop-carried-add-multibuffer@1</span>；以及 <span class="mono">reduction-sum-preserve@1</span>、<span class="mono">reduction-sum-max-tiles@1</span>、<span class="mono">reduction-sum-extra-buffer@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入/临时 payload、实例数和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证后自动安装的合同仍为 0。</div>
       </section>
 
       <section class="sheet" id="solver">
@@ -568,8 +568,8 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
             <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
-            <tr><td>目标 CANN oracle gate</td><td><span class="tag fact">五类已通过</span></td><td>99 项 C++ GTest；五类切片的 contract / semantic replay / real PlanMemory 在 20 seeds + retry 上均为 0 violation / 0 unavailable</td></tr>
-            <tr><td>Production contracts</td><td><span class="tag plan">候选合同 11 / 已认证 0</span></td><td>direct-copy、binary-add、reshape-copy、reduction-sum 与 loop-carried-add transfer function 已可执行；packaged profile 仍为空</td></tr>
+            <tr><td>目标 CANN oracle gate</td><td><span class="tag fact">五类 + 双缓冲子切片已通过</span></td><td>101 项 C++ GTest、219 项 Python/binding 测试；6 个真实 oracle case 的 contract / semantic replay / PlanMemory 在 20 seeds + retry 上均为 0 violation / 0 unavailable</td></tr>
+            <tr><td>Production contracts</td><td><span class="tag plan">候选合同 12 / 已认证 0</span></td><td>五类 operation transfer function 与 loop factor=2 的 minInstances transfer 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
         </table></div>
@@ -602,10 +602,11 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <h3>P3 · Reduction、loop 与 multibuffer <span class="tag plan">In progress</span></h3>
             <p>第一条 reduction 最小切片已实现：严格匹配唯一的一维连续 <span class="mono">f32 load → tt.reduce(axis=0, arith.addf) → scalar store</span>，只接受偶数元素、无 mask/特殊 cache/fast-math、单一 reducer region 和单一结果 use。matcher 建立三条逻辑资源：输入 payload、<span class="mono">ReductionScratch = input/2</span>、4-byte <span class="mono">ReductionAccumulator</span>，并记录三资源 CoexistenceWitness；任何 shape、combiner、dataflow 或 store 语义漂移均具名 defer。</p>
             <p>合同链不是把 scratch 当成 TTIR 已有 allocation：<span class="mono">reduction-sum-preserve@1</span> 只传递资源事实；当前 <span class="mono">reduction-sum-max-tiles@1</span> 只接受经真实 lowering 认证的 <span class="mono">max_tiles=1</span>；直到原子 BiSheng suffix 的 <span class="mono">reduction-sum-extra-buffer@1</span> 验证 <span class="mono">AllocExtraBuffer</span> 行为后，才把 input/scratch/accumulator 从 pairwise mayAlias 精化为 pairwise mustDistinct，solver 才能给出三者之和的 witness certificate。多 tile reduction 没有套用未经证明的公式，继续 defer。</p>
-            <p class="small"><strong>真实证据：</strong>before-CVPipelining snapshot 只有一个 262144-byte source allocation；现有语义模型的 debug 账本显示 reduction scratch 为 131072 bytes、accumulator 为 4 bytes，三者在 reduction 点同时存活，实际未对齐峰值为 393220 bytes。analyzer 因此给出同值下界和 <span class="mono">resource_ids=[0,1,2]</span> 证书；真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到对齐后的 3145984 bits UB overflow（capacity 1572864 bits），auto-tile outcome 全为 false，4-case 联合报告 violations/unavailable 均为 0。candidate 已生成但未安装。</p>
+            <p class="small"><strong>真实证据：</strong>before-CVPipelining snapshot 只有一个 262144-byte source allocation；现有语义模型的 debug 账本显示 reduction scratch 为 131072 bytes、accumulator 为 4 bytes，三者在 reduction 点同时存活，实际未对齐峰值为 393220 bytes。analyzer 因此给出同值下界和 <span class="mono">resource_ids=[0,1,2]</span> 证书；真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到对齐后的 3145984 bits UB overflow（capacity 1572864 bits），auto-tile outcome 全为 false，6-case 联合报告 violations/unavailable 均为 0。candidate 已生成但未安装。</p>
             <p>第二条 loop-carried liveness 最小切片已实现：严格匹配固定 <span class="mono">0..2 step 1</span> 的单 <span class="mono">scf.for</span>，数据流必须是 <span class="mono">init load → iter_arg accumulator</span>，loop body 只能包含 <span class="mono">step load → arith.addf(acc, step) → scf.yield</span>，loop 结果单独写回。matcher 建立 <span class="mono">loop-carried-accumulator</span> 与 <span class="mono">loop-step-input</span> 两条资源：前者从 loop 前的 load 活到 loop 后 store，后者在 loop program point 产生并消费，并建立二资源 CoexistenceWitness。trip count、body、fast-math、pointer、load/store 或 use 数量任一漂移均 defer。</p>
             <p><span class="mono">loop-carried-add-preserve@1</span> 只能保持已知 liveness；<span class="mono">loop-carried-add-max-tiles@1</span> 仅接受真实认证的 <span class="mono">max_tiles=1</span>，并在物化阶段确认两个独立 allocation 后把 mayAlias 精化为 mustDistinct。真实 before-CVPipelining snapshot 显示 loop 外 accumulator allocation 和 loop 内 step allocation 各 262144 bytes；analyzer 下界为 524288 bytes。真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到 4194304 bits UB overflow（capacity 1572864 bits），auto-tile outcome 全为 false，violations/unavailable 均为 0；candidate 已生成但未安装。</p>
-            <p class="small"><strong>剩余工作：</strong>实现 <span class="mono">minInstances</span> 和 multi-buffer coexistence；为 num_stages、更多 loop depth/trip count、buffer count 的边界组合补同编译 snapshot、semantic replay 与真实 PlanMemory fixtures。<strong>验收：</strong>当前 loop 证据不得外推到不同 bounds、嵌套 loop、scan、argmin/argmax、多 tile 或 multibuffer。</p>
+            <p>第三条固定 multibuffer 子切片已实现：真实 <span class="mono">MarkMultiBuffer</span> 只对 loop 内 GM→UB step load 标记 factor=2，PlanMemory 随后把该 storage entry 展开为两份物理实例。<span class="mono">loop-carried-add-multibuffer@1</span> 仅在前序合同已经证明两个资源 mustDistinct、suffix stage 与 options 精确匹配且实例参数恰为 2 时，调用单调的 <span class="mono">raiseResourceInstances(step, 2)</span>；accumulator 仍为一份。因此 analyzer 下界为 <span class="mono">262144 + 2 × 262144 = 786432 bytes</span>。真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到 6291456 bits UB overflow（capacity 1572864 bits），6-case 联合报告 violations/unavailable 均为 0；candidate 已生成但未安装。</p>
+            <p class="small"><strong>剩余工作：</strong>为 num_stages、更多 loop depth/trip count、buffer count、preload factor=4，以及 Dynamic CV inner/outer multibuffer 的边界组合补同编译 snapshot、semantic replay 与真实 PlanMemory fixtures。<strong>验收：</strong>当前证据不得外推到 factor≠2、不同 bounds、嵌套 loop、scan、argmin/argmax、多 tile、preload 或 Dynamic CV multibuffer。</p>
           </div>
           <div class="phase">
             <h3>P4 · Dynamic CV / MIX / irregular memory</h3>
@@ -688,7 +689,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <li><span class="mono">.../src/pipeline/modeling_result.hpp</span> — Exact/Incomplete 与 OracleExact/Partial/UBInvariant/Unsupported 覆盖语义。</li>
           <li><span class="mono">.../src/ir/semantic_ir.hpp</span> — allocation、gen/kill、lifetime、inplace、multibuffer 与 PlanMemory 结果。</li>
         </ul>
-        <div class="callout green"><strong>最终建议：</strong>P0 合同链与 direct-copy、binary-add、reshape-copy、reduction-sum、loop-carried-add 五类候选切片已经闭环；下一阶段不要另写一套 CV pass 模拟。先人工审核五类 candidate 与证据报告，再以同样的真实 boundary + semantic replay + PlanMemory 门禁扩展 multibuffer coverage matrix；证据不足的 operation family 继续 defer。</div>
+        <div class="callout green"><strong>最终建议：</strong>P0 合同链与 direct-copy、binary-add、reshape-copy、reduction-sum、loop-carried-add 五类候选切片，以及 loop factor=2 的 minInstances 子切片已经闭环；下一阶段不要另写一套 CV pass 模拟。先人工审核 candidate 与证据报告，再以同样的真实 boundary + semantic replay + PlanMemory 门禁扩展 preload、Dynamic CV inner/outer multibuffer coverage matrix；证据不足的 operation family 继续 defer。</div>
         <p class="footer">TTIR UB Conservative Lower-Bound Modeling · Internal Technical Brief</p>
       </section>
     </main>

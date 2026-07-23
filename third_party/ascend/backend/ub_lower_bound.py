@@ -123,6 +123,11 @@ def _is_valid_profile_stage(stage):
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
     if contract_id == "loop-carried-add-max-tiles":
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
+    if contract_id == "loop-carried-add-multibuffer":
+        return _has_positive_decimal_parameters(
+            parameters,
+            _DIRECT_COPY_PARAMETER_KEYS | {"expected_step_input_instances"},
+        ) and parameters["expected_step_input_instances"] == "2"
     if contract_id == "reshape-copy-preserve":
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
     if contract_id == "reshape-copy-max-tiles":
@@ -216,11 +221,25 @@ def _is_valid_profile_entry(entry):
         return False
     if not all(_is_valid_profile_stage(stage) for stage in stages):
         return False
-    if any(stage["contract_id"].startswith(
+    active_contract_ids = [
+        stage["contract_id"] for stage in stages
+        if stage["contract_id"].startswith(
             ("direct-copy-", "binary-add-", "loop-carried-add-",
-             "reshape-copy-", "reduction-sum-"))
-           for stage in stages):
-        if relevant_options.get("compile_mode") != "simd" or relevant_options.get("multibuffer") is not False:
+             "reshape-copy-", "reduction-sum-")
+        )
+    ]
+    if active_contract_ids:
+        if relevant_options.get("compile_mode") != "simd":
+            return False
+        has_multibuffer_contract = (
+            "loop-carried-add-multibuffer" in active_contract_ids
+        )
+        if has_multibuffer_contract:
+            if relevant_options.get("multibuffer") is not True or any(
+                    not contract_id.startswith("loop-carried-add-")
+                    for contract_id in active_contract_ids):
+                return False
+        elif relevant_options.get("multibuffer") is not False:
             return False
     if entry["contract_version"] != _CONTRACT_VERSION:
         return False

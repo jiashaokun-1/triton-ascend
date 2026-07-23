@@ -85,6 +85,9 @@ _CONTRACT_PROPOSAL_KEYS = frozenset({
     "max_tiles",
     "auto_tile_and_bind_subblock_outcome",
 })
+_MULTIBUFFER_CONTRACT_PROPOSAL_KEYS = (
+    _CONTRACT_PROPOSAL_KEYS | {"expected_step_input_instances"}
+)
 _IDENTITY_CONTRACT = {
     "auto_tile_and_bind_subblock": {
         "identity_value": "module-derived-per-exact-ttir",
@@ -284,8 +287,15 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError("arch must be a non-empty string")
         if type(item["options"]) is not dict or set(item["options"]) != _CASE_OPTION_KEYS:
             raise ManifestError("options fields do not match the schema")
-        if item["options"].get("compile_mode") != "simd" or item["options"].get("multibuffer") is not False:
-            raise ManifestError("UB oracle cases require compile_mode=simd and multibuffer=false")
+        if item["options"].get("compile_mode") != "simd":
+            raise ManifestError("UB oracle cases require compile_mode=simd")
+        multibuffer = item["options"].get("multibuffer")
+        if type(multibuffer) is not bool:
+            raise ManifestError("options.multibuffer must be boolean")
+        if multibuffer and family != "loop-carried-add":
+            raise ManifestError(
+                "multibuffer=true is currently restricted to loop-carried-add"
+            )
         for field in ("tile_mix_cube_loop", "tile_mix_vector_loop"):
             if type(item["options"][field]) is not int or item["options"][field] <= 0:
                 raise ManifestError(f"options.{field} must be a positive integer")
@@ -293,7 +303,11 @@ def load_manifest(path: Path) -> dict:
         if expected_decision is not None and expected_decision not in ("defer", "reject"):
             raise ManifestError("expected_analyzer_decision must be defer, reject, or null")
         proposal = item["contract_proposal"]
-        if type(proposal) is not dict or set(proposal) != _CONTRACT_PROPOSAL_KEYS:
+        expected_proposal_keys = (
+            _MULTIBUFFER_CONTRACT_PROPOSAL_KEYS
+            if multibuffer else _CONTRACT_PROPOSAL_KEYS
+        )
+        if type(proposal) is not dict or set(proposal) != expected_proposal_keys:
             raise ManifestError("contract_proposal fields do not match the schema")
         for field in (
             "expected_resource_count",
@@ -344,6 +358,10 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError(
                 "loop-carried-add currently requires f32 input and max_tiles=1"
             )
+        if multibuffer and proposal["expected_step_input_instances"] != 2:
+            raise ManifestError(
+                "loop-carried-add multibuffer currently requires exactly two step-input instances"
+            )
         case = dict(item)
         case["ttir"] = _fixture_path(root, item["ttir"], "ttir")
         case["before_cvpipelining"] = _fixture_path(
@@ -371,6 +389,10 @@ def build_proposed_contract_profile(
     }
     input_payload = proposal["expected_input_payload_bytes"]
     is_reduction = operation_family == "reduction-sum"
+    is_loop_multibuffer = (
+        operation_family == "loop-carried-add"
+        and proposal.get("expected_step_input_instances") == 2
+    )
     if is_reduction:
         common.update({
             "expected_scratch_payload_bytes": str(input_payload // 2),
@@ -394,6 +416,10 @@ def build_proposed_contract_profile(
             materialized = True
         elif is_reduction and stage["stage_name"] == "bisheng.ub-affecting-suffix":
             contract_id = "reduction-sum-extra-buffer"
+        elif (is_loop_multibuffer
+              and stage["stage_name"] == "bisheng.ub-affecting-suffix"):
+            contract_id = "loop-carried-add-multibuffer"
+            parameters["expected_step_input_instances"] = "2"
         bindings.append({
             **stage,
             "contract_id": contract_id,
@@ -500,7 +526,25 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
     if not all(value == expected for value in allocations):
         return False
     if analysis.get("operation_family") != "reduction-sum":
-        return lower_bound <= total
+        multibuffer_stages = [
+            stage for stage in stages
+            if type(stage) is dict
+            and stage.get("contract_id") == "loop-carried-add-multibuffer"
+        ]
+        if not multibuffer_stages:
+            return lower_bound <= total
+        if len(multibuffer_stages) != 1 or len(allocations) != 2:
+            return False
+        multi_parameters = multibuffer_stages[0].get("contract_parameters")
+        if type(multi_parameters) is not dict:
+            return False
+        try:
+            instances = int(multi_parameters["expected_step_input_instances"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return instances == 2 and lower_bound == (
+            allocations[0] + allocations[1] * instances
+        )
     extra_stages = [
         stage for stage in stages
         if type(stage) is dict
@@ -526,6 +570,7 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
 def suffix_pipeline_arguments(options: dict) -> list[str]:
     """Translate the identity-bearing fixture options to both oracle executables."""
     return [
+        f"--enable-auto-multi-buffer={str(options['multibuffer']).lower()}",
         f"--tile-mix-cube-loop={options['tile_mix_cube_loop']}",
         f"--tile-mix-vector-loop={options['tile_mix_vector_loop']}",
     ]
@@ -794,6 +839,7 @@ def evaluate(
                     "case": case["name"], "kind": "invalid-materialization-bridge",
                 })
             if (case["operation_family"] != "reduction-sum"
+                    and not case["options"]["multibuffer"]
                     and analysis.get("lower_bound_bytes", 0) > boundary_bytes):
                 report["violations"].append({
                     "case": case["name"], "kind": "lower-bound-exceeds-before-cvpipelining-allocation",

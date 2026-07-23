@@ -115,6 +115,30 @@
         "auto_tile_and_bind_subblock_outcome": false
       },
       "expected_analyzer_decision": "reject"
+    },
+    {
+      "name": "loop-carried-add-f32-65536-a2-tile1-multibuffer2",
+      "operation_family": "loop-carried-add",
+      "ttir": "loop-carried-add-f32-65536-a2-tile1.ttir.mlir",
+      "before_cvpipelining": "loop-carried-add-f32-65536-a2-tile1.before_cvpipelining.mlir",
+      "arch": "Ascend910B1",
+      "options": {
+        "compile_mode": "simd",
+        "multibuffer": true,
+        "tile_mix_cube_loop": 1,
+        "tile_mix_vector_loop": 1
+      },
+      "contract_proposal": {
+        "expected_resource_count": 2,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 1,
+        "expected_step_input_instances": 2,
+        "auto_tile_and_bind_subblock_outcome": false
+      },
+      "expected_analyzer_decision": "reject"
     }
   ]
 }

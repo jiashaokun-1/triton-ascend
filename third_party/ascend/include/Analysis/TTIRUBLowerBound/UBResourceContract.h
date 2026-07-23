@@ -110,6 +110,10 @@ std::unique_ptr<UBResourceContract> makeLoopCarriedAddMaxTilesContract(
     const PipelineStageContext &stage, int64_t expectedResourceCount,
     int64_t expectedSourceElements, unsigned expectedElementBitWidth,
     int64_t expectedInputPayloadBytes, int64_t maxTiles);
+std::unique_ptr<UBResourceContract> makeLoopCarriedAddMultiBufferContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t expectedStepInputInstances);
 std::unique_ptr<UBResourceContract> makeReshapeCopyPreserveContract(
     const PipelineStageContext &stage, int64_t expectedResourceCount,
     int64_t expectedSourceElements, unsigned expectedElementBitWidth,

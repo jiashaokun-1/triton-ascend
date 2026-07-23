@@ -1428,6 +1428,30 @@ def test_profile_loader_accepts_certified_loop_carried_schema(
     assert load_contract_profiles() == document
 
 
+def test_profile_loader_accepts_certified_loop_multibuffer_schema(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry(multibuffer=True)
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] = "loop-carried-add-multibuffer"
+    stage["contract_parameters"] = {
+        "expected_resource_count": "2",
+        "expected_source_elements": "65536",
+        "expected_element_bit_width": "32",
+        "expected_input_payload_bytes": "262144",
+        "expected_step_input_instances": "2",
+    }
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
 def test_profile_loader_accepts_certified_reshape_copy_schema(monkeypatch, tmp_path):
     profile_path = tmp_path / "profiles.json"
     entry = _direct_copy_profile_entry()
@@ -2053,6 +2077,82 @@ def test_binding_runs_loop_carried_lifetime_contract(tmp_path):
             "ttir-loop-carried-add-v1",
             "loop-carried-add-max-tiles",
             "loop-carried-add-preserve",
+        ],
+    }]
+
+
+def test_binding_runs_loop_carried_multibuffer_contract(tmp_path):
+    source = tmp_path / "loop-carried-add-multibuffer.ttir"
+    source.write_text(LOOP_CARRIED_ADD)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p3-loop-carried-add-multibuffer-test",
+        "canonical_ttir_sha256": hashlib.sha256(
+            LOOP_CARRIED_ADD.encode()
+        ).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B1",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p3-loop-carried-add-multibuffer-test-identity",
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    common = {
+        "expected_resource_count": "2",
+        "expected_source_elements": "65536",
+        "expected_element_bit_width": "32",
+        "expected_input_payload_bytes": "262144",
+    }
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [
+                {
+                    **stages[0],
+                    "contract_id": "loop-carried-add-max-tiles",
+                    "contract_version": "1",
+                    "contract_parameters": {**common, "max_tiles": "1"},
+                },
+                {
+                    **stages[1],
+                    "contract_id": "loop-carried-add-multibuffer",
+                    "contract_version": "1",
+                    "contract_parameters": {
+                        **common,
+                        "expected_step_input_instances": "2",
+                    },
+                },
+            ],
+        }],
+    }
+    candidate_result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend910B1",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+
+    assert candidate_result["decision"] == "reject"
+    assert candidate_result["lower_bound_bytes"] == 786432
+    assert candidate_result["unsupported_reasons"] == []
+    assert candidate_result["certificates"] == [{
+        "kind": "witness",
+        "bytes": 786432,
+        "resource_ids": [0, 1],
+        "contract_trace": [
+            "ttir-loop-carried-add-v1",
+            "loop-carried-add-max-tiles",
+            "loop-carried-add-multibuffer",
         ],
     }]
 

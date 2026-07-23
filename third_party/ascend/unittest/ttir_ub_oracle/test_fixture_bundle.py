@@ -222,6 +222,27 @@ def test_bundle_packages_loop_carried_allocations(tmp_path):
     ]
 
 
+def test_bundle_packages_loop_carried_multibuffer_contract(tmp_path):
+    dump_dir = _dump_dir(
+        tmp_path / "loop-multibuffer-dump",
+        allocation_count=2,
+        allocation_elements=65536,
+    )
+    result = bundle.create_fixture_bundle(
+        dump_dir,
+        tmp_path / "loop-multibuffer-fixture",
+        _config(
+            name="loop-carried-add-f32-65536-a2-tile1-multibuffer2",
+            operation_family="loop-carried-add",
+            max_tiles=1,
+            multibuffer=True,
+        ),
+    )
+    case = oracle.load_manifest(Path(result["manifest"]))["cases"][0]
+    assert case["options"]["multibuffer"] is True
+    assert case["contract_proposal"]["expected_step_input_instances"] == 2
+
+
 @pytest.mark.parametrize(
     "updates",
     [

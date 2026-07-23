@@ -88,6 +88,8 @@ public:
   void invalidate(ResourceId id, StringRef reason);
   LogicalResult lowerResourcePayload(ResourceId id, int64_t minPayloadBytes,
                                      StringRef contractId);
+  LogicalResult raiseResourceInstances(ResourceId id, int64_t minInstances,
+                                       StringRef contractId);
   LogicalResult appendResourceTrace(ResourceId id, StringRef contractId);
   LogicalResult refineWitnessToMustDistinct(WitnessId id,
                                             StringRef contractId);

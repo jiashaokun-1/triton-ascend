@@ -183,6 +183,18 @@ LogicalResult MandatoryUBResourceGraph::lowerResourcePayload(
   return success();
 }
 
+LogicalResult MandatoryUBResourceGraph::raiseResourceInstances(
+    ResourceId id, int64_t minInstances, StringRef contractId) {
+  if (id >= resources_.size() || minInstances <= 0 ||
+      minInstances < resources_[id].minInstances || contractId.empty()) {
+    malformed_ = true;
+    return failure();
+  }
+  resources_[id].minInstances = minInstances;
+  resources_[id].contractTrace.push_back(contractId.str());
+  return success();
+}
+
 LogicalResult MandatoryUBResourceGraph::appendResourceTrace(
     ResourceId id, StringRef contractId) {
   if (id >= resources_.size() || contractId.empty()) {
