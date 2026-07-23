@@ -95,13 +95,14 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
   --arch Ascend910B \
   --source-elements 65536 \
   --element-bit-width 32 \
-  --max-tiles 64 \
-  --auto-tile-outcome false
+  --max-tiles 64
 ```
 
 The packager derives the input payload, emits both file hashes, and refuses to
-overwrite an existing fixture. Do not guess the auto-tile outcome before
-checking the real stage snapshot.
+overwrite an existing fixture. By default, the oracle derives the auto-tile
+outcome from every real seed/retry snapshot and rejects nondeterministic
+outcomes. Use an explicit `--auto-tile-outcome true|false` only as an additional
+assertion for a known golden fixture.
 
 Run the comparison with:
 

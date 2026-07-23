@@ -477,7 +477,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 ### 10.4 当前验证结果
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
-- UB/策略/oracle 聚焦 Python 测试：305 项通过；
+- UB/策略/oracle 聚焦 Python 测试：309 项通过；
 - `TestAscendTTIRUBLowerBound` 原生 C++ GTest：89 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
@@ -493,7 +493,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 本次基线已执行：
 
-- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：305 项通过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：309 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
 - 普通 C++ GTest：89 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
@@ -549,6 +549,8 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
   `kernel.ttadapter.mlir`，自动生成严格 manifest、payload 和文件哈希；缺文件或目标已存在时拒绝写入；
 - manifest loader 独立校验 `expected_input_payload_bytes = source_elements × element_bit_width / 8`
   及 int64 边界，不能通过手写 proposal 绕过 source-fact 一致性；
+- 新 fixture 默认把 auto-tile outcome 留为 `null`，由 oracle 从所有 seed/retry 的真实
+  `post-TileAndBindSubBlock` snapshot 推导；观察到不同 outcome 会产生 violation 并禁止晋升；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
 - debug certificate dump，并在每个 certificate 的 `contract_trace` 中保留实际参与
@@ -735,12 +737,12 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
   --arch Ascend910B \
   --source-elements 65536 \
   --element-bit-width 32 \
-  --max-tiles 64 \
-  --auto-tile-outcome false
+  --max-tiles 64
 ```
 
-工具不会覆盖已有 fixture。reshape 路径把 `--operation-family` 改成 `reshape-copy`；真实 snapshot
-未确认前不要猜测 `--auto-tile-outcome`。
+工具不会覆盖已有 fixture。reshape 路径把 `--operation-family` 改成 `reshape-copy`。默认由 oracle
+从所有真实 snapshot 推导 outcome；只有维护已知 golden fixture 时才显式传
+`--auto-tile-outcome true|false` 增加预期值断言。
 
 ### 15.4 真实 PlanMemory 对照
 

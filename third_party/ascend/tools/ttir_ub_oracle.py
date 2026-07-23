@@ -277,8 +277,11 @@ def load_manifest(path: Path) -> dict:
                 raise ManifestError(f"contract_proposal.{field} must be a positive integer")
         if type(proposal["materialization_stage"]) is not str or not proposal["materialization_stage"]:
             raise ManifestError("contract_proposal.materialization_stage must be non-empty")
-        if type(proposal["auto_tile_and_bind_subblock_outcome"]) is not bool:
-            raise ManifestError("contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean")
+        auto_tile_outcome = proposal["auto_tile_and_bind_subblock_outcome"]
+        if auto_tile_outcome is not None and type(auto_tile_outcome) is not bool:
+            raise ManifestError(
+                "contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean or null"
+            )
         element_bit_width = proposal["expected_element_bit_width"]
         if element_bit_width < 8 or element_bit_width % 8:
             raise ManifestError(
@@ -710,6 +713,7 @@ def evaluate(
             report["cases"].append(case_report)
             continue
         lower_bound_bits = int(analysis.get("lower_bound_bytes", 0)) * 8
+        expected_outcome = case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"]
         for seed in run_seeds:
             try:
                 actual = suffix_runner(compiler, case["before_cvpipelining"], seed)
@@ -721,14 +725,13 @@ def evaluate(
                 continue
             peak = actual.get("actual_peak_bits")
             actual_outcome = actual.get("auto_tile_and_bind_subblock_outcome")
-            expected_outcome = case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"]
             if type(actual_outcome) is not bool:
                 report["unavailable"].append({
                     "case": case["name"], "phase": "auto-tile-outcome", "seed": seed,
                     "reason": "suffix compiler omitted the auto-tile outcome",
                 })
                 continue
-            if actual_outcome != expected_outcome:
+            if expected_outcome is not None and actual_outcome != expected_outcome:
                 report["violations"].append({
                     "case": case["name"], "kind": "auto-tile-outcome-mismatch", "seed": seed,
                     "expected": expected_outcome, "actual": actual_outcome,
@@ -775,6 +778,18 @@ def evaluate(
                         },
                         "semantic_replay": replay,
                     })
+        observed_outcomes = {
+            run.get("auto_tile_and_bind_subblock_outcome")
+            for run in case_report["runs"]
+            if type(run.get("auto_tile_and_bind_subblock_outcome")) is bool
+        }
+        if len(observed_outcomes) > 1:
+            report["violations"].append({
+                "case": case["name"], "kind": "auto-tile-outcome-nondeterministic",
+                "observed": sorted(observed_outcomes),
+            })
+        elif expected_outcome is None and len(observed_outcomes) == 1:
+            analysis["auto_tile_and_bind_subblock_outcome"] = next(iter(observed_outcomes))
         report["cases"].append(case_report)
     report["summary"] = {
         "cases": len(report["cases"]),

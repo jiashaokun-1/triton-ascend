@@ -88,12 +88,12 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
   --arch Ascend910B \
   --source-elements 65536 \
   --element-bit-width 32 \
-  --max-tiles 64 \
-  --auto-tile-outcome false
+  --max-tiles 64
 ```
 
-打包器会自动推导 input payload、输出两个文件哈希，并拒绝覆盖已有 fixture。在查看真实
-stage snapshot 之前，不要猜测 auto-tile outcome。
+打包器会自动推导 input payload、输出两个文件哈希，并拒绝覆盖已有 fixture。默认由 oracle
+从所有 seed/retry 的真实 snapshot 推导 auto-tile outcome；结果不一致时禁止晋升。只有维护
+已知 golden fixture 时才显式传 `--auto-tile-outcome true|false` 作为额外断言。
 
 校验命令：
 

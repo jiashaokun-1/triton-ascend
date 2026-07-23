@@ -34,7 +34,7 @@ class BundleConfig:
     source_elements: int
     element_bit_width: int
     max_tiles: int
-    auto_tile_and_bind_subblock_outcome: bool
+    auto_tile_and_bind_subblock_outcome: bool | None = None
     expected_analyzer_decision: str = "defer"
     materialization_stage: str = "ttir.triton-to-linalg"
 
@@ -70,8 +70,9 @@ def _validate_config(config: BundleConfig) -> int:
     payload_bytes = config.source_elements * (config.element_bit_width // 8)
     if payload_bytes > _MAX_INT64:
         raise BundleError("input payload overflows int64")
-    if type(config.auto_tile_and_bind_subblock_outcome) is not bool:
-        raise BundleError("auto-tile outcome must be boolean")
+    if (config.auto_tile_and_bind_subblock_outcome is not None
+            and type(config.auto_tile_and_bind_subblock_outcome) is not bool):
+        raise BundleError("auto-tile outcome must be boolean or None")
     return payload_bytes
 
 
@@ -164,12 +165,14 @@ def create_fixture_bundle(
     }
 
 
-def _parse_bool(value: str) -> bool:
+def _parse_outcome(value: str) -> bool | None:
+    if value == "auto":
+        return None
     if value == "true":
         return True
     if value == "false":
         return False
-    raise argparse.ArgumentTypeError("expected true or false")
+    raise argparse.ArgumentTypeError("expected auto, true or false")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-elements", type=int, required=True)
     parser.add_argument("--element-bit-width", type=int, required=True)
     parser.add_argument("--max-tiles", type=int, required=True)
-    parser.add_argument("--auto-tile-outcome", type=_parse_bool, required=True)
+    parser.add_argument("--auto-tile-outcome", type=_parse_outcome, default=None)
     parser.add_argument(
         "--expected-analyzer-decision", choices=("defer", "reject"), default="defer"
     )

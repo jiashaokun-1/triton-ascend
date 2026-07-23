@@ -282,6 +282,19 @@ def test_manifest_requires_payload_to_match_source_facts(tmp_path, proposal_upda
         oracle.load_manifest(path)
 
 
+def test_manifest_allows_oracle_to_derive_auto_tile_outcome(tmp_path):
+    path = _write_manifest(tmp_path)
+    manifest = json.loads(path.read_text())
+    manifest["cases"][0]["contract_proposal"][
+        "auto_tile_and_bind_subblock_outcome"
+    ] = None
+    path.write_text(json.dumps(manifest))
+    loaded = oracle.load_manifest(path)
+    assert loaded["cases"][0]["contract_proposal"][
+        "auto_tile_and_bind_subblock_outcome"
+    ] is None
+
+
 def test_manifest_paths_stay_with_fixtures(tmp_path):
     outside = tmp_path.parent / "outside.ttir"
     outside.write_text("module {}", encoding="utf-8")
@@ -478,6 +491,50 @@ def test_evaluate_accepts_available_defer_results(tmp_path):
     assert [item["seed"] for item in report["cases"][0]["runs"]] == [0, 1, -1]
 
 
+def test_evaluate_derives_one_consistent_auto_tile_outcome(tmp_path):
+    path = _write_manifest(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["cases"][0]["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] = None
+    path.write_text(json.dumps(raw))
+    manifest = oracle.load_manifest(path)
+    analysis = _analysis()
+    analysis["auto_tile_and_bind_subblock_outcome"] = None
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed, "status": "success", "overflow_scope": None,
+            "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(manifest, Path("compiler"), [0, 1], True, lambda _case: analysis, run)
+    assert report["violations"] == []
+    assert report["cases"][0]["analysis"][
+        "auto_tile_and_bind_subblock_outcome"
+    ] is False
+
+
+def test_evaluate_rejects_seed_dependent_auto_tile_outcome(tmp_path):
+    path = _write_manifest(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["cases"][0]["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] = None
+    path.write_text(json.dumps(raw))
+    manifest = oracle.load_manifest(path)
+    analysis = _analysis()
+    analysis["auto_tile_and_bind_subblock_outcome"] = None
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed, "status": "success", "overflow_scope": None,
+            "actual_peak_bits": 1024,
+            "auto_tile_and_bind_subblock_outcome": seed == 1,
+        }
+
+    report = oracle.evaluate(manifest, Path("compiler"), [0, 1], False, lambda _case: analysis, run)
+    assert {item["kind"] for item in report["violations"]} == {
+        "auto-tile-outcome-nondeterministic"
+    }
+
+
 def test_evaluate_detects_invalid_lower_bound_and_reject_result(tmp_path):
     path = _write_manifest(tmp_path, expected_analyzer_decision="reject")
     manifest = oracle.load_manifest(path)
@@ -563,6 +620,44 @@ def test_profile_candidate_requires_complete_certificate(tmp_path):
     report = oracle.evaluate(manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run)
     with pytest.raises(oracle.OracleUnavailable):
         oracle.build_profile_candidate(report)
+
+
+def test_profile_candidate_uses_outcome_derived_from_all_real_runs(tmp_path):
+    path = _write_manifest(tmp_path, expected_analyzer_decision="reject")
+    raw = json.loads(path.read_text())
+    raw["cases"][0]["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] = None
+    path.write_text(json.dumps(raw))
+    manifest = oracle.load_manifest(path)
+    analysis = _analysis("reject", 256)
+    analysis["auto_tile_and_bind_subblock_outcome"] = None
+
+    def run(_compiler, _input, seed):
+        return {
+            "seed": seed,
+            "status": "overflow",
+            "overflow_scope": "UB",
+            "actual_peak_bits": 4096,
+            "auto_tile_and_bind_subblock_outcome": False,
+        }
+
+    report = oracle.evaluate(
+        manifest,
+        Path("compiler"),
+        list(range(20)),
+        True,
+        lambda _case: analysis,
+        run,
+        Path("semantic-model"),
+        lambda _model, _input, seed: _semantic_result(
+            seed, status="overflow", peak=4096
+        ),
+    )
+    report["suffix_compiler_sha256"] = "c" * 64
+    report["semantic_model_sha256"] = "d" * 64
+    assert report["violations"] == []
+    assert report["unavailable"] == []
+    candidate = oracle.build_profile_candidate(report)
+    assert candidate["profiles"][0]["auto_tile_and_bind_subblock_outcome"] is False
 
 
 def test_profile_candidate_rejects_an_empty_case_set():

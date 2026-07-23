@@ -143,12 +143,11 @@ def test_bundle_cli_emits_machine_readable_result(tmp_path, capsys):
         "--source-elements", "65536",
         "--element-bit-width", "32",
         "--max-tiles", "64",
-        "--auto-tile-outcome", "false",
     ])
     assert status == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert payload["expected_input_payload_bytes"] == 262144
-    assert oracle.load_manifest(output_dir / "manifest.json")["cases"][0][
-        "operation_family"
-    ] == "reshape-copy"
+    case = oracle.load_manifest(output_dir / "manifest.json")["cases"][0]
+    assert case["operation_family"] == "reshape-copy"
+    assert case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] is None
