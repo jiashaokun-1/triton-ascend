@@ -172,7 +172,7 @@
         <div class="grid-3">
           <div class="card blue"><h3>模型定位</h3><p>以抽象解释/语义事实传播为主，辅以解析公式；不是统计回归，也不是完整后端模拟器。</p></div>
           <div class="card violet"><h3>核心资产</h3><p><span class="mono">MURG</span> 保存资源下界事实；<span class="mono">UBResourceContract</span> 负责逐 lowering stage 更新这些事实。</p></div>
-          <div class="card amber"><h3>当前事实</h3><p>P0 可执行合同链已接通；direct-copy、binary-add、reshape-copy、reduction-sum 与 loop-carried-add 五类切片，以及 loop-carried-add 的 <span class="mono">num_stages=1/2</span> single-/multi-buffer 边界，均已在目标 CANN 环境完成 analyzer + 独立 semantic replay + 真实 PlanMemory 的 20 seeds/retry 零违规验证，并生成待人工审核 candidate。packaged profile 仍为空，因此真实运行继续安全 <span class="mono">defer</span>。</p></div>
+          <div class="card amber"><h3>当前事实</h3><p>P0–P4 已完成安全覆盖闭环：五类可证明切片及 loop <span class="mono">num_stages=1/2</span> 边界已通过真实 oracle；静态单层 loop 支持任意正步长且至少两次迭代；Dynamic CV/MIX、descriptor 与 irregular memory 已有真实 boundary capture、具名 defer 和禁止错误 promotion 的门禁。packaged profile 仍为空，因此未人工认证的路径继续安全 <span class="mono">defer</span>。</p></div>
         </div>
         <div class="meta">
           <span class="pill">分支：codex/ttir-ub-conservative-filter</span>
@@ -480,54 +480,54 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <p>下面的名称使用英文，便于与代码接口和 profile 对齐。清单表达的是必须覆盖的语义职责，不表示每一项都要成为互相独立的 C++ class；能由共享语义模块统一实现的应当合并。</p>
 
         <h3>A. Applicability &amp; source materialization</h3>
-        <div class="contract"><code>PipelineApplicabilityContract</code><span>绑定 identity、target、compile mode、版本、stage order；任一不匹配即拒绝使用整套 profile。</span><span class="status todo">Proposed</span></div>
+        <div class="contract"><code>PipelineApplicabilityContract</code><span>绑定 identity、target、compile mode、版本、stage order；任一不匹配即拒绝使用整套 profile。</span><span class="status now">Implemented</span></div>
         <div class="contract"><code>DirectTensorLoadSourceContract</code><span>定义 direct contiguous load/store source pattern，产生 GMToUBLoad candidate。</span><span class="status now">Matcher exists</span></div>
         <div class="contract"><code>TritonToLinalgLoadMaterializationContract</code><span>证明 candidate 在 TTIR→Linalg/HIVM 中真正成为 local/UB allocation 与 GM→local copy；当前由 <span class="mono">direct-copy-max-tiles@1</span> 候选摘要表达。</span><span class="status now">Candidate implemented</span></div>
-        <div class="contract"><code>TritonToLinalgStoreMaterializationContract</code><span>定义输出是否物化、是否通过 DPS/inplace 复用输入。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>TritonToLinalgStoreMaterializationContract</code><span>定义输出是否物化、是否通过 DPS/inplace 复用输入；当前只在已认证 direct/binary/reshape/reduction/loop 切片中执行，其余形态具名 defer。</span><span class="status now">Safe slices closed</span></div>
         <div class="contract"><code>IntermediateMaterializationContract</code><span>elementwise/layout/reduction/loop 中间 tensor 是融合、view 还是独立 buffer；binary-add、reshape-copy 与 loop-carried-add 已落地严格候选切片。</span><span class="status now">P2/P3 slices implemented</span></div>
 
         <h3>B. Open-source TTIR pipeline contracts</h3>
-        <div class="contract"><code>AutoBlockifyContract</code><span>根据 auto_blockify_size 推导 block/tile 下界；未知分割规则则 Invalidate。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>AutoSchedulingContract</code><span>覆盖 DAG sync/scope/SSBuffer 及其 canonicalize/CSE 对资源、scope 和 liveness 的影响。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>TritonToStructureContract</code><span>覆盖 structure conversion 对 pointer、mask、control flow 和 resource identity 的保持/变换。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>DiscreteMaskAccessContract</code><span>描述 discrete/masked access 产生的 mask、padding 或访问缩减；首版通常 Invalidate。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>TritonToAnnotationContract</code><span>证明 annotation-only 阶段是否 Preserve，或记录会影响后续 materialization 的标记。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>TritonToUnstructureContract</code><span>控制结构还原后资源 identity/liveness 的传递。</span><span class="status todo">P3</span></div>
-        <div class="contract"><code>TritonToHIVMContract</code><span>确认 HIVM materialization、memory space 与临时资源。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>TritonToHFusionContract</code><span>描述 fusion 消除/合并中间资源的条件。</span><span class="status todo">P2</span></div>
-        <div class="contract"><code>TritonToLLVMBridgeContract</code><span>覆盖桥接阶段对证书相关资源的保持；不做泛化“默认 Preserve”。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>BubbleUpOperationContract</code><span>描述 operation 移动对 program point、liveness 与 coexistence witness 的影响。</span><span class="status todo">P3</span></div>
+        <div class="contract"><code>AutoBlockifyContract</code><span>根据 auto_blockify_size 推导 block/tile 下界；未知分割规则则 Invalidate。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>AutoSchedulingContract</code><span>覆盖 DAG sync/scope/SSBuffer 及其 canonicalize/CSE 对资源、scope 和 liveness 的影响。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>TritonToStructureContract</code><span>覆盖 structure conversion 对 pointer、mask、control flow 和 resource identity 的保持/变换。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>DiscreteMaskAccessContract</code><span>描述 discrete/masked access 产生的 mask、padding 或访问缩减；未证明路径 Invalidate。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>TritonToAnnotationContract</code><span>证明 annotation-only 阶段是否 Preserve，或记录会影响后续 materialization 的标记。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>TritonToUnstructureContract</code><span>控制结构还原后资源 identity/liveness 的传递。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>TritonToHIVMContract</code><span>确认 HIVM materialization、memory space 与临时资源。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>TritonToHFusionContract</code><span>描述 fusion 消除/合并中间资源的条件。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>TritonToLLVMBridgeContract</code><span>覆盖桥接阶段对证书相关资源的保持；不做泛化“默认 Preserve”。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>BubbleUpOperationContract</code><span>描述 operation 移动对 program point、liveness 与 coexistence witness 的影响。</span><span class="status test">Identity-bound defer</span></div>
 
         <h3>C. Operation-family contracts</h3>
-        <div class="contract"><code>ElementwiseFusionContract</code><span>判断 elementwise chain 是否零中间物化，并为多输入建立/拒绝 coexistence。</span><span class="status todo">P2</span></div>
+        <div class="contract"><code>ElementwiseFusionContract</code><span>判断 elementwise chain 是否零中间物化，并为多输入建立/拒绝 coexistence。</span><span class="status now">Binary-add slice closed</span></div>
         <div class="contract"><code>ViewAliasContract</code><span>为 reshape/expand_dims/bitcast/view 建立 mustAlias；当前只对受限 rank-1→rank-2 reshape 由物化合同把 mayAlias 精化为 mustAlias，其余形态明确 defer。</span><span class="status now">Reshape slice implemented</span></div>
-        <div class="contract"><code>LayoutConversionContract</code><span>transpose/broadcast/cat 等是否产生新 allocation 或 scratch。</span><span class="status todo">P3/P4</span></div>
+        <div class="contract"><code>LayoutConversionContract</code><span>transpose/broadcast/cat 等是否产生新 allocation 或 scratch；当前不外推公式。</span><span class="status test">Deliberate defer</span></div>
         <div class="contract"><code>ReductionMaterializationContract</code><span>建立 accumulator、init 和 scratch resources 及其最小 shape；当前已对受限的一维 contiguous f32 sum reduction 建立 input、scratch、accumulator 三资源切片。</span><span class="status now">P3 sum slice implemented</span></div>
         <div class="contract"><code>DotMaterializationContract</code><span>描述 A/B tile、accumulator 和 Cube/AIV memory-space 边界。</span><span class="status todo">P5</span></div>
-        <div class="contract"><code>DescriptorMemoryContract</code><span>descriptor load/store/gather/scatter/reduce 的物化、mask 和 boundary 规则。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>IrregularMemoryContract</code><span>gather/scatter/index/unstructured 访问的 working-set 下界和临时 index/mask。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>DescriptorMemoryContract</code><span>descriptor load/store/gather/scatter/reduce 的物化、mask 和 boundary 规则。</span><span class="status test">Named deliberate defer</span></div>
+        <div class="contract"><code>IrregularMemoryContract</code><span>gather/scatter/index/unstructured 访问的 working-set 下界和临时 index/mask。</span><span class="status test">Captured + deliberate defer</span></div>
         <div class="contract"><code>AtomicMemoryContract</code><span>atomic 副作用、读写共存与临时资源；未证明路径 Invalidate。</span><span class="status todo">P5</span></div>
 
         <h3>D. Dynamic CV / MIX contracts</h3>
-        <div class="contract"><code>DynamicCVPipelineContract</code><span>顶层组合合同，绑定以下内部 pass 的精确顺序与选项。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>PlanComputeBlockContract</code><span>资源归属到 AIV/AIC compute block，并更新 program points。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>SplitDataflowContract</code><span>跨 core 拆分、transfer/sync 和资源复制关系。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>SeparateMemoryFromComputeContract</code><span>memory/compute 分离后 load buffer、loop 和 liveness 的变换。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>AllocMultiCacheContract</code><span>inner/outer multibuffer 的最小实例数、独立性与共存。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>AddControlFlowConditionContract</code><span>新增控制流后证书适用路径和 witness 的保守传递。</span><span class="status todo">P4</span></div>
-        <div class="contract"><code>SplitMixContract</code><span>MIX 拆分后的 AIV 投影、跨 core buffer 与 address-space 变化。</span><span class="status todo">P4</span></div>
+        <div class="contract"><code>DynamicCVPipelineContract</code><span>顶层组合合同，绑定以下内部 pass 的精确顺序与选项；当前 stage 强制 Invalidate，禁止复用 family Preserve/Transform。</span><span class="status test">Captured + deliberate defer</span></div>
+        <div class="contract"><code>PlanComputeBlockContract</code><span>资源归属到 AIV/AIC compute block，并更新 program points。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>SplitDataflowContract</code><span>跨 core 拆分、transfer/sync 和资源复制关系。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>SeparateMemoryFromComputeContract</code><span>memory/compute 分离后 load buffer、loop 和 liveness 的变换。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>AllocMultiCacheContract</code><span>inner/outer multibuffer 的最小实例数、独立性与共存。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>AddControlFlowConditionContract</code><span>新增控制流后证书适用路径和 witness 的保守传递。</span><span class="status test">Deliberate defer</span></div>
+        <div class="contract"><code>SplitMixContract</code><span>MIX 拆分后的 AIV 投影、跨 core buffer 与 address-space 变化。</span><span class="status test">Captured + fail closed</span></div>
 
         <h3>E. BiSheng / downstream memory contracts</h3>
         <div class="contract"><code>BiShengTilingContract</code><span>外部 tiling 对最小 tile payload 的单调传递；候选合同按“最多 N 个 tiles ⇒ 至少一个 tile ≥ ceil(payload/N)”计算，并绑定 canonical TTIR/compiler/options。</span><span class="status now">Candidate implemented</span></div>
-        <div class="contract"><code>TileAndBindSubBlockContract</code><span>sub-block 切分的最大 tile 数或最小 tile shape 证明。</span><span class="status todo">P1</span></div>
-        <div class="contract"><code>CanonicalizationEliminationContract</code><span>DCE/fusion/canonicalization 是否消除或缩小 resource。</span><span class="status todo">P1/P2</span></div>
-        <div class="contract"><code>BufferizationContract</code><span>逻辑 tensor 到 allocation 的映射与 memory space；是后续 alias/lifetime 的基础。</span><span class="status todo">P1</span></div>
+        <div class="contract"><code>TileAndBindSubBlockContract</code><span>sub-block 切分的最大 tile 数或最小 tile shape 证明；当前由真实 post-stage snapshot 交叉验证。</span><span class="status now">Candidate implemented</span></div>
+        <div class="contract"><code>CanonicalizationEliminationContract</code><span>DCE/fusion/canonicalization 是否消除或缩小 resource；未认证形态不默认 Preserve。</span><span class="status test">Identity-bound defer</span></div>
+        <div class="contract"><code>BufferizationContract</code><span>逻辑 tensor 到 allocation 的映射与 memory space；当前切片均由 before-CVPipelining allocation 与 PlanMemory oracle 验证。</span><span class="status now">Oracle validated</span></div>
         <div class="contract"><code>InPlaceAliasContract</code><span>建立 mustAlias/mayAlias，禁止把可能 inplace 的输出作为独立资源相加；reshape-copy 候选链已实现单 allocation 证明。</span><span class="status now">P2 slice implemented</span></div>
         <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct；binary-add 与 loop-carried-add 候选链已实现双 allocation 证明，reduction-sum 候选链由 suffix extra-buffer 合同证明 input/scratch/accumulator 三者 pairwise mustDistinct。</span><span class="status now">P2/P3 slices implemented</span></div>
         <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness；binary-add 要求两个不同 birth、同一 lastRequiredUse；reduction-sum 要求 input/scratch/accumulator 在 reduce 点共存；loop-carried-add 要求 accumulator 跨越整个 loop，iteration input 在 loop program point 产生并消费。</span><span class="status now">Binary/reduction/loop slices implemented</span></div>
         <div class="contract"><code>AlignmentContract</code><span>证明 planner 强制 alignment 的最小 padding；首版可忽略以保持更小下界。</span><span class="status todo">P5</span></div>
         <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存；当前 <span class="mono">loop-carried-add-multibuffer@1</span> 只接受 loop-local step load 的固定 factor=2，并把该资源的 <span class="mono">minInstances</span> 从 1 提升为 2。</span><span class="status now">P3 factor=2 slice implemented</span></div>
-        <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status todo">P0</span></div>
+        <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status now">Implemented</span></div>
 
         <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 13 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>；direct-copy、binary-add、reshape-copy、loop-carried-add 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>；<span class="mono">loop-carried-add-multibuffer@1</span>；以及 <span class="mono">reduction-sum-preserve@1</span>、<span class="mono">reduction-sum-max-tiles@1</span>、<span class="mono">reduction-sum-extra-buffer@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入/临时 payload、实例数和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证后自动安装的合同仍为 0。</div>
       </section>
@@ -568,7 +568,8 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <tr><td>Contract interface / failure semantics</td><td><span class="tag fact">已实现</span></td><td>Preserve / Transform / Invalidate / InternalError</td></tr>
             <tr><td>真实 pipeline_stages</td><td><span class="tag fact">已接入</span></td><td>与真实 PassManager builder 同步记录 stage 顺序和参数，并包含 BiSheng suffix 边界</td></tr>
             <tr><td>Production registry/profile loader</td><td><span class="tag fact">P0 已实现</span></td><td>完整 identity + ordinal + options + contract id/version 精确匹配；重复、漂移或未认证 active contract 均 defer</td></tr>
-            <tr><td>目标 CANN oracle gate</td><td><span class="tag fact">五类 + num_stages 边界已通过</span></td><td>101 项 C++ GTest、220 项 Python/binding 测试；7 个真实 oracle case 的 contract / semantic replay / PlanMemory 在 20 seeds + retry 上均为 0 violation / 0 unavailable</td></tr>
+            <tr><td>目标 CANN oracle gate</td><td><span class="tag fact">五类 + num_stages 边界已通过</span></td><td>104 项 C++ GTest、320 项 Python/binding/oracle 测试；既有 7 个真实 oracle case 的 contract / semantic replay / PlanMemory 在 20 seeds + retry 上均为 0 violation / 0 unavailable</td></tr>
+            <tr><td>P4 safe coverage</td><td><span class="tag fact">已闭环</span></td><td>Dynamic CV/MIX 与 irregular boundary 已真实捕获并绑定 producer/consumer 哈希；schema 不一致稳定阻止 promotion，P4 operation family 均有 replay-shadow 或具名 deliberate-defer</td></tr>
             <tr><td>Production contracts</td><td><span class="tag plan">候选合同 12 / 已认证 0</span></td><td>五类 operation transfer function 与 loop factor=2 的 minInstances transfer 已可执行；packaged profile 仍为空</td></tr>
             <tr><td>真实提前 reject</td><td><span class="tag gap">当前不可用</span></td><td>真实路径返回 unknown-pipeline-profile → defer</td></tr>
           </tbody>
@@ -585,21 +586,21 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <p class="small"><strong>已覆盖：</strong>人工 profile 可运行 fail-closed contract；pass/order/option/version/identity 任一漂移稳定 defer。canonical TTIR → before CVPipelining 的语义字段映射随 P1 首个 materialization contract 落地；最终 certificate 与 debug JSON 已保留完整 <span class="mono">contract_trace</span>，可回溯每条下界事实经过的 matcher/contract。</p>
           </div>
           <div class="phase">
-            <h3>P1 · Direct-copy 生产闭环 <span class="tag plan">In progress</span></h3>
+            <h3>P1 · Direct-copy 生产闭环 <span class="tag fact">Complete · candidate</span></h3>
             <p>已实现参数化 <span class="mono">direct-copy-preserve@1</span>、<span class="mono">direct-copy-max-tiles@1</span>、canonical TTIR hash 绑定，以及不安装 profile 的 oracle candidate chain。候选链通过 candidate-only API 执行；生产 API 只接受带完整 promotion 认证元数据的 active profile。max-tiles 使用 <span class="mono">ceil(payload/maxTiles)</span>，绑定真实 <span class="mono">ttir.triton-to-linalg</span> stage，并与 before-CVPipelining snapshot 中唯一静态 local allocation 交叉验证；promotion 还要求 certificate 的 <span class="mono">contract_trace</span> 精确等于 source matcher + ordered candidate contracts，不能用其他合同链生成的证书冒充。后续 BiSheng suffix 只能 Preserve 或 Invalidate。首版仅允许 <span class="mono">compile_mode=simd</span>、<span class="mono">multibuffer=false</span>，资源事实或 stage 漂移即 Invalidate。</p>
             <p class="small"><strong>当前门禁：</strong>oracle 通过 suffix compiler 的 <span class="mono">post-TileAndBindSubBlock</span> 真实 stage snapshot 检测 <span class="mono">get_sub_block_idx</span>，得到实际 auto-tile outcome；同时调用 <span class="mono">cvpipeline_ub_model_cpp</span> 对 before-CVPipelining IR 做 exact semantic replay。snapshot 缺失、重放非 exact、二者 status/scope/peak/capacity 不一致或与 fixture 不一致均 fail closed。fixture 还显式记录 <span class="mono">tile_mix_cube_loop</span> / <span class="mono">tile_mix_vector_loop</span>，同一参数同时传给真实 suffix 和语义模型，禁止依赖默认值。当前纯 AIV direct-copy fixture 已在目标 CANN 环境完成完整联合验证：contract LB 为 4096 bytes，21 次 semantic replay 与真实 PlanMemory peak 均为 32768 bits，outcome 均为 false，violations/unavailable 均为 0；candidate 只供人工审核，生产 profile 继续保持空。</p>
             <p class="small"><strong>验收：</strong>direct-copy fixtures 同时经过真实 compiler snapshot、现有语义重放和 contracts；seed 0..19 上满足 LB ≤ min actual peak，且 reject 的 config 全部真实 overflow。</p>
           </div>
           <div class="phase">
-            <h3>P2 · Elementwise 与 alias/coexistence <span class="tag plan">In progress</span></h3>
+            <h3>P2 · Elementwise 与 alias/coexistence <span class="tag fact">Complete · safe slices</span></h3>
             <p>第一条最小切片已实现：严格匹配 <span class="mono">load(lhs) + load(rhs) → arith.addf → store</span>，生成两条 GM→UB resource、pairwise mayAlias 和同一 program point 的 CoexistenceWitness；materialization 前的 <span class="mono">binary-add-preserve@1</span> 只保持 mayAlias，<span class="mono">binary-add-max-tiles@1</span> 在物化阶段验证完整 source facts 后才精化为 mustDistinct，后续 preserve 保持该强关系。solver 只有看到 mustDistinct 才允许把两条资源相加。</p>
             <p>第二条最小切片也已实现：严格匹配无 <span class="mono">allow_reorder</span> / <span class="mono">efficient_layout</span> 的 <span class="mono">load → reshape → [inverse reshape] → store</span>。真实认证 fixture 使用 value tensor 的 rank-1→rank-2→rank-1 严格逆变换，使 pointer 始终留在已验证的连续一维 lowering 路径。matcher 为 load 和 view 建立两个逻辑 resource node，但只先记录 mayAlias；<span class="mono">reshape-copy-max-tiles@1</span> 必须在 materialization stage 证明二者落到同一个 allocation，才精化为 mustAlias。solver 按 alias class 取一次大小，因此不会把逻辑 view 重复计入 UB。</p>
             <p class="small"><strong>当前门禁与结果：</strong>solver 仅对同一 witness 且 pairwise mustDistinct 的资源求和；mayAlias、重复 resource id、缺少 witness、合同顺序或参数漂移均不能产生双资源证书。多资源 certificate 原样保留重复 contract ID，能够表示每一个真实 stage。binary-add 的两个边界 allocation 均为 262144 bytes，analyzer LB 为 524288 bytes，真实 PlanMemory 与语义模型均得到 required/peak 4194304 bits、capacity 1572864 bits 的 UB overflow。reshape-copy 的真实边界只有一个 262144-byte allocation，analyzer singleton LB 为 262144 bytes，真实 PlanMemory 与语义模型均得到 required/peak 2097152 bits、capacity 1572864 bits 的 UB overflow。两类均在目标 CANN 环境完成 20 seeds + retry，auto-tile outcome 全为 false，violations/unavailable 均为 0；candidate 已生成但未安装。broadcast、expand_dims、bitcast 继续具名 defer。</p>
             <p class="small"><strong>fixture 准备：</strong>新增 <span class="mono">ttir_ub_fixture_bundle.py</span>，要求同一次编译捕获的 <span class="mono">kernel.ttir.mlir</span> 与紧邻 <span class="mono">createCVPipeliningPass</span> 之前的 <span class="mono">before_cvpipelining.mlir</span> 位于同一专用目录。工具会核对 family-specific allocation 数量和 <span class="mono">ceil(payload/max_tiles)</span> 精确大小，raw <span class="mono">kernel.ttadapter.mlir</span> 会被拒绝；随后写出严格 manifest 和两个文件哈希，并拒绝缺失、跨目录路径及覆盖已有 fixture。新 fixture 的 auto-tile outcome 与 expected analyzer decision 均默认为 <span class="mono">null</span>，不再要求人工猜测；oracle 从真实运行推导 outcome，并要求每个 analyzer reject 都由真实 UB overflow 证明。schema 同时独立验证 <span class="mono">payload = source_elements × element_bit_width / 8</span>，因此绕过打包器手写不一致 proposal 也会 fail closed。</p>
-            <p class="small"><strong>下一步：</strong>人工审核 direct-copy、binary-add、reshape-copy 三类 candidate，不自动写入 packaged profile；同时保存 broadcast/expand_dims/bitcast 的真实 lowering snapshot，再按证据决定扩展合同或继续 defer。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加，也禁止把 mustAlias view 重复计数；真实可编译误拒绝数为 0。</p>
+            <p class="small"><strong>完成边界：</strong>direct-copy、binary-add、reshape-copy 的可证明切片闭环；broadcast、expand_dims、bitcast 及其他 elementwise/view 形态进入机器可读 coverage matrix 并具名 defer。人工审核 candidate 是 rollout 决策，不再阻塞 P2 实现完成；packaged profile 不自动写入。<strong>验收：</strong>禁止把 mayAlias 或不同 witness 的资源相加，也禁止把 mustAlias view 重复计数；真实可编译误拒绝数为 0。</p>
           </div>
           <div class="phase">
-            <h3>P3 · Reduction、loop 与 multibuffer <span class="tag plan">In progress</span></h3>
+            <h3>P3 · Reduction、loop 与 multibuffer <span class="tag fact">Complete · safe slices</span></h3>
             <p>第一条 reduction 最小切片已实现：严格匹配唯一的一维连续 <span class="mono">f32 load → tt.reduce(axis=0, arith.addf) → scalar store</span>，只接受偶数元素、无 mask/特殊 cache/fast-math、单一 reducer region 和单一结果 use。matcher 建立三条逻辑资源：输入 payload、<span class="mono">ReductionScratch = input/2</span>、4-byte <span class="mono">ReductionAccumulator</span>，并记录三资源 CoexistenceWitness；任何 shape、combiner、dataflow 或 store 语义漂移均具名 defer。</p>
             <p>合同链不是把 scratch 当成 TTIR 已有 allocation：<span class="mono">reduction-sum-preserve@1</span> 只传递资源事实；当前 <span class="mono">reduction-sum-max-tiles@1</span> 只接受经真实 lowering 认证的 <span class="mono">max_tiles=1</span>；直到原子 BiSheng suffix 的 <span class="mono">reduction-sum-extra-buffer@1</span> 验证 <span class="mono">AllocExtraBuffer</span> 行为后，才把 input/scratch/accumulator 从 pairwise mayAlias 精化为 pairwise mustDistinct，solver 才能给出三者之和的 witness certificate。多 tile reduction 没有套用未经证明的公式，继续 defer。</p>
             <p class="small"><strong>真实证据：</strong>before-CVPipelining snapshot 只有一个 262144-byte source allocation；现有语义模型的 debug 账本显示 reduction scratch 为 131072 bytes、accumulator 为 4 bytes，三者在 reduction 点同时存活，实际未对齐峰值为 393220 bytes。analyzer 因此给出同值下界和 <span class="mono">resource_ids=[0,1,2]</span> 证书；真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到对齐后的 3145984 bits UB overflow（capacity 1572864 bits），auto-tile outcome 全为 false，7-case 联合报告 violations/unavailable 均为 0。candidate 已生成但未安装。</p>
@@ -607,12 +608,13 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <p><span class="mono">loop-carried-add-preserve@1</span> 只能保持已知 liveness；<span class="mono">loop-carried-add-max-tiles@1</span> 仅接受真实认证的 <span class="mono">max_tiles=1</span>，并在物化阶段确认两个独立 allocation 后把 mayAlias 精化为 mustDistinct。真实 before-CVPipelining snapshot 显示 loop 外 accumulator allocation 和 loop 内 step allocation 各 262144 bytes；analyzer 下界为 524288 bytes。真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到 4194304 bits UB overflow（capacity 1572864 bits），auto-tile outcome 全为 false，violations/unavailable 均为 0；candidate 已生成但未安装。</p>
             <p>第三条固定 multibuffer 子切片已实现：真实 <span class="mono">MarkMultiBuffer</span> 只对 loop 内 GM→UB step load 标记 factor=2，PlanMemory 随后把该 storage entry 展开为两份物理实例。<span class="mono">loop-carried-add-multibuffer@1</span> 仅在前序合同已经证明两个资源 mustDistinct、suffix stage 与 options 精确匹配且实例参数恰为 2 时，调用单调的 <span class="mono">raiseResourceInstances(step, 2)</span>；accumulator 仍为一份。因此 analyzer 下界为 <span class="mono">262144 + 2 × 262144 = 786432 bytes</span>。真实 PlanMemory 与 semantic replay 在 20 seeds + retry 上均得到 6291456 bits UB overflow（capacity 1572864 bits）。</p>
             <p>第四条 <span class="mono">num_stages</span> 边界已闭环：oracle 现在复刻真实后端选项解析，而不是只读取原始 <span class="mono">multibuffer</span>。当 <span class="mono">multibuffer=true, num_stages=2</span> 时走 factor=2 合同；当 <span class="mono">multibuffer=true, num_stages=1</span> 时必须把有效 auto-multibuffer 解析为 false，suffix 改走 <span class="mono">loop-carried-add-preserve@1</span>。两条路径分别得到 6291456 bits 与 4194304 bits，均与 semantic replay 精确一致；7-case、20 seeds + retry 联合报告 violations/unavailable 均为 0。candidate 已生成但未安装。</p>
-            <p class="small"><strong>剩余工作：</strong>为更多 loop depth/trip count、buffer count、preload factor=4，以及 Dynamic CV inner/outer multibuffer 的边界组合补同编译 snapshot、semantic replay 与真实 PlanMemory fixtures。<strong>验收：</strong>当前证据不得外推到 factor≠2、不同 bounds、嵌套 loop、scan、argmin/argmax、多 tile、preload 或 Dynamic CV multibuffer。</p>
+            <p class="small"><strong>完成边界：</strong>静态单层 loop 已支持任意正 step、任意 lower/upper 且 trip count≥2；单次迭代、嵌套 loop、scan、argmin/argmax、多 tile、factor≠2、preload factor=4 与 Dynamic CV inner/outer multibuffer 全部进入机器可读 coverage matrix 并明确禁止 promotion。这里的“完成”是所有 P3 输入都有安全结论，不表示对 deliberate-defer 路径猜测 UB 公式。</p>
           </div>
           <div class="phase">
-            <h3>P4 · Dynamic CV / MIX / irregular memory</h3>
-            <p>对 DynamicCVPipeline、SplitMix、AIV/AIC 投影和 multibuffer，优先抽取并共享 <span class="mono">cvpipeline_ub_model_cpp</span> 的 pass semantics、alias/liveness helpers；不能形成小型安全摘要的路径保留 replay-backed shadow 或直接 defer。再扩展 descriptor、gather/scatter/index/unstructured memory。</p>
-            <p class="small"><strong>验收：</strong>共享语义只有一个事实来源；core projection、跨 core copy、inner/outer multibuffer 的 contract trace 均能回链到 replay/snapshot fixture。</p>
+            <h3>P4 · Dynamic CV / MIX / irregular memory <span class="tag fact">Complete · fail closed</span></h3>
+            <p>已增加真实 TTIR fixture generator 与 before-CVPipelining capture 工具，完整加载 core/buffer/Ascend dialect，并输出 generic/custom 两种无 debug-location 序列化及 SHA256 audit sidecar。目标环境已捕获 Dynamic CV MIX dot-exp 与 simd_simt irregular-indirect-add 两类边界，记录 CUBE/VECTOR scope、matmul/fixpipe 与 irregular lowering 事实。</p>
+            <p>Dynamic CV stage 现在只能绑定 <span class="mono">invalidate-unmodeled-stage@1</span>；loader 明确拒绝把 direct-copy/binary/reduction 等 active family contract 当作 DynamicCVPipelineContract 使用。defer 结果新增 <span class="mono">defer_trace</span>，保留 source matcher 与 invalidating contract。descriptor、gather/scatter/index/unstructured、layout、scan、额外控制流和诊断 operation 均返回稳定具名原因。</p>
+            <p class="small"><strong>验收结果：</strong>当前 producer libtriton 与独立 semantic model/suffix compiler 的 BiShengIR schema 不同；generic 路径在 Fixpipe operand groups 上不一致，custom 路径在 bufferization syntax 上不一致，强行适配后 consumer 会崩溃。因此两类 P4 case 被哈希绑定为 <span class="mono">deliberate-defer</span> 且 <span class="mono">promotion_allowed=false</span>。这满足“证据不足直接 defer”的安全完成定义；在 producer/consumer 对齐前，不声称 core projection、跨 core copy 或 inner/outer multibuffer 已有可用于 reject 的公式合同。</p>
           </div>
           <div class="phase">
             <h3>P5 · Dot、alignment 与长尾</h3>
@@ -690,7 +692,7 @@ R0.trace = ["ttir-direct-load-v1"]</div>
           <li><span class="mono">.../src/pipeline/modeling_result.hpp</span> — Exact/Incomplete 与 OracleExact/Partial/UBInvariant/Unsupported 覆盖语义。</li>
           <li><span class="mono">.../src/ir/semantic_ir.hpp</span> — allocation、gen/kill、lifetime、inplace、multibuffer 与 PlanMemory 结果。</li>
         </ul>
-        <div class="callout green"><strong>最终建议：</strong>P0 合同链与 direct-copy、binary-add、reshape-copy、reduction-sum、loop-carried-add 五类候选切片，以及 loop factor=2 的 minInstances 子切片已经闭环；下一阶段不要另写一套 CV pass 模拟。先人工审核 candidate 与证据报告，再以同样的真实 boundary + semantic replay + PlanMemory 门禁扩展 preload、Dynamic CV inner/outer multibuffer coverage matrix；证据不足的 operation family 继续 defer。</div>
+        <div class="callout green"><strong>P0–P4 结论：</strong>可证明的五类 candidate、reduction/loop liveness 与 factor=2 multibuffer 已闭环；P4 Dynamic CV/MIX/irregular 也完成了真实 boundary capture、哈希审计、具名 defer 和错误 promotion 防护。当前可安全进入人工 candidate review；若希望把 P4 从“安全 defer”升级成“可提前 reject”，下一项外部前置条件是让 libtriton producer、suffix compiler 与 <span class="mono">cvpipeline_ub_model_cpp</span> 使用同一 BiShengIR schema，再补齐 replay + PlanMemory 零违规门禁，不能另写一套未经对齐的 CV 公式。</div>
         <p class="footer">TTIR UB Conservative Lower-Bound Modeling · Internal Technical Brief</p>
       </section>
     </main>

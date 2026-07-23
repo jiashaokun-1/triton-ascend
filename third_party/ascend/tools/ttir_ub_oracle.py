@@ -429,7 +429,10 @@ def build_proposed_contract_profile(
             "expected_input_payload_bytes": str(output_payload if materialized else input_payload),
         }
         contract_id = f"{family['contract_prefix']}-preserve"
-        if is_materialization:
+        if stage["stage_name"] == "ttir.dynamic-cv-pipeline":
+            contract_id = "invalidate-unmodeled-stage"
+            parameters = {}
+        elif is_materialization:
             contract_id = f"{family['contract_prefix']}-max-tiles"
             parameters["max_tiles"] = str(proposal["max_tiles"])
             materialized = True

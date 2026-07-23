@@ -786,9 +786,18 @@ LogicalResult materializeLoopCarriedAdd(
       getIndexConstant(loop.getUpperBound(), function, reasons);
   FailureOr<int64_t> step =
       getIndexConstant(loop.getStep(), function, reasons);
-  if (failed(lower) || failed(upper) || failed(step) || *lower != 0 ||
-      *upper != 2 || *step != 1)
+  if (failed(lower) || failed(upper) || failed(step) || *step <= 0 ||
+      *lower >= *upper)
     return defer(reasons, "unsupported-loop-bounds");
+  int64_t signedDistance = 0;
+  if (llvm::SubOverflow(*upper, *lower, signedDistance))
+    return defer(reasons, "arithmetic-overflow");
+  const uint64_t distance = static_cast<uint64_t>(signedDistance);
+  const uint64_t positiveStep = static_cast<uint64_t>(*step);
+  const uint64_t tripCount =
+      distance / positiveStep + (distance % positiveStep != 0);
+  if (tripCount < 2)
+    return defer(reasons, "unsupported-loop-trip-count");
 
   Block &body = loop.getRegion().front();
   if (body.getNumArguments() != 2 ||

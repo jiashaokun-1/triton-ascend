@@ -11,6 +11,7 @@ void invalidateAll(MandatoryUBResourceGraph &graph, StringRef reason) {
   for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal) {
     if (graph.resources()[ordinal].validity != ValidityState::Valid)
       continue;
+    (void)graph.appendResourceTrace(static_cast<ResourceId>(ordinal), reason);
     graph.invalidate(static_cast<ResourceId>(ordinal), reason);
   }
 }

@@ -27,6 +27,7 @@ struct TTIRUBAnalysisResult {
   std::optional<int64_t> capacityBytes;
   SmallVector<LowerBoundCertificate> certificates;
   SmallVector<std::string> unsupportedReasons;
+  SmallVector<std::string> deferTrace;
   std::string contractVersion = "ttir-ub-lb-v1";
 };
 

@@ -843,6 +843,8 @@ TEST(UBResourceContract, ExplicitInvalidateInvalidatesResources) {
   EXPECT_TRUE(succeeded(
       registry.applyOrInvalidateAll(graph, {.stageName = "invalidate"})));
   EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 0);
+  EXPECT_EQ(graph.resources()[0].contractTrace,
+            SmallVector<std::string>({"fixed-disposition"}));
 }
 
 TEST(UBResourceContract, InternalErrorReturnsFailure) {
@@ -1041,10 +1043,34 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,
-       LoopCarriedAddRejectsUncertifiedTripCount) {
+       LoopCarriedAddAcceptsAnyStaticPositiveTripCountAtLeastTwo) {
   std::string source =
       replaceOnce(kLoopCarriedAdd, "%c2 = arith.constant 2 : index",
                   "%c2 = arith.constant 3 : index");
+  TTIRUBAnalysisResult result = analyze(source, options());
+
+  EXPECT_EQ(result.lowerBoundBytes, 262144);
+  EXPECT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "singleton");
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoopCarriedAddRejectsSingleIterationForMultiBufferProof) {
+  std::string source =
+      replaceOnce(kLoopCarriedAdd, "%c2 = arith.constant 2 : index",
+                  "%c2 = arith.constant 1 : index");
+  TTIRUBAnalysisResult result = analyze(source, options());
+
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-loop-trip-count"));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoopCarriedAddRejectsNonPositiveStep) {
+  std::string source =
+      replaceOnce(kLoopCarriedAdd, "%c1 = arith.constant 1 : index",
+                  "%c1 = arith.constant 0 : index");
   TTIRUBAnalysisResult result = analyze(source, options());
 
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
@@ -1389,6 +1415,36 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
   EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
   EXPECT_TRUE(hasReason(result, "unsupported-op"));
   EXPECT_EQ(diagnosticCount, 0u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       P4OperationFamiliesDeferWithStableNamedReasons) {
+  const std::pair<StringRef, StringRef> cases[] = {
+      {"tt.descriptor_gather", "unsupported-op-descriptor-memory"},
+      {"tt.gather", "unsupported-op-irregular-memory"},
+      {"tt.trans", "unsupported-op-layout-transform"},
+      {"tt.scan", "unsupported-op-scan"},
+      {"tt.cat", "unsupported-op-shape-construction"},
+      {"tt.atomic_rmw", "unsupported-op-atomic"},
+      {"tt.print", "unsupported-op-launch-or-diagnostics"},
+      {"scf.while", "unsupported-op-control-flow"},
+  };
+  for (auto [operationName, reason] : cases) {
+    context.allowUnregisteredDialects();
+    OwningOpRef<ModuleOp> module = parse();
+    ASSERT_TRUE(module);
+    triton::ReturnOp returnOp = findOnlyOp<triton::ReturnOp>(*module);
+    OperationState state(returnOp.getLoc(), operationName);
+    Operation *unsupported = Operation::create(state);
+    returnOp->getBlock()->getOperations().insert(returnOp->getIterator(),
+                                                  unsupported);
+
+    auto [result, diagnosticCount] =
+        analyzeModuleCapturingDiagnostics(*module, options());
+    EXPECT_EQ(result.decision, TTIRUBDecision::Defer) << operationName.str();
+    EXPECT_TRUE(hasReason(result, reason)) << operationName.str();
+    EXPECT_EQ(diagnosticCount, 0u) << operationName.str();
+  }
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,

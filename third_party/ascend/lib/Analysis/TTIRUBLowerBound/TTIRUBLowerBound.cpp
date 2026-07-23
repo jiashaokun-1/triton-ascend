@@ -69,12 +69,35 @@ StringRef classifyUnsupportedOperation(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
   if (name == triton::ReduceOp::getOperationName())
     return "unsupported-op-reduction";
+  if (name == "tt.scan" || name == "tt.scan.return")
+    return "unsupported-op-scan";
   if (name == triton::BroadcastOp::getOperationName())
     return "unsupported-op-broadcast";
   if (name == triton::ExpandDimsOp::getOperationName())
     return "unsupported-op-expand-dims";
   if (name == triton::BitcastOp::getOperationName())
     return "unsupported-op-bitcast";
+  if (name == "tt.make_tensor_ptr" || name == "tt.advance" ||
+      name == "tt.descriptor_load" || name == "tt.descriptor_store" ||
+      name == "tt.descriptor_reduce" || name == "tt.descriptor_gather" ||
+      name == "tt.descriptor_scatter")
+    return "unsupported-op-descriptor-memory";
+  if (name == "tt.gather" || name == "tt.scatter" ||
+      name == "tt.index_select" || name == "tt.index_put" ||
+      name == "tt.load_unstructured" || name == "tt.store_unstructured")
+    return "unsupported-op-irregular-memory";
+  if (name == "tt.trans" || name == "tt.flip" || name == "tt.sort" ||
+      name == "ttascend.flip" || name == "ttascend.sort")
+    return "unsupported-op-layout-transform";
+  if (name == "tt.cat" || name == "tt.join" || name == "tt.split")
+    return "unsupported-op-shape-construction";
+  if (name == "tt.atomic_rmw" || name == "tt.atomic_cas")
+    return "unsupported-op-atomic";
+  if (name == "tt.get_program_id" || name == "tt.get_num_programs" ||
+      name == "tt.assert" || name == "tt.print")
+    return "unsupported-op-launch-or-diagnostics";
+  if (name == "scf.while" || name == "scf.if")
+    return "unsupported-op-control-flow";
   if (name.split('.').first == "arith")
     return "unsupported-op-arithmetic";
   if (operation->getNumRegions() != 0)
@@ -286,8 +309,11 @@ analyzeTTIRUBLowerBound(ModuleOp module, const TTIRUBAnalysisOptions &options,
   }
 
   for (const MandatoryUBResource &resource : graph.resources()) {
-    if (resource.validity == ValidityState::Invalid)
+    if (resource.validity == ValidityState::Invalid) {
       addReason(result.unsupportedReasons, resource.invalidReason);
+      for (const std::string &trace : resource.contractTrace)
+        addReason(result.deferTrace, trace);
+    }
   }
   if (!result.unsupportedReasons.empty())
     return result;

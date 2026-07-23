@@ -431,6 +431,38 @@ def test_proposed_contract_chain_transitions_at_materialization_stage():
     assert bindings[2]["contract_parameters"]["expected_input_payload_bytes"] == "4096"
 
 
+def test_dynamic_cv_stage_is_always_explicit_fail_closed():
+    proposal = {
+        "expected_resource_count": 1,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 64,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {
+            "stage_name": "ttir.dynamic-cv-pipeline",
+            "options": {"compile_on_910_95": "true"},
+        },
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+
+    assert [binding["contract_id"] for binding in bindings] == [
+        "direct-copy-max-tiles",
+        "invalidate-unmodeled-stage",
+        "direct-copy-preserve",
+    ]
+    assert bindings[1]["contract_parameters"] == {}
+
+
 def test_binary_add_contract_chain_uses_binary_contracts():
     identity = {"sha256": "identity"}
     stages = [

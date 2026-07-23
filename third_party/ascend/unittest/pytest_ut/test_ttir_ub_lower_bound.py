@@ -1632,6 +1632,34 @@ def test_binding_result_is_json_serializable():
     assert result["capacity_bytes"] is None
 
 
+def test_binding_serializes_generic_module_for_boundary_capture(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+
+    text = ascend.analysis.ttir_ub_generic_module_text(module)
+
+    assert text.startswith('"builtin.module"()')
+    assert '"tt.func"' in text
+    assert "#loc" not in text
+
+
+def test_binding_serializes_portable_module_without_debug_locations(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+
+    text = ascend.analysis.ttir_ub_portable_module_text(module)
+
+    assert text.startswith("module")
+    assert "tt.func" in text
+    assert "#loc" not in text
+
+
 def test_binding_does_not_expose_allow_unvalidated():
     context = ir.context()
     module = ir.builder(context).create_module()
@@ -1719,7 +1747,65 @@ def test_binding_loads_exact_ordered_fail_closed_profile(tmp_path):
     )
     assert result["decision"] == "defer"
     assert result["unsupported_reasons"] == ["invalidate-unmodeled-stage"]
+    assert result["defer_trace"] == [
+        "ttir-direct-load-v1",
+        "invalidate-unmodeled-stage",
+    ]
     assert result["certificates"] == []
+
+
+def test_binding_rejects_active_family_contract_on_dynamic_cv_stage(tmp_path):
+    source = tmp_path / "direct-load.ttir"
+    source.write_text(DIRECT_LOAD_COPY)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p4-dynamic-cv-test-pipeline",
+        "canonical_ttir_sha256": hashlib.sha256(
+            DIRECT_LOAD_COPY.encode()
+        ).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p4-dynamic-cv-test-identity",
+    }
+    stages = [{
+        "stage_name": "ttir.dynamic-cv-pipeline",
+        "options": {"compile_on_910_95": "false"},
+    }]
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [{
+                **stages[0],
+                "contract_id": "direct-copy-preserve",
+                "contract_version": "1",
+                "contract_parameters": {
+                    "expected_resource_count": "1",
+                    "expected_source_elements": "65536",
+                    "expected_element_bit_width": "32",
+                    "expected_input_payload_bytes": "262144",
+                },
+            }],
+        }],
+    }
+
+    result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend910B",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+
+    assert result["decision"] == "defer"
+    assert result["unsupported_reasons"] == ["unknown-pipeline-profile"]
 
 
 def test_binding_runs_parameterized_direct_copy_contract_chain(tmp_path):

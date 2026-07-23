@@ -2,6 +2,8 @@
 #include "Analysis/TTIRUBLowerBound/UBResourceContract.h"
 
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/OperationSupport.h"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -135,6 +137,13 @@ makeProfileContract(const PipelineContractBinding &binding) {
   if (binding.contractId == "invalidate-unmodeled-stage" &&
       binding.contractVersion == "1" && binding.parameters.empty())
     return makeInvalidateContract(binding.stage);
+  // Dynamic CV changes core projection, dataflow, liveness and cache
+  // multiplicity.  Reusing a family-level Preserve/Transform contract here
+  // would incorrectly treat those changes as no-ops.  Until a replay-backed
+  // DynamicCVPipelineContract is implemented, this exact stage may only carry
+  // the explicit fail-closed contract above.
+  if (binding.stage.stageName == "ttir.dynamic-cv-pipeline")
+    return nullptr;
 
   constexpr std::array<StringRef, 4> resourceParameters = {
       "expected_resource_count", "expected_source_elements",
@@ -464,6 +473,10 @@ py::dict serializeResult(const TTIRUBAnalysisResult &analysis,
   for (const std::string &reason : analysis.unsupportedReasons)
     unsupportedReasons.append(reason);
   result["unsupported_reasons"] = std::move(unsupportedReasons);
+  py::list deferTrace;
+  for (const std::string &trace : analysis.deferTrace)
+    deferTrace.append(trace);
+  result["defer_trace"] = std::move(deferTrace);
   result["pipeline_identity"] = identity.sha256;
   result["contract_version"] = analysis.contractVersion;
   return result;
@@ -484,6 +497,22 @@ py::dict runAnalysis(ModuleOp &module, const py::dict &rawOptions,
 } // namespace
 
 void initTTIRUBLowerBoundBindings(py::module_ &module) {
+  module.def("ttir_ub_portable_module_text", [](ModuleOp &module) {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    module.print(stream, OpPrintingFlags().enableDebugInfo(false));
+    stream.flush();
+    return text;
+  });
+
+  module.def("ttir_ub_generic_module_text", [](ModuleOp &module) {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    module.print(stream, OpPrintingFlags().printGenericOpForm());
+    stream.flush();
+    return text;
+  });
+
   module.def("get_ub_capacity_bytes", [](const std::string &arch) -> py::object {
     std::optional<int64_t> capacity = getUBCapacityBytes(arch);
     if (!capacity)

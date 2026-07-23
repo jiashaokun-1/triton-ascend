@@ -1,0 +1,169 @@
+{
+  "schema": "ttir-ub-coverage-v1",
+  "completion_boundary": "P4",
+  "operation_families": [
+    {
+      "family": "direct-memory",
+      "phase": "P1",
+      "operations": ["tt.load", "tt.store", "tt.addptr"],
+      "status": "candidate-supported",
+      "evidence": "direct-copy oracle fixture"
+    },
+    {
+      "family": "descriptor-memory",
+      "phase": "P4",
+      "operations": ["tt.make_tensor_ptr", "tt.advance", "tt.descriptor_load", "tt.descriptor_store", "tt.descriptor_reduce", "tt.descriptor_gather", "tt.descriptor_scatter"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-descriptor-memory"
+    },
+    {
+      "family": "irregular-memory",
+      "phase": "P4",
+      "operations": ["tt.gather", "tt.scatter", "tt.index_select", "tt.index_put", "tt.load_unstructured", "tt.store_unstructured"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-irregular-memory"
+    },
+    {
+      "family": "elementwise",
+      "phase": "P2",
+      "operations": ["arith.addf"],
+      "status": "candidate-supported",
+      "evidence": "binary-add oracle fixture"
+    },
+    {
+      "family": "other-elementwise",
+      "phase": "P2",
+      "operations": ["arith.*", "math.*", "extern_elementwise"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-arithmetic or unsupported-op"
+    },
+    {
+      "family": "view",
+      "phase": "P2",
+      "operations": ["tt.reshape"],
+      "status": "candidate-supported",
+      "evidence": "reshape-copy oracle fixture"
+    },
+    {
+      "family": "broadcast-view",
+      "phase": "P2",
+      "operations": ["tt.broadcast", "tt.expand_dims", "tt.bitcast"],
+      "status": "deliberate-defer",
+      "evidence": "operation-specific unsupported-op reason"
+    },
+    {
+      "family": "shape-construction",
+      "phase": "P4",
+      "operations": ["tt.cat", "tt.join", "tt.split"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-shape-construction"
+    },
+    {
+      "family": "layout-transform",
+      "phase": "P4",
+      "operations": ["tt.trans", "tt.flip", "tt.sort", "ttascend.flip", "ttascend.sort"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-layout-transform"
+    },
+    {
+      "family": "reduction",
+      "phase": "P3",
+      "operations": ["tt.reduce(axis=0, arith.addf)"],
+      "status": "candidate-supported",
+      "evidence": "reduction-sum oracle fixture"
+    },
+    {
+      "family": "reduction-long-tail",
+      "phase": "P3",
+      "operations": ["tt.reduce(other)", "argmin", "argmax", "tt.scan", "tt.scan.return"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-reduction or unsupported-op-scan"
+    },
+    {
+      "family": "control-flow",
+      "phase": "P3",
+      "operations": ["scf.for(static, one carried tensor, add)"],
+      "status": "candidate-supported",
+      "evidence": "loop-carried-add oracle fixture"
+    },
+    {
+      "family": "control-flow-long-tail",
+      "phase": "P4",
+      "operations": ["nested scf.for", "scf.while", "scf.if"],
+      "status": "deliberate-defer",
+      "evidence": "nested-region or unsupported-op-control-flow"
+    },
+    {
+      "family": "multibuffer-preload",
+      "phase": "P3",
+      "operations": ["loop step-load factor=2", "factor!=2", "preload factor=4"],
+      "status": "deliberate-defer",
+      "evidence": "factor=2 is candidate-supported by the loop fixture; every other factor and preload remain explicitly unpromotable"
+    },
+    {
+      "family": "constants-indexing",
+      "phase": "P1",
+      "operations": ["tt.make_range", "tt.splat", "arith.constant"],
+      "status": "source-fact-only",
+      "evidence": "strict contiguous-pointer and static-bound matchers"
+    },
+    {
+      "family": "launch-diagnostics",
+      "phase": "P4",
+      "operations": ["tt.get_program_id", "tt.get_num_programs", "tt.assert", "tt.print"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-launch-or-diagnostics"
+    },
+    {
+      "family": "dynamic-cv-mix",
+      "phase": "P4",
+      "operations": ["DynamicCVPipeline", "PlanComputeBlock", "SplitDataflow", "SeparateMemoryFromCompute", "AllocMultiCache", "AddControlFlowCondition", "SplitMix"],
+      "status": "deliberate-defer",
+      "evidence": "exact PipelineIdentity and boundary audit; semantic replay and PlanMemory promotion are forbidden until producer/consumer schemas match"
+    }
+  ],
+  "contracts": [
+    {"name": "PipelineApplicabilityContract", "phase": "P0", "status": "implemented"},
+    {"name": "DirectTensorLoadSourceContract", "phase": "P1", "status": "implemented-slice"},
+    {"name": "TritonToLinalgLoadMaterializationContract", "phase": "P1", "status": "implemented-slice"},
+    {"name": "TritonToLinalgStoreMaterializationContract", "phase": "P2", "status": "implemented-slice"},
+    {"name": "IntermediateMaterializationContract", "phase": "P2", "status": "implemented-slice"},
+    {"name": "AutoBlockifyContract", "phase": "P1", "status": "identity-bound-defer"},
+    {"name": "AutoSchedulingContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "TritonToStructureContract", "phase": "P1", "status": "identity-bound-defer"},
+    {"name": "DiscreteMaskAccessContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "TritonToAnnotationContract", "phase": "P1", "status": "identity-bound-defer"},
+    {"name": "TritonToUnstructureContract", "phase": "P3", "status": "deliberate-defer"},
+    {"name": "TritonToHIVMContract", "phase": "P1", "status": "identity-bound-defer"},
+    {"name": "TritonToHFusionContract", "phase": "P2", "status": "identity-bound-defer"},
+    {"name": "TritonToLLVMBridgeContract", "phase": "P1", "status": "identity-bound-defer"},
+    {"name": "BubbleUpOperationContract", "phase": "P3", "status": "identity-bound-defer"},
+    {"name": "ElementwiseFusionContract", "phase": "P2", "status": "implemented-slice"},
+    {"name": "ViewAliasContract", "phase": "P2", "status": "implemented-slice"},
+    {"name": "LayoutConversionContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "ReductionMaterializationContract", "phase": "P3", "status": "implemented-slice"},
+    {"name": "DescriptorMemoryContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "IrregularMemoryContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "DynamicCVPipelineContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "PlanComputeBlockContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "SplitDataflowContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "SeparateMemoryFromComputeContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "AllocMultiCacheContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "AddControlFlowConditionContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "SplitMixContract", "phase": "P4", "status": "deliberate-defer"},
+    {"name": "BiShengTilingContract", "phase": "P1", "status": "implemented-slice"},
+    {"name": "TileAndBindSubBlockContract", "phase": "P1", "status": "implemented-slice"},
+    {"name": "CanonicalizationEliminationContract", "phase": "P2", "status": "identity-bound-defer"},
+    {"name": "BufferizationContract", "phase": "P1", "status": "oracle-validated"},
+    {"name": "InPlaceAliasContract", "phase": "P2", "status": "implemented-slice"},
+    {"name": "DistinctAllocationContract", "phase": "P2", "status": "implemented-slice"},
+    {"name": "LifetimeContract", "phase": "P3", "status": "implemented-slice"},
+    {"name": "MultiBufferContract", "phase": "P3", "status": "implemented-factor-2"},
+    {"name": "PlanMemoryInterpretationContract", "phase": "P0", "status": "implemented"}
+  ],
+  "out_of_scope_after_p4": [
+    "DotMaterializationContract",
+    "AtomicMemoryContract",
+    "AlignmentContract"
+  ]
+}
