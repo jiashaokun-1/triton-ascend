@@ -76,12 +76,12 @@ kernel.ttir.ub-lower-bound.json
 5. 增加成对的 canonical TTIR 与 before-CVPipelining fixture。
 6. 使用 seed `0..19` 和 retry 模式与真实 PlanMemory 比较，通过后再评审 profile。
 
-为避免把不同编译产生的文件误配成一组，先开启 Triton kernel dump，并从同一个 cache
-目录打包 `kernel.ttir.mlir` 和 `kernel.ttadapter.mlir`：
+先从同一次编译捕获 `kernel.ttir.mlir`，以及紧邻 `createCVPipeliningPass` 之前的 BiSheng
+Generic IR；将后者命名为 `before_cvpipelining.mlir`，放入同一个专用 capture 目录后打包：
 
 ```bash
 python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
-  --dump-dir /path/to/dumps/ONE_CACHE_KEY \
+  --dump-dir /path/to/paired-capture/ONE_CASE \
   --output-dir /tmp/binary-add-fixture \
   --name binary-add-f32-65536-a2 \
   --operation-family binary-add \
@@ -91,9 +91,11 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
   --max-tiles 64
 ```
 
-打包器会自动推导 input payload、输出两个文件哈希，并拒绝覆盖已有 fixture。默认由 oracle
-从所有 seed/retry 的真实 snapshot 推导 auto-tile outcome；结果不一致时禁止晋升。只有维护
-已知 golden fixture 时才显式传 `--auto-tile-outcome true|false` 作为额外断言。
+打包器会核对 before-CVPipelining 边界的静态 allocation 数量和大小，因此 raw
+`kernel.ttadapter.mlir` 会被拒绝；同时自动推导 input payload、输出两个文件哈希，并拒绝覆盖
+已有 fixture。默认由 oracle 从所有 seed/retry 的真实 snapshot 推导 auto-tile outcome；结果
+不一致时禁止晋升。只有维护已知 golden fixture 时才显式传
+`--auto-tile-outcome true|false` 作为额外断言。
 
 校验命令：
 

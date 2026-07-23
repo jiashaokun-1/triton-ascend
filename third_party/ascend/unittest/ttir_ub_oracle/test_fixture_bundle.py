@@ -23,12 +23,14 @@ bundle = _load_tool("ttir_ub_fixture_bundle")
 oracle = _load_tool("ttir_ub_oracle")
 
 
-def _dump_dir(root):
+def _dump_dir(root, allocation_count=2, allocation_elements=1024):
     root.mkdir()
     (root / "kernel.ttir.mlir").write_text("module { tt.func public @copy() }\n")
-    (root / "kernel.ttadapter.mlir").write_text(
-        '%0 = "memref.alloc"() : () -> memref<1024xf32>\n'
-        '%1 = "memref.alloc"() : () -> memref<1024xf32>\n'
+    (root / "before_cvpipelining.mlir").write_text(
+        "".join(
+            f'%{index} = "memref.alloc"() : () -> memref<{allocation_elements}xf32>\n'
+            for index in range(allocation_count)
+        )
     )
     return root
 
@@ -69,6 +71,10 @@ def test_bundle_packages_one_same_dump_pair_for_the_oracle(tmp_path):
     assert result["before_cvpipelining_sha256"] == oracle.file_sha256(
         case["before_cvpipelining"]
     )
+    assert result["before_cvpipelining_allocations_bytes"] == \
+        oracle.parse_boundary_allocation_bytes(
+            case["before_cvpipelining"].read_text(encoding="utf-8")
+        )
 
 
 def test_bundle_refuses_partial_or_overwritten_pairs(tmp_path):
@@ -85,6 +91,16 @@ def test_bundle_refuses_partial_or_overwritten_pairs(tmp_path):
     with pytest.raises(bundle.BundleError, match="overwrite"):
         bundle.create_fixture_bundle(complete, output_dir, _config())
     assert (output_dir / "manifest.json").read_text() == "do not replace\n"
+
+
+def test_bundle_rejects_raw_ttir_to_linalg_output_as_the_cvpipeline_boundary(tmp_path):
+    raw_ttir_adapter = _dump_dir(
+        tmp_path / "raw-ttadapter", allocation_count=2, allocation_elements=65536
+    )
+    with pytest.raises(bundle.BundleError, match="allocations do not match"):
+        bundle.create_fixture_bundle(
+            raw_ttir_adapter, tmp_path / "fixture", _config()
+        )
 
 
 def test_bundle_refuses_a_broken_output_symlink(tmp_path):
@@ -132,7 +148,7 @@ def test_bundle_rejects_unsafe_or_inconsistent_configuration(tmp_path, updates):
 
 
 def test_bundle_cli_emits_machine_readable_result(tmp_path, capsys):
-    dump_dir = _dump_dir(tmp_path / "dump")
+    dump_dir = _dump_dir(tmp_path / "dump", allocation_count=1)
     output_dir = tmp_path / "fixture"
     status = bundle.main([
         "--dump-dir", str(dump_dir),
@@ -148,6 +164,7 @@ def test_bundle_cli_emits_machine_readable_result(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert payload["expected_input_payload_bytes"] == 262144
+    assert payload["before_cvpipelining_allocations_bytes"] == [4096]
     case = oracle.load_manifest(output_dir / "manifest.json")["cases"][0]
     assert case["operation_family"] == "reshape-copy"
     assert case["contract_proposal"]["auto_tile_and_bind_subblock_outcome"] is None

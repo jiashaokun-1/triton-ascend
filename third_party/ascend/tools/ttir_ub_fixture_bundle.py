@@ -18,8 +18,17 @@ _OPERATION_FAMILY_RESOURCE_COUNTS = {
     "binary-add": 2,
     "reshape-copy": 2,
 }
+_OPERATION_FAMILY_ALLOCATION_COUNTS = {
+    "direct-copy": 1,
+    "binary-add": 2,
+    "reshape-copy": 1,
+}
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _MAX_INT64 = (1 << 63) - 1
+_STATIC_ALLOC_RE = re.compile(
+    r'"memref\.alloc"\([^\n]*?\)\s*(?:<[^\n]*?>\s*)?:\s*\([^\n]*?\)\s*->\s*'
+    r'memref<(\d+)x(bf16|f16|f32|f64|i8|i16|i32|i64)>'
+)
 
 
 class BundleError(ValueError):
@@ -87,13 +96,35 @@ def _dump_file(dump_dir: Path, relative_name: str, field: str) -> Path:
     return candidate
 
 
+def _parse_boundary_allocation_bytes(path: Path) -> list[int]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise BundleError(f"cannot read before-CVPipelining snapshot: {error}") from error
+    matches = _STATIC_ALLOC_RE.findall(text)
+    if not matches or len(matches) != text.count('"memref.alloc"'):
+        raise BundleError(
+            "before-CVPipelining allocations must all be supported static 1-D memrefs"
+        )
+    allocations = []
+    for elements_text, element_type in matches:
+        bit_width = 16 if element_type == "bf16" else int(
+            re.search(r"\d+", element_type).group()
+        )
+        allocation_bytes = int(elements_text) * (bit_width // 8)
+        if allocation_bytes <= 0 or allocation_bytes > _MAX_INT64:
+            raise BundleError("before-CVPipelining allocation has an invalid size")
+        allocations.append(allocation_bytes)
+    return allocations
+
+
 def create_fixture_bundle(
     dump_dir: Path,
     output_dir: Path,
     config: BundleConfig,
     *,
     ttir_dump_name: str = "kernel.ttir.mlir",
-    before_dump_name: str = "kernel.ttadapter.mlir",
+    before_dump_name: str = "before_cvpipelining.mlir",
 ) -> dict:
     """Copy a same-compilation dump pair and create its strict oracle manifest."""
     payload_bytes = _validate_config(config)
@@ -103,7 +134,17 @@ def create_fixture_bundle(
     before_source = _dump_file(dump_dir, before_dump_name, "before-CVPipelining dump name")
     if not ttir_source.is_file() or not before_source.is_file():
         raise BundleError(
-            "dump directory must contain kernel.ttir.mlir and kernel.ttadapter.mlir"
+            "dump directory must contain kernel.ttir.mlir and before_cvpipelining.mlir"
+        )
+    allocations = _parse_boundary_allocation_bytes(before_source)
+    expected_allocation_count = _OPERATION_FAMILY_ALLOCATION_COUNTS[
+        config.operation_family
+    ]
+    expected_allocation_bytes = (payload_bytes + config.max_tiles - 1) // config.max_tiles
+    if (len(allocations) != expected_allocation_count
+            or any(value != expected_allocation_bytes for value in allocations)):
+        raise BundleError(
+            "before-CVPipelining allocations do not match the operation family and proposal"
         )
     ttir_name = f"{config.name}.ttir.mlir"
     before_name = f"{config.name}.before_cvpipelining.mlir"
@@ -162,6 +203,7 @@ def create_fixture_bundle(
         "ttir_sha256": _file_sha256(targets[0]),
         "before_cvpipelining_sha256": _file_sha256(targets[1]),
         "expected_input_payload_bytes": payload_bytes,
+        "before_cvpipelining_allocations_bytes": allocations,
     }
 
 
@@ -193,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--materialization-stage", default="ttir.triton-to-linalg")
     parser.add_argument("--ttir-dump-name", default="kernel.ttir.mlir")
-    parser.add_argument("--before-dump-name", default="kernel.ttadapter.mlir")
+    parser.add_argument("--before-dump-name", default="before_cvpipelining.mlir")
     arguments = parser.parse_args(argv)
     try:
         result = create_fixture_bundle(

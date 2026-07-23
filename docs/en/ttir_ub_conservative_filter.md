@@ -82,13 +82,14 @@ To support another TTIR pattern or lowering stage:
 6. Compare the lower bound with real PlanMemory results for seeds `0..19` and
    retry mode before reviewing a profile candidate.
 
-To avoid pairing files from different compilations, first enable the Triton
-kernel dump and package `kernel.ttir.mlir` and `kernel.ttadapter.mlir` from one
-cache directory:
+First capture `kernel.ttir.mlir` and the BiSheng Generic IR immediately before
+`createCVPipeliningPass` from the same compilation. Place the latter at
+`before_cvpipelining.mlir` in one dedicated capture directory, then package the
+pair:
 
 ```bash
 python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
-  --dump-dir /path/to/dumps/ONE_CACHE_KEY \
+  --dump-dir /path/to/paired-capture/ONE_CASE \
   --output-dir /tmp/binary-add-fixture \
   --name binary-add-f32-65536-a2 \
   --operation-family binary-add \
@@ -98,11 +99,13 @@ python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
   --max-tiles 64
 ```
 
-The packager derives the input payload, emits both file hashes, and refuses to
-overwrite an existing fixture. By default, the oracle derives the auto-tile
-outcome from every real seed/retry snapshot and rejects nondeterministic
-outcomes. Use an explicit `--auto-tile-outcome true|false` only as an additional
-assertion for a known golden fixture.
+The packager rejects a raw `kernel.ttadapter.mlir`: the exact number and size of
+static allocations must match the proposed before-CVPipelining boundary. It
+also derives the input payload, emits both file hashes, and refuses to overwrite
+an existing fixture. By default, the oracle derives the auto-tile outcome from
+every real seed/retry snapshot and rejects nondeterministic outcomes. Use an
+explicit `--auto-tile-outcome true|false` only as an additional assertion for a
+known golden fixture.
 
 Run the comparison with:
 
