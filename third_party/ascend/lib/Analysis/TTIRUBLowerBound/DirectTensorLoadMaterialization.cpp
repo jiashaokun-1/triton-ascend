@@ -4,6 +4,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include <climits>
@@ -167,18 +168,26 @@ LogicalResult rejectUnsupportedOperations(
     }
     if (isa<triton::MakeRangeOp, triton::SplatOp, triton::AddPtrOp,
             triton::LoadOp, triton::StoreOp, triton::ReshapeOp,
-            triton::ReduceOp, triton::ReduceReturnOp,
-            arith::AddFOp>(operation)) {
+            triton::ReduceOp, triton::ReduceReturnOp, arith::AddFOp,
+            arith::ConstantOp, scf::ForOp, scf::YieldOp>(operation)) {
       triton::FuncOp function = operation->getParentOfType<triton::FuncOp>();
       const bool isReduction = isa<triton::ReduceOp>(operation);
       const bool isReductionBody =
           isa<triton::ReduceReturnOp, arith::AddFOp>(operation) &&
           operation->getParentOfType<triton::ReduceOp>();
+      const bool isLoop = isa<scf::ForOp>(operation);
+      const bool isLoopBody =
+          isa<triton::LoadOp, arith::AddFOp, scf::YieldOp>(operation) &&
+          operation->getParentOfType<scf::ForOp>();
       const bool validPlacement =
           isReduction
               ? function && isDirectlyInEntryBlock(operation, function) &&
                     operation->getNumRegions() == 1
-              : isReductionBody ||
+              : isLoop
+                    ? function &&
+                          isDirectlyInEntryBlock(operation, function) &&
+                          operation->getNumRegions() == 1
+                    : isReductionBody || isLoopBody ||
                     (function && isDirectlyInEntryBlock(operation, function) &&
                      operation->getNumRegions() == 0);
       if (matched.contains(operation) && validPlacement &&
@@ -745,6 +754,199 @@ LogicalResult materializeBinaryAdd(
   return success();
 }
 
+FailureOr<int64_t> getIndexConstant(Value value, triton::FuncOp function,
+                                    SmallVectorImpl<std::string> &reasons) {
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                          : IntegerAttr();
+  if (!constant || !integer || !constant.getType().isIndex() ||
+      !isDirectlyInEntryBlock(constant, function) ||
+      constant->getNumOperands() != 0 || constant->getNumResults() != 1 ||
+      constant->getNumRegions() != 0 || constant->getNumSuccessors() != 0 ||
+      !constant.getResult().hasOneUse())
+    return defer(reasons, "unsupported-loop-bounds");
+  return integer.getInt();
+}
+
+LogicalResult materializeLoopCarriedAdd(
+    ArrayRef<triton::LoadOp> loads, scf::ForOp loop,
+    MandatoryUBResourceGraph &graph, llvm::DenseSet<Operation *> &matched,
+    SmallVectorImpl<std::string> &reasons) {
+  triton::FuncOp function = loop->getParentOfType<triton::FuncOp>();
+  if (!function || !isDirectlyInEntryBlock(loop, function) ||
+      loads.size() != 2 || loop->getNumOperands() != 4 ||
+      loop->getNumResults() != 1 || loop->getNumRegions() != 1 ||
+      loop->getNumSuccessors() != 0 || loop.getInitArgs().size() != 1 ||
+      !loop.getRegion().hasOneBlock())
+    return defer(reasons, "unsupported-loop-shape");
+
+  FailureOr<int64_t> lower =
+      getIndexConstant(loop.getLowerBound(), function, reasons);
+  FailureOr<int64_t> upper =
+      getIndexConstant(loop.getUpperBound(), function, reasons);
+  FailureOr<int64_t> step =
+      getIndexConstant(loop.getStep(), function, reasons);
+  if (failed(lower) || failed(upper) || failed(step) || *lower != 0 ||
+      *upper != 2 || *step != 1)
+    return defer(reasons, "unsupported-loop-bounds");
+
+  Block &body = loop.getRegion().front();
+  if (body.getNumArguments() != 2 ||
+      body.getArgument(0) != loop.getInductionVar() ||
+      loop.getRegionIterArgs().size() != 1 ||
+      body.getArgument(1) != loop.getRegionIterArgs().front() ||
+      std::distance(body.begin(), body.end()) != 3)
+    return defer(reasons, "unsupported-loop-shape");
+  auto stepLoad = dyn_cast<triton::LoadOp>(&body.front());
+  auto add =
+      dyn_cast_or_null<arith::AddFOp>(stepLoad ? stepLoad->getNextNode()
+                                               : nullptr);
+  auto yield =
+      dyn_cast_or_null<scf::YieldOp>(add ? add->getNextNode() : nullptr);
+  if (!stepLoad || !add || !yield || &body.back() != yield.getOperation() ||
+      add->getNumOperands() != 2 || add->getNumResults() != 1 ||
+      add->getNumRegions() != 0 || add->getNumSuccessors() != 0 ||
+      add.getFastmath() != arith::FastMathFlags::none ||
+      add.getLhs() != loop.getRegionIterArgs().front() ||
+      add.getRhs() != stepLoad.getResult() ||
+      yield->getNumOperands() != 1 || yield->getNumResults() != 0 ||
+      yield->getNumRegions() != 0 || yield->getNumSuccessors() != 0 ||
+      yield.getResults().front() != add.getResult())
+    return defer(reasons, "unsupported-loop-body");
+
+  triton::LoadOp initLoad;
+  for (triton::LoadOp load : loads) {
+    if (load == stepLoad)
+      continue;
+    if (initLoad)
+      return defer(reasons, "unsupported-loop-dataflow");
+    initLoad = load;
+  }
+  if (!initLoad || !isDirectlyInEntryBlock(initLoad, function) ||
+      initLoad->getNumOperands() != 1 || initLoad->getNumResults() != 1 ||
+      initLoad->getNumRegions() != 0 || initLoad->getNumSuccessors() != 0 ||
+      stepLoad->getNumOperands() != 1 || stepLoad->getNumResults() != 1 ||
+      stepLoad->getNumRegions() != 0 || stepLoad->getNumSuccessors() != 0)
+    return defer(reasons, "unsupported-loop-load");
+  auto hasSupportedLoadSemantics = [](triton::LoadOp load) {
+    return !load.getOther() && load.getBoundaryCheck().empty() &&
+           !load.getPadding() && !load.getIsVolatile() &&
+           load.getCache() == triton::CacheModifier::NONE &&
+           load.getEvict() == triton::EvictionPolicy::NORMAL;
+  };
+  if (!hasSupportedLoadSemantics(initLoad) ||
+      !hasSupportedLoadSemantics(stepLoad))
+    return defer(reasons, "unsupported-load-semantics");
+
+  auto resultType = dyn_cast<RankedTensorType>(loop.getResult(0).getType());
+  if (!resultType || !resultType.hasStaticShape() ||
+      resultType.getRank() != 1 || !resultType.getElementType().isF32() ||
+      initLoad.getType() != resultType || stepLoad.getType() != resultType ||
+      loop.getInitArgs().front() != initLoad.getResult() ||
+      loop.getRegionIterArgs().front().getType() != resultType ||
+      add.getType() != resultType || !initLoad.getResult().hasOneUse() ||
+      !stepLoad.getResult().hasOneUse() ||
+      *stepLoad.getResult().getUsers().begin() != add.getOperation() ||
+      !loop.getResult(0).hasOneUse())
+    return defer(reasons, "unsupported-loop-dataflow");
+  FailureOr<int64_t> payloadBytes = getPayloadBytes(resultType, reasons);
+  if (failed(payloadBytes))
+    return failure();
+
+  auto store =
+      dyn_cast<triton::StoreOp>(*loop.getResult(0).getUsers().begin());
+  if (!store || store->getNumOperands() != 2 || store->getNumResults() != 0 ||
+      store->getNumRegions() != 0 || store->getNumSuccessors() != 0 ||
+      store.getValue() != loop.getResult(0) ||
+      !isDirectlyInEntryBlock(store, function) ||
+      !loop->isBeforeInBlock(store) || !store.getBoundaryCheck().empty() ||
+      store.getCache() != triton::CacheModifier::NONE ||
+      store.getEvict() != triton::EvictionPolicy::NORMAL)
+    return defer(reasons, "unsupported-loop-store");
+
+  FailureOr<ContiguousPointerChain> initChain = matchContiguousPointer(
+      initLoad.getPtr(), function, resultType.getNumElements(),
+      resultType.getElementType(), reasons);
+  FailureOr<ContiguousPointerChain> stepChain = matchContiguousPointer(
+      stepLoad.getPtr(), function, resultType.getNumElements(),
+      resultType.getElementType(), reasons);
+  FailureOr<ContiguousPointerChain> destinationChain = matchContiguousPointer(
+      store.getPtr(), function, resultType.getNumElements(),
+      resultType.getElementType(), reasons);
+  if (failed(initChain) || failed(stepChain) || failed(destinationChain))
+    return failure();
+  if (!initChain->addPtr.getResult().hasOneUse() ||
+      !stepChain->addPtr.getResult().hasOneUse() ||
+      !destinationChain->addPtr.getResult().hasOneUse() ||
+      !initChain->addPtr->isBeforeInBlock(initLoad) ||
+      !stepChain->addPtr->isBeforeInBlock(loop) ||
+      !destinationChain->addPtr->isBeforeInBlock(store) ||
+      initChain->range != stepChain->range ||
+      initChain->range != destinationChain->range ||
+      std::distance(initChain->range.getResult().use_begin(),
+                    initChain->range.getResult().use_end()) != 3)
+    return defer(reasons, "non-contiguous-pointer");
+
+  const uint64_t initOrdinal = std::distance(
+      function.getBody().front().begin(), initLoad->getIterator());
+  const uint64_t loopOrdinal = std::distance(
+      function.getBody().front().begin(), loop->getIterator());
+  const uint64_t storeOrdinal = std::distance(
+      function.getBody().front().begin(), store->getIterator());
+  if (!(initOrdinal < loopOrdinal && loopOrdinal < storeOrdinal))
+    return defer(reasons, "unsupported-loop-dataflow");
+
+  SmallVector<ResourceId> resourceIds;
+  auto addResource = [&](StringRef name, uint64_t birth, uint64_t lastUse,
+                         StringRef consumer) -> LogicalResult {
+    MandatoryUBResource resource;
+    resource.debugName = name.str();
+    resource.minPayloadBytes = *payloadBytes;
+    resource.minInstances = 1;
+    resource.origin = "tt.load";
+    resource.kind = MaterializationKind::GMToUBLoad;
+    resource.birth.ordinal = birth;
+    resource.lastRequiredUse.ordinal = lastUse;
+    resource.sourceElements = resultType.getNumElements();
+    resource.elementBitWidth = 32;
+    resource.consumer = consumer.str();
+    resource.contractTrace.push_back("ttir-loop-carried-add-v1");
+    ResourceId id = graph.addResource(std::move(resource));
+    if (id == InvalidResourceId)
+      return failure();
+    resourceIds.push_back(id);
+    return success();
+  };
+  if (failed(addResource("loop-carried-accumulator", initOrdinal,
+                         storeOrdinal, "scf.for")) ||
+      failed(addResource("loop-step-input", loopOrdinal, loopOrdinal,
+                         "arith.addf")))
+    return defer(reasons, "malformed-resource-graph");
+  graph.addMayAlias(resourceIds[0], resourceIds[1]);
+  CoexistenceWitness witness;
+  witness.resources = resourceIds;
+  witness.contractTrace.push_back("ttir-loop-carried-add-v1");
+  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
+    return defer(reasons, "malformed-resource-graph");
+
+  matched.insert(initChain->range);
+  for (const ContiguousPointerChain &chain :
+       {*initChain, *stepChain, *destinationChain}) {
+    matched.insert(chain.splat);
+    matched.insert(chain.addPtr);
+  }
+  for (Value bound : {loop.getLowerBound(), loop.getUpperBound(),
+                      loop.getStep()})
+    matched.insert(bound.getDefiningOp());
+  matched.insert(initLoad);
+  matched.insert(stepLoad);
+  matched.insert(loop);
+  matched.insert(add);
+  matched.insert(yield);
+  matched.insert(store);
+  return success();
+}
+
 } // namespace
 
 LogicalResult materializeDirectTensorLoads(
@@ -778,7 +980,14 @@ LogicalResult materializeDirectTensorLoads(
   module.walk([&](triton::ReduceOp reduce) { reductions.push_back(reduce); });
   SmallVector<arith::AddFOp> adds;
   module.walk([&](arith::AddFOp add) { adds.push_back(add); });
-  if (!reductions.empty()) {
+  SmallVector<scf::ForOp> loops;
+  module.walk([&](scf::ForOp loop) { loops.push_back(loop); });
+  if (!loops.empty()) {
+    if (loops.size() != 1 || reductions.size() != 0 || adds.size() != 1 ||
+        failed(materializeLoopCarriedAdd(loads, loops.front(), graph, matched,
+                                         unsupportedReasons)))
+      return failure();
+  } else if (!reductions.empty()) {
     if (reductions.size() != 1 || loads.size() != 1 ||
         failed(materializeReductionSum(loads.front(), reductions.front(),
                                        graph, matched, unsupportedReasons)))

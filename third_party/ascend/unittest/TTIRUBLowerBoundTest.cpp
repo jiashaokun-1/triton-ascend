@@ -131,6 +131,31 @@ module {
 }
 )mlir";
 
+constexpr StringLiteral kLoopCarriedAdd = R"mlir(
+module {
+  tt.func public @loop_carried_add(%init_src: !tt.ptr<f32>, %step_src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %init_splat = tt.splat %init_src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %init_ptrs = tt.addptr %init_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %step_splat = tt.splat %step_src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %step_ptrs = tt.addptr %step_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dst_splat = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dst_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %c0 = arith.constant 0 : index
+    %c2 = arith.constant 2 : index
+    %c1 = arith.constant 1 : index
+    %init = tt.load %init_ptrs : tensor<65536x!tt.ptr<f32>>
+    %result = scf.for %iv = %c0 to %c2 step %c1 iter_args(%acc = %init) -> tensor<65536xf32> {
+      %step = tt.load %step_ptrs : tensor<65536x!tt.ptr<f32>>
+      %next = arith.addf %acc, %step : tensor<65536xf32>
+      scf.yield %next : tensor<65536xf32>
+    }
+    tt.store %dst_ptrs, %result : tensor<65536x!tt.ptr<f32>>
+    tt.return
+  }
+}
+)mlir";
+
 std::string replaceOnce(StringRef source, StringRef from, StringRef to) {
   std::string result = source.str();
   size_t position = result.find(from.str());
@@ -948,6 +973,63 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
   ASSERT_EQ(result.certificates.size(), 1u);
   EXPECT_EQ(result.certificates[0].kind, "singleton");
   EXPECT_EQ(result.certificates[0].resourceIds.size(), 1u);
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoopCarriedAddProvesAccumulatorAndStepInputCoexist) {
+  TTIRUBAnalysisOptions analysisOptions = options("Ascend910B1");
+  analysisOptions.stages = {{.stageName = "source"},
+                            {.stageName = "materialize"},
+                            {.stageName = "suffix"}};
+  PipelineContractRegistry loopRegistry;
+  loopRegistry.setProfileIdentity(analysisOptions.pipelineIdentity);
+  ASSERT_TRUE(succeeded(loopRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[0],
+       .contractId = "loop-carried-add-preserve",
+       .contractVersion = "1"},
+      makeLoopCarriedAddPreserveContract(analysisOptions.stages[0], 2, 65536,
+                                         32, 262144))));
+  ASSERT_TRUE(succeeded(loopRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[1],
+       .contractId = "loop-carried-add-max-tiles",
+       .contractVersion = "1"},
+      makeLoopCarriedAddMaxTilesContract(analysisOptions.stages[1], 2, 65536,
+                                         32, 262144, 1))));
+  ASSERT_TRUE(succeeded(loopRegistry.addProfileContract(
+      {.stage = analysisOptions.stages[2],
+       .contractId = "loop-carried-add-preserve",
+       .contractVersion = "1"},
+      makeLoopCarriedAddPreserveContract(analysisOptions.stages[2], 2, 65536,
+                                         32, 262144))));
+  OwningOpRef<ModuleOp> module = parse(kLoopCarriedAdd);
+  ASSERT_TRUE(module);
+
+  TTIRUBAnalysisResult result =
+      analyzeTTIRUBLowerBound(*module, analysisOptions, loopRegistry);
+  EXPECT_EQ(result.decision, TTIRUBDecision::Reject);
+  EXPECT_EQ(result.lowerBoundBytes, 524288);
+  ASSERT_TRUE(result.unsupportedReasons.empty());
+  ASSERT_EQ(result.certificates.size(), 1u);
+  EXPECT_EQ(result.certificates[0].kind, "witness");
+  EXPECT_EQ(result.certificates[0].resourceIds,
+            SmallVector<ResourceId>({0, 1}));
+  EXPECT_EQ(
+      result.certificates[0].contractTrace,
+      SmallVector<std::string>({"ttir-loop-carried-add-v1",
+                                "loop-carried-add-preserve",
+                                "loop-carried-add-max-tiles",
+                                "loop-carried-add-preserve"}));
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       LoopCarriedAddRejectsUncertifiedTripCount) {
+  std::string source =
+      replaceOnce(kLoopCarriedAdd, "%c2 = arith.constant 2 : index",
+                  "%c2 = arith.constant 3 : index");
+  TTIRUBAnalysisResult result = analyze(source, options());
+
+  EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+  EXPECT_TRUE(hasReason(result, "unsupported-loop-bounds"));
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,

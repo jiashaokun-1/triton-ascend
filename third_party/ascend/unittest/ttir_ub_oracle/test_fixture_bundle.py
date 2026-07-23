@@ -199,6 +199,29 @@ def test_bundle_packages_reduction_source_allocation(tmp_path):
     assert result["before_cvpipelining_allocations_bytes"] == [262144]
 
 
+def test_bundle_packages_loop_carried_allocations(tmp_path):
+    dump_dir = _dump_dir(
+        tmp_path / "loop-dump",
+        allocation_count=2,
+        allocation_elements=65536,
+    )
+    result = bundle.create_fixture_bundle(
+        dump_dir,
+        tmp_path / "loop-fixture",
+        _config(
+            name="loop-carried-add-f32-65536-a2-tile1",
+            operation_family="loop-carried-add",
+            max_tiles=1,
+        ),
+    )
+    case = oracle.load_manifest(Path(result["manifest"]))["cases"][0]
+    assert case["operation_family"] == "loop-carried-add"
+    assert case["contract_proposal"]["expected_resource_count"] == 2
+    assert result["before_cvpipelining_allocations_bytes"] == [
+        262144, 262144
+    ]
+
+
 @pytest.mark.parametrize(
     "updates",
     [

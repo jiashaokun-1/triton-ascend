@@ -148,6 +148,12 @@ makeProfileContract(const PipelineContractBinding &binding) {
   const bool binaryTransform =
       binding.contractId == "binary-add-max-tiles" &&
       binding.contractVersion == "1";
+  const bool loopPreserve =
+      binding.contractId == "loop-carried-add-preserve" &&
+      binding.contractVersion == "1";
+  const bool loopTransform =
+      binding.contractId == "loop-carried-add-max-tiles" &&
+      binding.contractVersion == "1";
   const bool reshapePreserve =
       binding.contractId == "reshape-copy-preserve" &&
       binding.contractVersion == "1";
@@ -169,12 +175,13 @@ makeProfileContract(const PipelineContractBinding &binding) {
     expectedNames.push_back("expected_scratch_payload_bytes");
     expectedNames.push_back("expected_accumulator_payload_bytes");
   }
-  if (transform || binaryTransform || reshapeTransform ||
+  if (transform || binaryTransform || loopTransform || reshapeTransform ||
       reductionTransform)
     expectedNames.push_back("max_tiles");
   if ((!preserve && !transform && !binaryPreserve && !binaryTransform &&
-       !reshapePreserve && !reshapeTransform && !reductionPreserve &&
-       !reductionTransform && !reductionExtraBuffer) ||
+       !loopPreserve && !loopTransform && !reshapePreserve &&
+       !reshapeTransform && !reductionPreserve && !reductionTransform &&
+       !reductionExtraBuffer) ||
       !hasExactParameters(binding, expectedNames))
     return nullptr;
 
@@ -208,6 +215,10 @@ makeProfileContract(const PipelineContractBinding &binding) {
     return makeBinaryAddPreserveContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload);
+  if (loopPreserve)
+    return makeLoopCarriedAddPreserveContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload);
   if (reshapePreserve)
     return makeReshapeCopyPreserveContract(
         binding.stage, *resourceCount, *sourceElements,
@@ -228,6 +239,10 @@ makeProfileContract(const PipelineContractBinding &binding) {
     return nullptr;
   if (binaryTransform)
     return makeBinaryAddMaxTilesContract(
+        binding.stage, *resourceCount, *sourceElements,
+        static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
+  if (loopTransform)
+    return makeLoopCarriedAddMaxTilesContract(
         binding.stage, *resourceCount, *sourceElements,
         static_cast<unsigned>(*elementBitWidth), *inputPayload, *maxTiles);
   if (reshapeTransform)
@@ -337,6 +352,8 @@ bool loadMatchingProfile(const py::handle &value,
                binding.contractId == "direct-copy-max-tiles" ||
                binding.contractId == "binary-add-preserve" ||
                binding.contractId == "binary-add-max-tiles" ||
+               binding.contractId == "loop-carried-add-preserve" ||
+               binding.contractId == "loop-carried-add-max-tiles" ||
                binding.contractId == "reshape-copy-preserve" ||
                binding.contractId == "reshape-copy-max-tiles" ||
                binding.contractId == "reduction-sum-preserve" ||

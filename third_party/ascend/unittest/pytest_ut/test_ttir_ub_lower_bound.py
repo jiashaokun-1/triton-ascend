@@ -110,6 +110,31 @@ module {
 }
 """
 
+LOOP_CARRIED_ADD = """
+module {
+  tt.func public @loop_carried_add(%init_src: !tt.ptr<f32>, %step_src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
+    %init_splat = tt.splat %init_src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %init_ptrs = tt.addptr %init_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %step_splat = tt.splat %step_src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %step_ptrs = tt.addptr %step_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %dst_splat = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
+    %dst_ptrs = tt.addptr %dst_splat, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
+    %c0 = arith.constant 0 : index
+    %c2 = arith.constant 2 : index
+    %c1 = arith.constant 1 : index
+    %init = tt.load %init_ptrs : tensor<65536x!tt.ptr<f32>>
+    %result = scf.for %iv = %c0 to %c2 step %c1 iter_args(%acc = %init) -> tensor<65536xf32> {
+      %step = tt.load %step_ptrs : tensor<65536x!tt.ptr<f32>>
+      %next = arith.addf %acc, %step : tensor<65536xf32>
+      scf.yield %next : tensor<65536xf32>
+    }
+    tt.store %dst_ptrs, %result : tensor<65536x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 INT64_MAX = (1 << 63) - 1
 UINT32_MAX = (1 << 32) - 1
 
@@ -1384,6 +1409,25 @@ def test_profile_loader_accepts_certified_binary_add_schema(monkeypatch, tmp_pat
     assert load_contract_profiles() == document
 
 
+def test_profile_loader_accepts_certified_loop_carried_schema(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] = "loop-carried-add-max-tiles"
+    stage["contract_parameters"]["expected_resource_count"] = "2"
+    stage["contract_parameters"]["max_tiles"] = "1"
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
 def test_profile_loader_accepts_certified_reshape_copy_schema(monkeypatch, tmp_path):
     profile_path = tmp_path / "profiles.json"
     entry = _direct_copy_profile_entry()
@@ -1936,6 +1980,79 @@ def test_binding_runs_reduction_sum_extra_buffer_contract(tmp_path):
             "ttir-reduction-sum-v1",
             "reduction-sum-max-tiles",
             "reduction-sum-extra-buffer",
+        ],
+    }]
+
+
+def test_binding_runs_loop_carried_lifetime_contract(tmp_path):
+    source = tmp_path / "loop-carried-add.ttir"
+    source.write_text(LOOP_CARRIED_ADD)
+    context = ir.context()
+    ascend.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    identity = {
+        "open_source_pipeline": "p3-loop-carried-add-test",
+        "canonical_ttir_sha256": hashlib.sha256(
+            LOOP_CARRIED_ADD.encode()
+        ).hexdigest(),
+        "relevant_options_json": "{}",
+        "target_arch": "Ascend910B1",
+        "triton_version": "test",
+        "cann_version_hash": "test",
+        "sha256": "p3-loop-carried-add-test-identity",
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    common = {
+        "expected_resource_count": "2",
+        "expected_source_elements": "65536",
+        "expected_element_bit_width": "32",
+        "expected_input_payload_bytes": "262144",
+    }
+    profile = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "profiles": [{
+            "pipeline_identity": identity,
+            "pipeline_stages": [
+                {
+                    **stages[0],
+                    "contract_id": "loop-carried-add-max-tiles",
+                    "contract_version": "1",
+                    "contract_parameters": {**common, "max_tiles": "1"},
+                },
+                {
+                    **stages[1],
+                    "contract_id": "loop-carried-add-preserve",
+                    "contract_version": "1",
+                    "contract_parameters": common,
+                },
+            ],
+        }],
+    }
+    candidate_result = ascend.analysis.ttir_ub_lower_bound_candidate_for_oracle(
+        module,
+        {
+            "arch": "Ascend910B1",
+            "compile_mode": "aiv",
+            "pipeline_identity": identity,
+            "pipeline_stages": stages,
+            "contract_profile": profile,
+        },
+    )
+
+    assert candidate_result["decision"] == "reject"
+    assert candidate_result["lower_bound_bytes"] == 524288
+    assert candidate_result["unsupported_reasons"] == []
+    assert candidate_result["certificates"] == [{
+        "kind": "witness",
+        "bytes": 524288,
+        "resource_ids": [0, 1],
+        "contract_trace": [
+            "ttir-loop-carried-add-v1",
+            "loop-carried-add-max-tiles",
+            "loop-carried-add-preserve",
         ],
     }]
 

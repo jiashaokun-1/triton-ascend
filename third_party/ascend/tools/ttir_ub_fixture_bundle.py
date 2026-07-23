@@ -16,12 +16,14 @@ import sys
 _OPERATION_FAMILY_RESOURCE_COUNTS = {
     "direct-copy": 1,
     "binary-add": 2,
+    "loop-carried-add": 2,
     "reshape-copy": 2,
     "reduction-sum": 3,
 }
 _OPERATION_FAMILY_ALLOCATION_COUNTS = {
     "direct-copy": 1,
     "binary-add": 2,
+    "loop-carried-add": 2,
     "reshape-copy": 1,
     "reduction-sum": 1,
 }
@@ -88,6 +90,11 @@ def _validate_config(config: BundleConfig) -> int:
                  or config.source_elements % 2)):
         raise BundleError(
             "reduction-sum currently requires even f32 input and max_tiles=1"
+        )
+    if (config.operation_family == "loop-carried-add"
+            and (config.max_tiles != 1 or config.element_bit_width != 32)):
+        raise BundleError(
+            "loop-carried-add currently requires f32 input and max_tiles=1"
         )
     payload_bytes = config.source_elements * (config.element_bit_width // 8)
     if payload_bytes > _MAX_INT64:

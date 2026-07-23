@@ -119,6 +119,10 @@ def _is_valid_profile_stage(stage):
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
     if contract_id == "binary-add-max-tiles":
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
+    if contract_id == "loop-carried-add-preserve":
+        return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
+    if contract_id == "loop-carried-add-max-tiles":
+        return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS | {"max_tiles"})
     if contract_id == "reshape-copy-preserve":
         return _has_positive_decimal_parameters(parameters, _DIRECT_COPY_PARAMETER_KEYS)
     if contract_id == "reshape-copy-max-tiles":
@@ -213,7 +217,8 @@ def _is_valid_profile_entry(entry):
     if not all(_is_valid_profile_stage(stage) for stage in stages):
         return False
     if any(stage["contract_id"].startswith(
-            ("direct-copy-", "binary-add-", "reshape-copy-", "reduction-sum-"))
+            ("direct-copy-", "binary-add-", "loop-carried-add-",
+             "reshape-copy-", "reduction-sum-"))
            for stage in stages):
         if relevant_options.get("compile_mode") != "simd" or relevant_options.get("multibuffer") is not False:
             return False

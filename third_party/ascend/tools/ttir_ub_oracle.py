@@ -51,6 +51,14 @@ _OPERATION_FAMILIES = {
         "allocation_count": 2,
         "contract_prefix": "binary-add",
     },
+    "loop-carried-add": {
+        "matcher_trace": "ttir-loop-carried-add-v1",
+        "certificate_kind": "witness",
+        "certificate_resource_count": 2,
+        "resource_count": 2,
+        "allocation_count": 2,
+        "contract_prefix": "loop-carried-add",
+    },
     "reshape-copy": {
         "matcher_trace": "ttir-reshape-copy-v1",
         "certificate_kind": "singleton",
@@ -269,7 +277,8 @@ def load_manifest(path: Path) -> dict:
         family = item["operation_family"]
         if family not in _OPERATION_FAMILIES:
             raise ManifestError(
-                "operation_family must be direct-copy, binary-add, reshape-copy, or reduction-sum"
+                "operation_family must be direct-copy, binary-add, "
+                "loop-carried-add, reshape-copy, or reduction-sum"
             )
         if type(item["arch"]) is not str or not item["arch"]:
             raise ManifestError("arch must be a non-empty string")
@@ -327,6 +336,13 @@ def load_manifest(path: Path) -> dict:
         ):
             raise ManifestError(
                 "reduction-sum currently requires even f32 input and max_tiles=1"
+            )
+        if family == "loop-carried-add" and (
+            proposal["max_tiles"] != 1
+            or proposal["expected_element_bit_width"] != 32
+        ):
+            raise ManifestError(
+                "loop-carried-add currently requires f32 input and max_tiles=1"
             )
         case = dict(item)
         case["ttir"] = _fixture_path(root, item["ttir"], "ttir")

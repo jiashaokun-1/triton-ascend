@@ -400,6 +400,33 @@ def test_binary_add_contract_chain_uses_binary_contracts():
     assert bindings[1]["contract_parameters"]["expected_input_payload_bytes"] == "4096"
 
 
+def test_loop_carried_contract_chain_keeps_full_iteration_payload():
+    proposal = {
+        "expected_resource_count": 2,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 1,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal, "loop-carried-add"
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+    assert [binding["contract_id"] for binding in bindings] == [
+        "loop-carried-add-max-tiles", "loop-carried-add-preserve"
+    ]
+    assert bindings[0]["contract_parameters"]["max_tiles"] == "1"
+    assert bindings[1]["contract_parameters"][
+        "expected_input_payload_bytes"
+    ] == "262144"
+
+
 def test_reshape_copy_contract_chain_uses_view_contracts():
     proposal = {
         "expected_resource_count": 2,
@@ -469,16 +496,19 @@ def test_proposed_contract_chain_requires_unique_materialization_stage():
 
 def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-copy"):
     is_binary_add = operation_family == "binary-add"
+    is_loop_carried = operation_family == "loop-carried-add"
     is_reshape_copy = operation_family == "reshape-copy"
     is_reduction = operation_family == "reduction-sum"
     materialization_id = (
         "reduction-sum-max-tiles" if is_reduction else
+        "loop-carried-add-max-tiles" if is_loop_carried else
         "binary-add-max-tiles" if is_binary_add else
         "reshape-copy-max-tiles" if is_reshape_copy else
         "direct-copy-max-tiles"
     )
     matcher_trace = (
         "ttir-reduction-sum-v1" if is_reduction else
+        "ttir-loop-carried-add-v1" if is_loop_carried else
         "ttir-binary-add-v1" if is_binary_add else
         "ttir-reshape-copy-v1" if is_reshape_copy else
         "ttir-direct-load-v1"
@@ -487,16 +517,20 @@ def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-co
     if is_reduction:
         contract_trace.append("reduction-sum-extra-buffer")
     certificate = {
-        "kind": "witness" if (is_binary_add or is_reduction) else "singleton",
+        "kind": "witness" if (
+            is_binary_add or is_loop_carried or is_reduction
+        ) else "singleton",
         "bytes": lower_bound_bytes,
         "resource_ids": [0, 1, 2] if is_reduction else (
-            [0, 1] if is_binary_add else [0]
+            [0, 1] if (is_binary_add or is_loop_carried) else [0]
         ),
         "contract_trace": contract_trace,
     }
     common_parameters = {
         "expected_resource_count": "3" if is_reduction else (
-            "2" if (is_binary_add or is_reshape_copy) else "1"
+            "2" if (
+                is_binary_add or is_loop_carried or is_reshape_copy
+            ) else "1"
         ),
         "expected_source_elements": "65536",
         "expected_element_bit_width": "32",
@@ -508,7 +542,7 @@ def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-co
             "expected_accumulator_payload_bytes": "4",
         })
     materialization_parameters = {**common_parameters, "max_tiles": (
-        "1" if is_reduction else "64"
+        "1" if (is_reduction or is_loop_carried) else "64"
     )}
     stages = [{
         "stage_name": "ttir.triton-to-linalg",
@@ -538,10 +572,13 @@ def _analysis(decision="defer", lower_bound_bytes=0, operation_family="direct-co
         "auto_tile_and_bind_subblock_outcome": False,
         "before_cvpipelining_allocations_bytes": (
             [262144] if is_reduction else
+            [262144, 262144] if is_loop_carried else
             [4096, 4096] if is_binary_add else [4096]
         ),
         "before_cvpipelining_allocation_bytes": (
-            262144 if is_reduction else 8192 if is_binary_add else 4096
+            262144 if is_reduction else
+            524288 if is_loop_carried else
+            8192 if is_binary_add else 4096
         ),
         "ttir_fixture_sha256": "a" * 64,
         "before_cvpipelining_sha256": "b" * 64,

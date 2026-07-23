@@ -3,6 +3,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -193,6 +194,25 @@ StringRef getVerifierPreflightFailure(Operation *root) {
       if (!hasExactRegisteredType<triton::ReduceReturnOp>(operation) ||
           !hasExactShape(operation, 1, 0, 0, 0))
         return "unsupported-op-reduction";
+    } else if (name == arith::ConstantOp::getOperationName()) {
+      if (!hasExactRegisteredType<arith::ConstantOp>(operation) ||
+          !hasExactShape(operation, 0, 1, 0, 0) ||
+          !operation->getPropertiesStorage())
+        return "malformed-ir";
+      const auto *properties =
+          operation->getPropertiesStorage().as<arith::ConstantOp::Properties *>();
+      if (!isa_and_nonnull<IntegerAttr>(properties->value))
+        return "malformed-ir";
+    } else if (name == scf::ForOp::getOperationName()) {
+      if (!hasExactRegisteredType<scf::ForOp>(operation) ||
+          !hasExactShape(operation, 4, 1, 1, 0) ||
+          !operation->getRegion(0).hasOneBlock() ||
+          operation->getRegion(0).front().getNumArguments() != 2)
+        return "unsupported-op-loop";
+    } else if (name == scf::YieldOp::getOperationName()) {
+      if (!hasExactRegisteredType<scf::YieldOp>(operation) ||
+          !hasExactShape(operation, 1, 0, 0, 0))
+        return "unsupported-op-loop";
     } else if (name == arith::AddFOp::getOperationName()) {
       if (!hasExactRegisteredType<arith::AddFOp>(operation) ||
           !hasExactShape(operation, 2, 1, 0, 0) ||

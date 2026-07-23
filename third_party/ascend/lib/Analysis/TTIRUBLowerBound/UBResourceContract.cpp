@@ -375,6 +375,136 @@ private:
   int64_t maxTiles;
 };
 
+class LoopCarriedAddContractBase : public UBResourceContract {
+public:
+  LoopCarriedAddContractBase(const PipelineStageContext &stage,
+                             int64_t expectedResourceCount,
+                             int64_t expectedSourceElements,
+                             unsigned expectedElementBitWidth,
+                             int64_t expectedInputPayloadBytes)
+      : stageName(stage.stageName),
+        expectedResourceCount(expectedResourceCount),
+        expectedSourceElements(expectedSourceElements),
+        expectedElementBitWidth(expectedElementBitWidth),
+        expectedInputPayloadBytes(expectedInputPayloadBytes) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef version() const final { return "1"; }
+
+  bool matches(const PipelineStageContext &context) const final {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+
+protected:
+  bool matchesResources(const MandatoryUBResourceGraph &graph,
+                        bool requireDistinct) const {
+    if (expectedResourceCount != 2 || expectedSourceElements <= 0 ||
+        expectedElementBitWidth == 0 || expectedInputPayloadBytes <= 0 ||
+        graph.resources().size() != 2 || graph.witnesses().size() != 1)
+      return false;
+    const CoexistenceWitness &witness = graph.witnesses().front();
+    if (witness.resources != SmallVector<ResourceId>({0, 1}))
+      return false;
+    if (requireDistinct ? !graph.hasPairwiseDistinctWitness(0)
+                        : !graph.hasPairwiseMayAliasWitness(0))
+      return false;
+    const MandatoryUBResource &accumulator = graph.resources()[0];
+    const MandatoryUBResource &stepInput = graph.resources()[1];
+    auto matchesCommon = [&](const MandatoryUBResource &resource) {
+      return resource.validity == ValidityState::Valid &&
+             resource.origin == "tt.load" &&
+             resource.kind == MaterializationKind::GMToUBLoad &&
+             resource.minInstances == 1 &&
+             resource.sourceElements == expectedSourceElements &&
+             resource.elementBitWidth == expectedElementBitWidth &&
+             resource.minPayloadBytes == expectedInputPayloadBytes;
+    };
+    return matchesCommon(accumulator) && matchesCommon(stepInput) &&
+           accumulator.debugName == "loop-carried-accumulator" &&
+           accumulator.consumer == "scf.for" &&
+           stepInput.debugName == "loop-step-input" &&
+           stepInput.consumer == "arith.addf" &&
+           accumulator.birth.ordinal < stepInput.birth.ordinal &&
+           stepInput.birth.ordinal == stepInput.lastRequiredUse.ordinal &&
+           stepInput.lastRequiredUse.ordinal <
+               accumulator.lastRequiredUse.ordinal;
+  }
+
+  LogicalResult appendTrace(MandatoryUBResourceGraph &graph,
+                            StringRef contractId) const {
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
+      if (failed(graph.appendResourceTrace(static_cast<ResourceId>(ordinal),
+                                           contractId)))
+        return failure();
+    return success();
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+  int64_t expectedResourceCount;
+  int64_t expectedSourceElements;
+  unsigned expectedElementBitWidth;
+  int64_t expectedInputPayloadBytes;
+};
+
+class LoopCarriedAddPreserveContract final
+    : public LoopCarriedAddContractBase {
+public:
+  using LoopCarriedAddContractBase::LoopCarriedAddContractBase;
+
+  StringRef id() const override { return "loop-carried-add-preserve"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (!matchesResources(graph, /*requireDistinct=*/false) &&
+        !matchesResources(graph, /*requireDistinct=*/true))
+      return ContractDisposition::Invalidate;
+    if (failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Preserve;
+  }
+};
+
+class LoopCarriedAddMaxTilesContract final
+    : public LoopCarriedAddContractBase {
+public:
+  LoopCarriedAddMaxTilesContract(const PipelineStageContext &stage,
+                                 int64_t expectedResourceCount,
+                                 int64_t expectedSourceElements,
+                                 unsigned expectedElementBitWidth,
+                                 int64_t expectedInputPayloadBytes,
+                                 int64_t maxTiles)
+      : LoopCarriedAddContractBase(
+            stage, expectedResourceCount, expectedSourceElements,
+            expectedElementBitWidth, expectedInputPayloadBytes),
+        maxTiles(maxTiles) {}
+
+  StringRef id() const override { return "loop-carried-add-max-tiles"; }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    // Only the observed tile=1 lowering is admitted: one allocation carries
+    // the accumulator across iterations while a second allocation is loaded
+    // inside each iteration.  Multi-tile loop liveness needs a new profile.
+    if (maxTiles != 1 ||
+        !matchesResources(graph, /*requireDistinct=*/false))
+      return ContractDisposition::Invalidate;
+    if (failed(graph.refineWitnessToMustDistinct(0, id())) ||
+        failed(appendTrace(graph, id())))
+      return ContractDisposition::InternalError;
+    return ContractDisposition::Transform;
+  }
+
+private:
+  int64_t maxTiles;
+};
+
 class ReshapeCopyContractBase : public UBResourceContract {
 public:
   ReshapeCopyContractBase(const PipelineStageContext &stage,
@@ -794,6 +924,24 @@ std::unique_ptr<UBResourceContract> makeBinaryAddMaxTilesContract(
     int64_t expectedSourceElements, unsigned expectedElementBitWidth,
     int64_t expectedInputPayloadBytes, int64_t maxTiles) {
   return std::make_unique<BinaryAddMaxTilesContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeLoopCarriedAddPreserveContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes) {
+  return std::make_unique<LoopCarriedAddPreserveContract>(
+      stage, expectedResourceCount, expectedSourceElements,
+      expectedElementBitWidth, expectedInputPayloadBytes);
+}
+
+std::unique_ptr<UBResourceContract> makeLoopCarriedAddMaxTilesContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t expectedSourceElements, unsigned expectedElementBitWidth,
+    int64_t expectedInputPayloadBytes, int64_t maxTiles) {
+  return std::make_unique<LoopCarriedAddMaxTilesContract>(
       stage, expectedResourceCount, expectedSourceElements,
       expectedElementBitWidth, expectedInputPayloadBytes, maxTiles);
 }
