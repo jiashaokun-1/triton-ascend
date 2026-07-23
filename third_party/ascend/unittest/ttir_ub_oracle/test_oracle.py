@@ -260,6 +260,28 @@ def test_manifest_requires_family_specific_resource_count(tmp_path):
         oracle.load_manifest(path)
 
 
+@pytest.mark.parametrize(
+    "proposal_update",
+    [
+        {"expected_element_bit_width": 7},
+        {"expected_element_bit_width": 12},
+        {"expected_input_payload_bytes": 1},
+        {
+            "expected_source_elements": 1 << 63,
+            "expected_element_bit_width": 8,
+            "expected_input_payload_bytes": 1 << 63,
+        },
+    ],
+)
+def test_manifest_requires_payload_to_match_source_facts(tmp_path, proposal_update):
+    path = _write_manifest(tmp_path)
+    manifest = json.loads(path.read_text())
+    manifest["cases"][0]["contract_proposal"].update(proposal_update)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(oracle.ManifestError):
+        oracle.load_manifest(path)
+
+
 def test_manifest_paths_stay_with_fixtures(tmp_path):
     outside = tmp_path.parent / "outside.ttir"
     outside.write_text("module {}", encoding="utf-8")

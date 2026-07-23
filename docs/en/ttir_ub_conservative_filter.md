@@ -82,6 +82,27 @@ To support another TTIR pattern or lowering stage:
 6. Compare the lower bound with real PlanMemory results for seeds `0..19` and
    retry mode before reviewing a profile candidate.
 
+To avoid pairing files from different compilations, first enable the Triton
+kernel dump and package `kernel.ttir.mlir` and `kernel.ttadapter.mlir` from one
+cache directory:
+
+```bash
+python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
+  --dump-dir /path/to/dumps/ONE_CACHE_KEY \
+  --output-dir /tmp/binary-add-fixture \
+  --name binary-add-f32-65536-a2 \
+  --operation-family binary-add \
+  --arch Ascend910B \
+  --source-elements 65536 \
+  --element-bit-width 32 \
+  --max-tiles 64 \
+  --auto-tile-outcome false
+```
+
+The packager derives the input payload, emits both file hashes, and refuses to
+overwrite an existing fixture. Do not guess the auto-tile outcome before
+checking the real stage snapshot.
+
 Run the comparison with:
 
 ```bash

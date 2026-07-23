@@ -77,6 +77,7 @@ _OVERFLOW_RE = re.compile(
     r"\b(UB|L1|L0A|L0B|L0C) overflow, requires (\d+) bits while (\d+) bits available!"
 )
 _SUB_BLOCK_INDEX_OP = "hivm.hir.get_sub_block_idx"
+_MAX_INT64 = (1 << 63) - 1
 _STATIC_ALLOC_RE = re.compile(
     r'"memref\.alloc"\([^\n]*?\)\s*(?:<[^\n]*?>\s*)?:\s*\([^\n]*?\)\s*->\s*'
     r'memref<(\d+)x(bf16|f16|f32|f64|i8|i16|i32|i64)>'
@@ -278,6 +279,20 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError("contract_proposal.materialization_stage must be non-empty")
         if type(proposal["auto_tile_and_bind_subblock_outcome"]) is not bool:
             raise ManifestError("contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean")
+        element_bit_width = proposal["expected_element_bit_width"]
+        if element_bit_width < 8 or element_bit_width % 8:
+            raise ManifestError(
+                "contract_proposal.expected_element_bit_width must be whole bytes"
+            )
+        derived_payload = (
+            proposal["expected_source_elements"] * (element_bit_width // 8)
+        )
+        if derived_payload > _MAX_INT64:
+            raise ManifestError("contract_proposal payload overflows int64")
+        if proposal["expected_input_payload_bytes"] != derived_payload:
+            raise ManifestError(
+                "contract_proposal input payload disagrees with source elements and bit width"
+            )
         if proposal["expected_resource_count"] != _OPERATION_FAMILIES[family]["resource_count"]:
             raise ManifestError(
                 "contract_proposal.expected_resource_count disagrees with operation_family"

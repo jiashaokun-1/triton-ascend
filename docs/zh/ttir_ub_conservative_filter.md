@@ -76,6 +76,25 @@ kernel.ttir.ub-lower-bound.json
 5. 增加成对的 canonical TTIR 与 before-CVPipelining fixture。
 6. 使用 seed `0..19` 和 retry 模式与真实 PlanMemory 比较，通过后再评审 profile。
 
+为避免把不同编译产生的文件误配成一组，先开启 Triton kernel dump，并从同一个 cache
+目录打包 `kernel.ttir.mlir` 和 `kernel.ttadapter.mlir`：
+
+```bash
+python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
+  --dump-dir /path/to/dumps/ONE_CACHE_KEY \
+  --output-dir /tmp/binary-add-fixture \
+  --name binary-add-f32-65536-a2 \
+  --operation-family binary-add \
+  --arch Ascend910B \
+  --source-elements 65536 \
+  --element-bit-width 32 \
+  --max-tiles 64 \
+  --auto-tile-outcome false
+```
+
+打包器会自动推导 input payload、输出两个文件哈希，并拒绝覆盖已有 fixture。在查看真实
+stage snapshot 之前，不要猜测 auto-tile outcome。
+
 校验命令：
 
 ```bash

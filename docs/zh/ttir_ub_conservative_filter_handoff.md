@@ -477,7 +477,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 ### 10.4 当前验证结果
 
 - 使用 LLVM `fad3272286528b8a491085183434c5ad4b59ab92` 完成原生 `libtriton.so` 构建和导入；
-- UB/策略/oracle 聚焦 Python 测试：289 项通过；
+- UB/策略/oracle 聚焦 Python 测试：305 项通过；
 - `TestAscendTTIRUBLowerBound` 原生 C++ GTest：89 项通过；
 - 完整 identity-bound analyzer + 独立语义重放 + 真实 suffix compiler：seed `0..19` 加 retry 共 21 次；
 - analyzer contract LB 为 `4096 bytes`；21 次 semantic replay 与真实 PlanMemory peak 均为
@@ -493,7 +493,7 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 本次基线已执行：
 
-- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：289 项通过；
+- UB、autotune policy、async compile 和 oracle 聚焦 Python 测试：305 项通过；
 - 精确 LLVM 原生构建：`libtriton.so` 构建并导入成功；
 - 普通 C++ GTest：89 项通过；
 - analyzer + semantic replay + 真实 suffix compiler 联合 oracle：20 seeds + retry，
@@ -545,6 +545,10 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - oracle promotion 按 operation family 要求 singleton 或双资源 witness certificate 的
   bytes/resource ID 合法，且
   `contract_trace` 精确等于 source matcher 与 ordered candidate contracts；
+- `ttir_ub_fixture_bundle.py` 从同一个 Triton dump 目录成对复制 canonical TTIR 与
+  `kernel.ttadapter.mlir`，自动生成严格 manifest、payload 和文件哈希；缺文件或目标已存在时拒绝写入；
+- manifest loader 独立校验 `expected_input_payload_bytes = source_elements × element_bit_width / 8`
+  及 int64 边界，不能通过手写 proposal 绕过 source-fact 一致性；
 - C++ pybind API 与 Python 结果二次校验；
 - off/shadow/enforce policy；
 - debug certificate dump，并在每个 certificate 的 `contract_trace` 中保留实际参与
@@ -706,7 +710,8 @@ python -m pytest -q --noconftest \
   third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py \
   third_party/ascend/unittest/autotune_ut/test_do_bench_compat.py \
   python/test/unit/runtime/test_async_compile_context.py \
-  third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py
+  third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py \
+  third_party/ascend/unittest/ttir_ub_oracle/test_fixture_bundle.py
 ```
 
 ### 15.2 Oracle parser 测试
@@ -716,7 +721,28 @@ python -m pytest -q --noconftest \
   third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py
 ```
 
-### 15.3 真实 PlanMemory 对照
+### 15.3 从同一次编译 dump 生成 fixture
+
+先用 `TRITON_KERNEL_DUMP=1`、`TRITON_DUMP_DIR=/path/to/dumps` 和 debug 编译目标 kernel，找到同一
+cache 子目录中的 `kernel.ttir.mlir` 与 `kernel.ttadapter.mlir`，再执行：
+
+```bash
+python third_party/ascend/tools/ttir_ub_fixture_bundle.py \
+  --dump-dir /path/to/dumps/ONE_CACHE_KEY \
+  --output-dir /tmp/binary-add-fixture \
+  --name binary-add-f32-65536-a2 \
+  --operation-family binary-add \
+  --arch Ascend910B \
+  --source-elements 65536 \
+  --element-bit-width 32 \
+  --max-tiles 64 \
+  --auto-tile-outcome false
+```
+
+工具不会覆盖已有 fixture。reshape 路径把 `--operation-family` 改成 `reshape-copy`；真实 snapshot
+未确认前不要猜测 `--auto-tile-outcome`。
+
+### 15.4 真实 PlanMemory 对照
 
 ```bash
 python third_party/ascend/tools/ttir_ub_oracle.py \
@@ -735,7 +761,7 @@ python third_party/ascend/tools/ttir_ub_oracle.py \
 - `1`：发现下界或 reject 证明违规；
 - `2`：缺少 analyzer、compiler identity、PlanMemory 数据或其他必需环境。
 
-### 15.4 提交前检查
+### 15.5 提交前检查
 
 ```bash
 git diff --check
