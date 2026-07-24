@@ -516,6 +516,18 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - `git diff --check` 通过；
 - 本次所有提交均带 `Signed-off-by`。
 
+2026-07-24 P4 修正后的本地增量验证：
+
+- oracle、fixture bundle、same-schema helper、coverage matrix：103 项通过；
+- 本次修改涉及的 4 个 UB C++ implementation object、GTest object 与 pybind object 均单独重编译成功；
+- 三份 JSON evidence/schema 均可解析，HTML5 报告可由标准 parser 完整读取；
+- 5 份外部 patch 分别通过目标 source tree 的 `git apply --check`；
+- `git diff --check` 通过；
+- 完整 GTest 链接被工作区既有 Triton/外部 MLIR header revision 不一致阻塞
+  （`DiscardableAttributes.cpp` / `Ops.cpp`，不涉及本次 UB 文件）；本机也没有可导入的
+  `triton._C`。因此运行态 GTest/pybind 与 CANN full-chain 不在本地伪装成已验证，统一留到
+  服务器恢复后用同一 revision 重建执行。
+
 环境限制：
 
 - 4 个既有 autotune 文件依赖 `torch_npu`，本机无法收集；
@@ -528,7 +540,9 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 
 ### 12.1 已完成
 
-- MURG 数据结构、alias/distinct/witness 关系和下界 solver；
+- MURG 数据结构、alias/distinct/witness 关系和下界 solver；资源新增
+  `UBExecutionScope::{SingleCore,AIC,AIV}`，不同物理 core 的资源禁止建立 relation/witness，
+  因而不会把 AIC UB 与 AIV UB 错误相加；
 - `UBResourceContract` 抽象、registry 和严格未匹配策略；
 - verifier 前的结构预检；
 - direct static GM→UB load/copy matcher；
@@ -565,6 +579,18 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
 - `ttir_ub_fixture_bundle.py` 要求同一 capture 目录内存在 canonical TTIR 与紧邻
   `createCVPipeliningPass` 之前的 `before_cvpipelining.mlir`，并核对 family-specific allocation
   数量和精确大小；raw `kernel.ttadapter.mlir`、缺文件或已有目标都会被拒绝；
+- P4 fixture 已换成真实 full-compiler before-CVPipelining dump，并要求 target/device/core
+  provenance；Dynamic MIX dot→exp 的两个逻辑资源分别属于 AIC 与 AIV，1024-byte source
+  经已验证 projection 后各形成 512-byte 下界，最终是 512-byte singleton certificate，
+  不是跨核相加的 2048-byte witness；
+- irregular indirect-add 的真实 boundary 在 `gather_load` 前产生
+  `memref.alloc(%dim) : memref<?xf32>`。TTIR 无法给出该 mandatory source buffer 的 extent，
+  因此已删除旧 96-byte `irregular-memory-*` contract、profile schema 和 binding factory；
+  strict matcher 只返回零证书的 `unsupported-irregular-source-extent`；
+- oracle 会识别上述 irregular deliberate-defer，验证真实动态 source boundary 后跳过无意义的
+  PlanMemory/promotion；profile candidate 只包含拥有有效 certificate 的 case；
+- 同 schema suffix、真实 full-compiler boundary dump、默认 memory-space 兼容和 semantic runtime
+  capacity 都有独立 patch；本地已验证 patch 可应用性；
 - manifest loader 独立校验 `expected_input_payload_bytes = source_elements × element_bit_width / 8`
   及 int64 边界，不能通过手写 proposal 绕过 source-fact 一致性；
 - 新 fixture 默认把 auto-tile outcome 留为 `null`，由 oracle 从所有 seed/retry 的真实
@@ -596,6 +622,20 @@ Preserve/Transform 合同。因此：
 绕过。
 
 ## 13. 下一步工作
+
+### P4：仅剩目标 CANN 最终门禁
+
+服务器不可用前，Dynamic MIX seed 0 已通过真实 full PlanMemory：AIC 与 AIV scope peak 均为
+`4096 bits`，与 analyzer 的 `512 bytes = 4096 bits` singleton 下界一致。当前仍不能声称 P4
+promotion 完成，恢复服务器后只需执行以下环境验证，不再补本地建模代码：
+
+1. 用当前源码重建 `libtriton`、同 schema suffix compiler 和 `cvpipeline_ub_model_cpp`，记录三者
+   SHA256；
+2. 对 Dynamic MIX 运行 seeds `0..19` + retry，逐 scope 比较 analyzer、真实 PlanMemory 与 exact
+   semantic replay；
+3. 确认 auto-tile outcome、status、capacity、peak 全部一致且 violations/unavailable 为 0；
+4. irregular case 必须保持 `unsupported-irregular-source-extent`，不得生成 profile；
+5. 只为有非空合法 certificate 的 case 生成 candidate，继续禁止自动安装 packaged profile。
 
 ### P1：为真实 pipeline 建立第一组有效合同
 
@@ -775,6 +815,26 @@ golden fixture 时才传 `--expected-analyzer-decision defer|reject`。
 
 ### 15.4 真实 PlanMemory 对照
 
+先从 libtriton 使用的 pinned BiShengIR revision 构建同 schema suffix runner：
+
+```bash
+python third_party/ascend/tools/ttir_ub_prepare_same_schema_oracle.py \
+  --apply-patch \
+  --build-dir /path/to/triton-build \
+  --cmake /path/to/cmake \
+  --jobs 8
+```
+
+工具会拒绝错误 revision、既不能正向应用也不能反向验证的 patch，以及应用前已有修改的
+AscendNPU-IR source。构建使用
+`TRITON_ASCEND_BUILD_BISHENGIR_ORACLE_TOOLS=ON`，产物为
+`/path/to/triton-build/bin/bishengir-cvpipeline-suffix-compile`。
+
+当前 pipeline 的 Ascend950 nominal UB 是 256 KiB，但真实 PlanMemory 为 allocator
+保留 64 KiB，判溢阈值是 192 KiB；analyzer 和 semantic replay 必须使用该真实阈值。
+oracle 会把 analyzer 的逐 case capacity 通过 `--ub-capacity-bits` 显式传给 semantic
+model，并核对返回值，禁止依赖可漂移默认值。
+
 ```bash
 python third_party/ascend/tools/ttir_ub_oracle.py \
   --manifest third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json \
@@ -819,6 +879,12 @@ git log -1 --show-signature
 | Async compile | `python/triton/runtime/_async_compile.py` |
 | Profile | `third_party/ascend/backend/ub_contract_profiles.json` |
 | Oracle | `third_party/ascend/tools/ttir_ub_oracle.py` |
+| 同 schema suffix 准备/构建 | `third_party/ascend/tools/ttir_ub_prepare_same_schema_oracle.py` |
+| 同 schema suffix patch | `third_party/ascend/tools/patches/0001-feat-port-same-schema-CVPipeline-suffix-oracle.patch` |
+| Full compiler boundary dump patch | `third_party/ascend/tools/patches/cvpipeline_full_compiler_in_process_oracle.patch` |
+| Suffix 默认 memory-space patch | `third_party/ascend/tools/patches/cvpipeline_suffix_default_memory_space.patch` |
+| Legacy suffix Fixpipe patch | `third_party/ascend/tools/patches/cvpipeline_suffix_legacy_fixpipe.patch` |
+| Semantic runtime capacity patch | `third_party/ascend/tools/patches/cvpipeline_ub_model_runtime_capacity.patch` |
 | C++ 测试 | `third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp` |
 | Python 测试 | `third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py` |
 | Autotune 测试 | `third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py` |
@@ -830,10 +896,14 @@ git log -1 --show-signature
 identity、policy、telemetry、异步过滤以及真实 PlanMemory oracle 都已具备，并有完整的
 保守失败策略。
 
-但当前版本仍是生产 profile 上线前的基础阶段。它不会对真实生产 config 给出有效
-reject，原因是生产合同尚未认证且 profile 为空；P0 registry loader 已经接通。
+P0–P4 的本地开发已形成安全闭环：可证明切片拥有可执行合同链，无法证明的 family 拥有稳定、
+机器可读的 deliberate-defer。P4 的关键修正是把 MIX AIC/AIV 建模为独立 UB execution scope，
+并撤销遗漏动态 source allocation 的 irregular 96-byte 假证书。pinned revision 的同 schema
+suffix、full-compiler capture、memory-space 兼容、可复现构建入口和真实 192 KiB allocator
+threshold 对齐均已实现。当前版本仍不会对真实生产 config 给出有效 reject，因为 packaged
+profile 为空。
 
-后续最重要的工作不是继续放宽 matcher，而是完成 P1：在真实 CANN/compiler identity
-环境中建立第一条端到端可认证 materialization/tiling contract，并用逐 seed
-PlanMemory 证明该 profile 可以启用。完成这一步后，`enforce` 才真正开始产生早期过滤
-收益。
+服务器恢复后只剩 Dynamic MIX 的 20 seeds + retry suffix / semantic replay / analyzer 零违规
+报告和 rebuilt binary hashes。irregular 必须继续具名 defer，除非未来能从 TTIR 或 config
+获得可证明的 source extent 上界并重新提交 matcher、MURG、全 stage contracts 与 oracle。
+任一 schema、capacity、stage、execution scope 或结果漂移都继续 fail closed。

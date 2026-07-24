@@ -1,0 +1,151 @@
+diff --git a/cvpipeline_ub_model_cpp/src/ir/semantic_ir.hpp b/cvpipeline_ub_model_cpp/src/ir/semantic_ir.hpp
+--- a/cvpipeline_ub_model_cpp/src/ir/semantic_ir.hpp
++++ b/cvpipeline_ub_model_cpp/src/ir/semantic_ir.hpp
+@@ -26,7 +26,22 @@ namespace cvub {
+ namespace fs = std::filesystem;
+
+ constexpr uint64_t kBitsPerByte = 8;
+-constexpr uint64_t kUBCapacityBits = 192 * 1024 * kBitsPerByte;
++constexpr uint64_t kDefaultUBCapacityBits = 192 * 1024 * kBitsPerByte;
++
++inline uint64_t &MutableUBCapacityBits() {
++  static uint64_t capacityBits = kDefaultUBCapacityBits;
++  return capacityBits;
++}
++
++inline uint64_t GetUBCapacityBits() {
++  return MutableUBCapacityBits();
++}
++
++inline void SetUBCapacityBits(uint64_t capacityBits) {
++  if (capacityBits == 0)
++    throw std::runtime_error("UB capacity must be positive");
++  MutableUBCapacityBits() = capacityBits;
++}
+
+ struct IRAllocRecord {
+   std::string name;
+@@ -117,7 +132,7 @@ struct PlanMemoryModelResult {
+   uint32_t selectedSeed = 0;
+   uint64_t peakBits = 0;
+   uint64_t requiredBits = 0;
+-  uint64_t capacityBits = kUBCapacityBits;
++  uint64_t capacityBits = GetUBCapacityBits();
+   std::vector<PlannedBufferRecord> buffers;
+   std::vector<std::pair<std::string, std::string>> inplacePairs;
+   std::map<std::string, uint32_t> multiBufferNums;
+diff --git a/cvpipeline_ub_model_cpp/src/main.cpp b/cvpipeline_ub_model_cpp/src/main.cpp
+--- a/cvpipeline_ub_model_cpp/src/main.cpp
++++ b/cvpipeline_ub_model_cpp/src/main.cpp
+@@ -34,6 +34,7 @@ struct Options {
+   bool enableAutoMultiBuffer = false;
+   cvub::MultiBufferStrategy localMultiBufferStrategy =
+       cvub::MultiBufferStrategy::CubeNoL0C;
++  uint64_t ubCapacityBits = cvub::kDefaultUBCapacityBits;
+   cvub::MultiBufferStrategy mixMultiBufferStrategy =
+       cvub::MultiBufferStrategy::OnlyCube;
+   std::string format = "text";
+@@ -86,5 +87,6 @@ void PrintHelp() {
+       << "  --limit-auto-multi-buffer-of-local-buffer=<strategy>\n"
+       << "  --limit-auto-multi-buffer-buffer=<strategy>\n"
++      << "  --ub-capacity-bits=<positive integer>\n"
+       << "  --restrict-inplace-as-isa\n"
+       << "  --random-seed=<0..19>\n"
+       << "  --format=<text|json>\n"
+@@ -171,7 +173,9 @@ Options ParseOptions(int argc, char **argv) {
+     else if (auto mixStrategy =
+                  readValue("--limit-auto-multi-buffer-buffer"))
+       options.mixMultiBufferStrategy =
+           cvub::ParseMultiBufferStrategy(*mixStrategy);
++    else if (auto capacity = readValue("--ub-capacity-bits"))
++      options.ubCapacityBits = std::stoull(*capacity);
+     else if (argument == "--show-runtime-timing")
+       options.showRuntimeTiming = true;
+     else if (auto showTiming = readValue("--show-runtime-timing"))
+@@ -199,6 +203,8 @@ void ValidateOptions(const Options &options) {
+   if (options.tileMixCubeLoop <= 0 || options.tileMixVectorLoop <= 0)
+     throw std::runtime_error(
+         "--tile-mix-cube-loop and --tile-mix-vector-loop must be positive");
++  if (options.ubCapacityBits == 0)
++    throw std::runtime_error("--ub-capacity-bits must be positive");
+   if ((!options.debugDirectory.empty() ||
+        options.debugEntry != DebugEntry::BeforeCVPipelining) &&
+       !options.debug)
+@@ -517,7 +523,7 @@ void PrintBlocker(const Options &options, const std::string &message) {
+             << "  \"status\": \"blocker\",\n"
+             << "  \"ub_peak_bits\": null,\n"
+             << "  \"required_bits\": null,\n"
+-            << "  \"capacity_bits\": " << cvub::kUBCapacityBits << ",\n"
++            << "  \"capacity_bits\": " << options.ubCapacityBits << ",\n"
+             << "  \"overflow\": null,\n"
+             << "  \"functions\": [],\n"
+             << "  \"diagnostics\": [\"" << JsonEscape(message) << "\"]\n"
+@@ -532,6 +538,7 @@ int main(int argc, char **argv) {
+   try {
+     options = ParseOptions(argc, argv);
+     ValidateOptions(options);
++    cvub::SetUBCapacityBits(options.ubCapacityBits);
+     if (options.debug || options.showRuntimeTiming)
+       debugTrace.emplace(std::cerr, options.debugDirectory, options.debug,
+                          options.showRuntimeTiming);
+diff --git a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_plan.hpp b/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_plan.hpp
+--- a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_plan.hpp
++++ b/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_plan.hpp
+@@ -753,13 +753,13 @@ inline PlanMemoryModelResult PlanLocalMemoryImpl(
+                                "total non-reuse UB size");
+     uint64_t requiredBits = 0;
+     bool success = false;
+     MemPlanStateModel planState;
+-    if (noReuseBits <= kUBCapacityBits) {
++    if (noReuseBits <= GetUBCapacityBits()) {
+       requiredBits = PlanBuffersWithoutReuse(entries, 256);
+       success = true;
+     } else {
+       success = PlanMemAddressOfWholeLocalBuffer(
+-          entries, kUBCapacityBits, 256, requiredBits, planState,
++          entries, GetUBCapacityBits(), 256, requiredBits, planState,
+           liveness.inplacableBufferPairs);
+     }
+
+@@ -768,7 +768,7 @@ inline PlanMemoryModelResult PlanLocalMemoryImpl(
+     result.selectedSeed = attempt;
+     result.requiredBits = requiredBits;
+     result.peakBits = requiredBits;
+-    result.capacityBits = kUBCapacityBits;
++    result.capacityBits = GetUBCapacityBits();
+     result.inplacePairs = liveness.inplacePairList;
+     result.multiBufferNums = liveness.buffer2MultiNum;
+     std::map<std::string, LifetimeRecord> lifeByName;
+diff --git a/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp b/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp
+--- a/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp
++++ b/cvpipeline_ub_model_cpp/src/pipeline/cvpipelining_ub_pipeline.hpp
+@@ -425,7 +425,7 @@ struct ModulePlanResult {
+   bool overflow = false;
+   uint64_t peakBits = 0;
+   uint64_t requiredBits = 0;
+-  uint64_t capacityBits = kUBCapacityBits;
++  uint64_t capacityBits = GetUBCapacityBits();
+   std::vector<FunctionPlanResult> functions;
+   std::vector<std::string> diagnostics;
+ };
+diff --git a/cvpipeline_ub_model_cpp/tests/test_module_plan.cpp b/cvpipeline_ub_model_cpp/tests/test_module_plan.cpp
+--- a/cvpipeline_ub_model_cpp/tests/test_module_plan.cpp
++++ b/cvpipeline_ub_model_cpp/tests/test_module_plan.cpp
+@@ -37,7 +37,16 @@ int main() {
+   Check(result.functions[0].function != result.functions[1].function,
+         "function plans must retain distinct identities");
+
++  cvub::SetUBCapacityBits(65536);
++  const cvub::ModulePlanResult constrained =
++      cvub::RunUBModuleFromAfterCVPipelining(module, {});
++  Check(constrained.capacityBits == 65536,
++        "module result must report the configured UB capacity");
++  Check(!constrained.success && constrained.overflow,
++        "runtime UB capacity must control the PlanMemory decision");
++  cvub::SetUBCapacityBits(cvub::kDefaultUBCapacityBits);
++
+   std::cout << "[PASS] generic IR accepts implicit modules and plans AIV "
+-               "functions independently\n";
++               "functions independently with runtime capacity\n";
+   return 0;
+ }

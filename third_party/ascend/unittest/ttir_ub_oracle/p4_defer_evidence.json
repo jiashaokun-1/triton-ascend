@@ -1,9 +1,10 @@
 {
-  "schema": "ttir-ub-p4-defer-evidence-v1",
-  "captured_on": "2026-07-23",
+  "schema": "ttir-ub-p4-defer-evidence-v2",
+  "captured_on": "2026-07-24",
+  "server_validation": "pending-server-unavailable",
   "producer_libtriton_sha256": "ff7cfbcd21fa392ccb4146f3e5c6c21be13cba013a4d3bc12a4aa53af35aafa8",
-  "consumer_suffix_compiler_sha256": "4cf8798e69e1500e43257b714db6222792039f0fb73c0459bacea985f5c6c6f5",
-  "consumer_semantic_model_sha256": "0d398b32d46f7e93af8bfca44a75abf61afddc524d04d3cf5cf89385f5fb6b40",
+  "consumer_suffix_compiler_sha256": null,
+  "consumer_semantic_model_sha256": null,
   "cases": [
     {
       "name": "dynamic-cv-mix-dot-exp",
@@ -11,22 +12,28 @@
       "compile_mode": "simd",
       "enable_dynamic_cv_pipeline": true,
       "ttir_sha256": "4f7089d6eeaef8a94804ce830f872a14b5ef1a2a0fe462bfd3c6a5efc2c8f4c7",
-      "boundary_sha256": "b85a5fcb87756603c76b490b442e949a0feb86b3704aa6fe0b967f168d27b64e",
+      "boundary_sha256": "47624da9dc2512d18c29409ed8101550fdae7e1b64aa5611d9253c43e1eabe5e",
       "boundary_facts": [
-        "CUBE scope",
-        "VECTOR scope",
-        "linalg.matmul",
-        "hivm.hir.fixpipe"
+        "full-compiler MIX module provenance",
+        "1024-byte AIC Fixpipe source allocation",
+        "1024-byte AIV vector source allocation",
+        "AIC and AIV use physically independent UB domains"
       ],
       "pipeline_tail": [
         "ttir.triton-to-linalg",
-        "ttir.dynamic-cv-pipeline"
+        "ttir.dynamic-cv-pipeline",
+        "bisheng.ub-affecting-suffix"
       ],
       "status": "replay-shadow",
-      "analyzer_lower_bound_bits": 16384,
-      "semantic_replay_peak_bits": 40960,
-      "validated_seeds": "0..19",
-      "reason": "same-schema-suffix-oracle-unavailable-and-capacity-parameter-mismatch",
+      "analyzer_lower_bound_bits": 4096,
+      "planmemory_peak_bits_by_scope": {
+        "AIC": 4096,
+        "AIV": 4096
+      },
+      "validated_seeds": [
+        0
+      ],
+      "reason": "real seed 0 full PlanMemory agreed per execution scope; seeds 0..19, retry, and rebuilt consumer hashes remain pending",
       "promotion_allowed": false
     },
     {
@@ -35,21 +42,22 @@
       "compile_mode": "simd_simt",
       "enable_dynamic_cv_pipeline": false,
       "ttir_sha256": "89e8f469b6aa377dc3a80c43ac0ca87475bb474e4a024d27cd018ab96fc59a00",
-      "boundary_sha256": "bf0664ad1a5cbc91b4d2ff378e1e21bb3859321d06dc1fb1e7a48b35c1a87c29",
+      "boundary_sha256": "0c244001a8c119ed9d5c88b50a2355acaf2f023da9201f427aca8cb34338c5e5",
       "boundary_facts": [
-        "indirect index load",
-        "unstructured data load",
-        "simd_simt lowering"
+        "full-compiler AIV module provenance",
+        "memref.alloc(%dim) : memref<?xf32> before gather_load",
+        "source extent is unavailable in the matched TTIR"
       ],
       "pipeline_tail": [
         "ttir.triton-to-unstructure",
-        "ttir.triton-to-linalg"
+        "ttir.triton-to-linalg",
+        "bisheng.ub-affecting-suffix"
       ],
-      "status": "replay-shadow",
-      "analyzer_lower_bound_bits": 768,
-      "semantic_replay_peak_bits": 1024,
-      "validated_seeds": "0..19",
-      "reason": "same-schema-suffix-oracle-unavailable-and-capacity-parameter-mismatch",
+      "status": "deliberate-defer",
+      "analyzer_lower_bound_bits": 0,
+      "planmemory_peak_bits_by_scope": null,
+      "validated_seeds": [],
+      "reason": "unsupported-irregular-source-extent",
       "promotion_allowed": false
     }
   ]

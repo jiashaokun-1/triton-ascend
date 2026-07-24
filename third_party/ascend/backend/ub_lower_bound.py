@@ -96,16 +96,6 @@ _DYNAMIC_CV_PARAMETER_KEYS = frozenset({
     "fixpipe_min_instances",
     "vector_min_instances",
 })
-_IRREGULAR_MEMORY_PARAMETER_KEYS = frozenset({
-    "expected_resource_count",
-    "expected_elements",
-    "expected_index_bit_width",
-    "expected_value_bit_width",
-    "expected_index_payload_bytes",
-    "expected_value_payload_bytes",
-    "max_tiles",
-    "materialized_allocation_count",
-})
 
 
 def _has_positive_decimal_parameters(parameters, expected_keys):
@@ -164,17 +154,6 @@ def _is_valid_profile_stage(stage):
     }:
         return _has_positive_decimal_parameters(
             parameters, _DYNAMIC_CV_PARAMETER_KEYS
-        )
-    if contract_id in {
-        "irregular-memory-source-preserve",
-        "irregular-memory-replay",
-        "irregular-memory-result-preserve",
-    }:
-        return (
-            _has_positive_decimal_parameters(
-                parameters, _IRREGULAR_MEMORY_PARAMETER_KEYS
-            )
-            and parameters["materialized_allocation_count"] == "1"
         )
     return False
 
@@ -263,8 +242,7 @@ def _is_valid_profile_entry(entry):
         stage["contract_id"] for stage in stages
         if stage["contract_id"].startswith(
             ("direct-copy-", "binary-add-", "loop-carried-add-",
-             "reshape-copy-", "reduction-sum-", "dynamic-cv-",
-             "irregular-memory-")
+             "reshape-copy-", "reduction-sum-", "dynamic-cv-")
         )
     ]
     if active_contract_ids:
@@ -272,20 +250,10 @@ def _is_valid_profile_entry(entry):
             contract_id for contract_id in active_contract_ids
             if contract_id.startswith("dynamic-cv-")
         ]
-        irregular_contracts = [
-            contract_id for contract_id in active_contract_ids
-            if contract_id.startswith("irregular-memory-")
-        ]
         if dynamic_contracts:
             if (len(dynamic_contracts) != len(active_contract_ids)
                     or relevant_options.get("compile_mode") != "simd"
                     or relevant_options.get("enable_dynamic_cv_pipeline") is not True):
-                return False
-        elif irregular_contracts:
-            if (len(irregular_contracts) != len(active_contract_ids)
-                    or relevant_options.get("compile_mode") != "simd_simt"
-                    or relevant_options.get("enable_dynamic_cv_pipeline") is True
-                    or relevant_options.get("multibuffer") is True):
                 return False
         elif relevant_options.get("compile_mode") != "simd":
             return False
@@ -296,7 +264,7 @@ def _is_valid_profile_entry(entry):
         has_multibuffer_contract = (
             "loop-carried-add-multibuffer" in active_contract_ids
         )
-        if dynamic_contracts or irregular_contracts:
+        if dynamic_contracts:
             pass
         elif has_multibuffer_contract:
             if not effective_multibuffer or any(

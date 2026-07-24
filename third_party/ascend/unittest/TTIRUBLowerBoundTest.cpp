@@ -481,6 +481,28 @@ TEST(MandatoryUBResourceGraph, InvalidRelationIdsFailClosed) {
   }
 }
 
+TEST(MandatoryUBResourceGraph, CrossCoreRelationsAndWitnessesFailClosed) {
+  auto addScopedResources = [](MandatoryUBResourceGraph &graph) {
+    MandatoryUBResource aic{"aic", 64, 1};
+    aic.executionScope = UBExecutionScope::AIC;
+    MandatoryUBResource aiv{"aiv", 128, 1};
+    aiv.executionScope = UBExecutionScope::AIV;
+    return std::pair{graph.addResource(std::move(aic)),
+                     graph.addResource(std::move(aiv))};
+  };
+
+  MandatoryUBResourceGraph relationGraph;
+  auto [relationAic, relationAiv] = addScopedResources(relationGraph);
+  relationGraph.addMustDistinct(relationAic, relationAiv);
+  EXPECT_TRUE(failed(relationGraph.solveWitnessLowerBound()));
+
+  MandatoryUBResourceGraph witnessGraph;
+  auto [witnessAic, witnessAiv] = addScopedResources(witnessGraph);
+  EXPECT_EQ(witnessGraph.addWitness({witnessAic, witnessAiv}),
+            InvalidWitnessId);
+  EXPECT_TRUE(failed(witnessGraph.solveWitnessLowerBound()));
+}
+
 TEST(MandatoryUBResourceGraph, FixedInsertionApiSupportsPlannedCallSites) {
   MandatoryUBResourceGraph graph;
   auto id = graph.addResource({"load0", 64, 1});
@@ -838,6 +860,7 @@ std::pair<ResourceId, ResourceId>
 addDynamicCVResources(MandatoryUBResourceGraph &graph) {
   MandatoryUBResource fixpipe{"dynamic-cv-fixpipe-output", 1024, 1};
   fixpipe.origin = "tt.dot";
+  fixpipe.executionScope = UBExecutionScope::AIC;
   fixpipe.kind = MaterializationKind::DynamicCVFixpipeOutput;
   fixpipe.birth.ordinal = 20;
   fixpipe.lastRequiredUse.ordinal = 24;
@@ -849,6 +872,7 @@ addDynamicCVResources(MandatoryUBResourceGraph &graph) {
 
   MandatoryUBResource vector{"dynamic-cv-vector-output", 1024, 1};
   vector.origin = "math.exp";
+  vector.executionScope = UBExecutionScope::AIV;
   vector.kind = MaterializationKind::DynamicCVVectorOutput;
   vector.birth.ordinal = 24;
   vector.lastRequiredUse.ordinal = 25;
@@ -858,11 +882,6 @@ addDynamicCVResources(MandatoryUBResourceGraph &graph) {
   vector.contractTrace = {"ttir-dynamic-cv-dot-exp-v1"};
   ResourceId vectorId = graph.addResource(std::move(vector));
 
-  graph.addMayAlias(fixpipeId, vectorId);
-  CoexistenceWitness witness;
-  witness.resources = {fixpipeId, vectorId};
-  witness.contractTrace = {"ttir-dynamic-cv-dot-exp-v1"};
-  graph.addWitness(std::move(witness));
   return {fixpipeId, vectorId};
 }
 
@@ -881,10 +900,11 @@ TEST(UBResourceContract, DynamicCVReplayTransfersObservedPhysicalFacts) {
   EXPECT_EQ(graph.resources()[fixpipe].minInstances, 2);
   EXPECT_EQ(graph.resources()[vector].minPayloadBytes, 512);
   EXPECT_EQ(graph.resources()[vector].minInstances, 3);
-  EXPECT_TRUE(graph.hasPairwiseDistinctWitness(0));
+  EXPECT_TRUE(graph.witnesses().empty());
   auto result = graph.solveWitnessLowerBound();
   ASSERT_TRUE(succeeded(result));
-  EXPECT_EQ(result->bytes, 2560);
+  EXPECT_EQ(result->bytes, 1536);
+  EXPECT_EQ(result->kind, "singleton");
   EXPECT_EQ(result->contractTrace,
             SmallVector<std::string>({"ttir-dynamic-cv-dot-exp-v1",
                                       "dynamic-cv-replay"}));
@@ -893,18 +913,15 @@ TEST(UBResourceContract, DynamicCVReplayTransfersObservedPhysicalFacts) {
 TEST(UBResourceContract, DynamicCVReplayInvalidatesLifetimeDrift) {
   MandatoryUBResourceGraph graph;
   auto [fixpipe, vector] = addDynamicCVResources(graph);
-  // Rebuild with a gap between the CUBE result's last use and the VECTOR
-  // result's birth.  The replay contract may only assert coexistence for the
-  // exact adjacent boundary observed by the oracle.
+  // Rebuild with a gap between the CUBE hand-off and the VECTOR result birth.
+  // Even though their UB scopes are independent, the replay contract is bound
+  // to this exact producer/consumer hand-off observed by the oracle.
   MandatoryUBResourceGraph drifted;
   MandatoryUBResource first = graph.resources()[fixpipe];
   MandatoryUBResource second = graph.resources()[vector];
   second.birth.ordinal += 1;
   ResourceId firstId = drifted.addResource(std::move(first));
   ResourceId secondId = drifted.addResource(std::move(second));
-  drifted.addMayAlias(firstId, secondId);
-  drifted.addWitness({firstId, secondId});
-
   PipelineContractRegistry registry;
   registry.addForTesting(makeDynamicCVReplayContract(
       {.stageName = "ttir.dynamic-cv-pipeline"}, 2, 256, 32, 1024, 1024, 1,
@@ -930,123 +947,22 @@ TEST(UBResourceContract, DynamicCVContractsPreserveARealStageChain) {
 
   ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
       graph, {.stageName = "ttir.auto-blockify"})));
-  EXPECT_TRUE(graph.hasPairwiseMayAliasWitness(0));
+  EXPECT_TRUE(graph.witnesses().empty());
   ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
       graph, {.stageName = "ttir.dynamic-cv-pipeline"})));
-  EXPECT_TRUE(graph.hasPairwiseDistinctWitness(0));
+  EXPECT_TRUE(graph.witnesses().empty());
   ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
       graph, {.stageName = "bisheng.ub-affecting-suffix"})));
   auto result = graph.solveWitnessLowerBound();
   ASSERT_TRUE(succeeded(result));
-  EXPECT_EQ(result->bytes, 2560);
+  EXPECT_EQ(result->bytes, 1536);
+  EXPECT_EQ(result->kind, "singleton");
   EXPECT_EQ(result->contractTrace,
             SmallVector<std::string>({
                 "ttir-dynamic-cv-dot-exp-v1",
                 "dynamic-cv-source-preserve",
                 "dynamic-cv-replay",
                 "dynamic-cv-result-preserve",
-            }));
-}
-
-std::pair<ResourceId, ResourceId>
-addIrregularMemoryResources(MandatoryUBResourceGraph &graph) {
-  MandatoryUBResource index{"irregular-index", 64, 1};
-  index.origin = "tt.load";
-  index.kind = MaterializationKind::IrregularIndex;
-  index.birth.ordinal = 3;
-  index.lastRequiredUse.ordinal = 6;
-  index.sourceElements = 8;
-  index.elementBitWidth = 64;
-  index.consumer = "tt.addptr";
-  index.contractTrace = {"ttir-irregular-indirect-add-v1"};
-  ResourceId indexId = graph.addResource(std::move(index));
-
-  MandatoryUBResource value{"irregular-gather", 32, 1};
-  value.origin = "tt.load";
-  value.kind = MaterializationKind::IrregularGather;
-  value.birth.ordinal = 6;
-  value.lastRequiredUse.ordinal = 10;
-  value.sourceElements = 8;
-  value.elementBitWidth = 32;
-  value.consumer = "arith.addf";
-  value.contractTrace = {"ttir-irregular-indirect-add-v1"};
-  ResourceId valueId = graph.addResource(std::move(value));
-
-  graph.addMayAlias(indexId, valueId);
-  CoexistenceWitness witness;
-  witness.resources = {indexId, valueId};
-  witness.contractTrace = {"ttir-irregular-indirect-add-v1"};
-  graph.addWitness(std::move(witness));
-  return {indexId, valueId};
-}
-
-TEST(UBResourceContract, IrregularReplayUsesCeilingTileProjection) {
-  MandatoryUBResourceGraph graph;
-  auto [index, value] = addIrregularMemoryResources(graph);
-  PipelineContractRegistry registry;
-  registry.addForTesting(makeIrregularMemoryReplayContract(
-      {.stageName = "ttir.triton-to-linalg"}, 2, 8, 64, 32, 64, 32,
-      /*maxTiles=*/3));
-
-  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
-      graph, {.stageName = "ttir.triton-to-linalg"})));
-  EXPECT_EQ(graph.resources()[index].minPayloadBytes, 22);
-  EXPECT_EQ(graph.resources()[value].minPayloadBytes, 11);
-  EXPECT_TRUE(graph.hasPairwiseDistinctWitness(0));
-  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 33);
-}
-
-TEST(UBResourceContract, IrregularReplayInvalidatesResourceKindDrift) {
-  MandatoryUBResourceGraph graph;
-  auto [index, value] = addIrregularMemoryResources(graph);
-  (void)value;
-  PipelineContractRegistry registry;
-  registry.addForTesting(makeIrregularMemoryReplayContract(
-      {.stageName = "ttir.triton-to-linalg"}, 2, 8, 64, 32, 64, 32, 1));
-
-  // The contract must not reinterpret a regular GM load as an index buffer.
-  auto regular = graph.resources()[index];
-  MandatoryUBResourceGraph drifted;
-  regular.kind = MaterializationKind::GMToUBLoad;
-  ResourceId first = drifted.addResource(std::move(regular));
-  ResourceId second = drifted.addResource(graph.resources()[1]);
-  drifted.addMayAlias(first, second);
-  drifted.addWitness({first, second});
-  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
-      drifted, {.stageName = "ttir.triton-to-linalg"})));
-  EXPECT_EQ(drifted.resources()[first].validity, ValidityState::Invalid);
-  EXPECT_EQ(drifted.resources()[second].validity, ValidityState::Invalid);
-}
-
-TEST(UBResourceContract, IrregularContractsPreserveARealStageChain) {
-  MandatoryUBResourceGraph graph;
-  addIrregularMemoryResources(graph);
-  PipelineContractRegistry registry;
-  registry.addForTesting(makeIrregularMemorySourcePreserveContract(
-      {.stageName = "ttir.auto-blockify"}, 2, 8, 64, 32, 64, 32, 3));
-  registry.addForTesting(makeIrregularMemoryReplayContract(
-      {.stageName = "ttir.triton-to-linalg"}, 2, 8, 64, 32, 64, 32, 3));
-  registry.addForTesting(makeIrregularMemoryResultPreserveContract(
-      {.stageName = "bisheng.ub-affecting-suffix"}, 2, 8, 64, 32, 64, 32,
-      3));
-
-  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
-      graph, {.stageName = "ttir.auto-blockify"})));
-  EXPECT_TRUE(graph.hasPairwiseMayAliasWitness(0));
-  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
-      graph, {.stageName = "ttir.triton-to-linalg"})));
-  EXPECT_TRUE(graph.hasPairwiseDistinctWitness(0));
-  ASSERT_TRUE(succeeded(registry.applyOrInvalidateAll(
-      graph, {.stageName = "bisheng.ub-affecting-suffix"})));
-  auto result = graph.solveWitnessLowerBound();
-  ASSERT_TRUE(succeeded(result));
-  EXPECT_EQ(result->bytes, 33);
-  EXPECT_EQ(result->contractTrace,
-            SmallVector<std::string>({
-                "ttir-irregular-indirect-add-v1",
-                "irregular-memory-source-preserve",
-                "irregular-memory-replay",
-                "irregular-memory-result-preserve",
             }));
 }
 
@@ -1094,7 +1010,7 @@ TEST(UBResourceContract, CapacityHasNoUnknownDefault) {
   for (const char *arch : {"Ascend910_95", "Ascend950", "Ascend910_9579",
                            "Ascend910_9581", "Ascend910_9589",
                            "Ascend910_9599"})
-    expectCapacity(arch, 256 * 1024);
+    expectCapacity(arch, 192 * 1024);
 
   for (const char *arch : {"future-chip", "Ascend910B-future",
                            "Ascend910BLAH", "Ascend910_93future",

@@ -152,22 +152,6 @@ std::unique_ptr<UBResourceContract> makeDynamicCVResultPreserveContract(
     int64_t expectedOutputElements, unsigned expectedElementBitWidth,
     int64_t expectedSourcePayloadBytes, int64_t projectedPayloadBytes,
     int64_t fixpipeMinInstances, int64_t vectorMinInstances);
-std::unique_ptr<UBResourceContract> makeIrregularMemoryReplayContract(
-    const PipelineStageContext &stage, int64_t expectedResourceCount,
-    int64_t expectedElements, unsigned expectedIndexBitWidth,
-    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
-    int64_t expectedValuePayloadBytes, int64_t maxTiles);
-std::unique_ptr<UBResourceContract> makeIrregularMemorySourcePreserveContract(
-    const PipelineStageContext &stage, int64_t expectedResourceCount,
-    int64_t expectedElements, unsigned expectedIndexBitWidth,
-    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
-    int64_t expectedValuePayloadBytes, int64_t maxTiles);
-std::unique_ptr<UBResourceContract> makeIrregularMemoryResultPreserveContract(
-    const PipelineStageContext &stage, int64_t expectedResourceCount,
-    int64_t expectedElements, unsigned expectedIndexBitWidth,
-    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
-    int64_t expectedValuePayloadBytes, int64_t maxTiles);
-
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch);
 
 } // namespace mlir::triton::ascend::ub

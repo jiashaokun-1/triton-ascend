@@ -1,0 +1,59 @@
+--- a/bishengir/tools/bishengir-cvpipeline-suffix-compile/bishengir-cvpipeline-suffix-compile.cpp
++++ b/bishengir/tools/bishengir-cvpipeline-suffix-compile/bishengir-cvpipeline-suffix-compile.cpp
+@@ -210,14 +210,16 @@
+
+ static std::unique_ptr<llvm::MemoryBuffer> upgradeLegacyOracleInput(
+     std::unique_ptr<llvm::MemoryBuffer> input) {
+-  // The checked-in before-CVPipelining corpus predates VCmpOp's optional
+-  // temp_buffer operand group.  Fresh TableGen output therefore expects three
+-  // segment sizes while those generic-form records contain two.  Upgrade only
+-  // that exact legacy spelling in-memory; never rewrite the corpus itself.
+-  constexpr StringLiteral legacy =
++  // The checked-in before-CVPipelining corpus predates optional operand groups
++  // added to VCmpOp and FixpipeOp. Upgrade only those exact generic-form
++  // spellings in-memory; never rewrite the corpus itself.
++  constexpr StringLiteral legacyVCmp =
+       "operandSegmentSizes = array<i32: 2, 1>";
+-  constexpr StringLiteral current =
++  constexpr StringLiteral currentVCmp =
+       "operandSegmentSizes = array<i32: 2, 1, 0>";
++  constexpr StringLiteral fixpipeName = "\"hivm.hir.fixpipe\"";
++  constexpr StringLiteral currentFixpipe =
++      "operandSegmentSizes = array<i32: 1, 1, 0, 0>, ";
+   std::string text = input->getBuffer().str();
+   size_t lineBegin = 0;
+   while (lineBegin < text.size()) {
+@@ -225,12 +227,20 @@
+     if (lineEnd == std::string::npos)
+       lineEnd = text.size();
+     StringRef line(text.data() + lineBegin, lineEnd - lineBegin);
+-    if (line.contains("\"hivm.hir.vcmp\"") && line.contains(legacy)) {
+-      size_t attribute = text.find(legacy.str(), lineBegin);
++    if (line.contains("\"hivm.hir.vcmp\"") && line.contains(legacyVCmp)) {
++      size_t attribute = text.find(legacyVCmp.str(), lineBegin);
+       if (attribute < lineEnd) {
+-        text.replace(attribute, legacy.size(), current.str());
+-        lineEnd += current.size() - legacy.size();
++        text.replace(attribute, legacyVCmp.size(), currentVCmp.str());
++        lineEnd += currentVCmp.size() - legacyVCmp.size();
+       }
++    } else if (line.contains(fixpipeName) &&
++               !line.contains("operandSegmentSizes")) {
++      size_t properties = text.find("<{", lineBegin);
++      if (properties < lineEnd) {
++        properties += 2;
++        text.insert(properties, currentFixpipe.str());
++        lineEnd += currentFixpipe.size();
++      }
+     }
+     lineBegin = lineEnd + (lineEnd < text.size());
+   }
+@@ -569,7 +579,7 @@
+ static llvm::cl::opt<bool> enableTritonKernelCompile(
+     "enable-triton-kernel-compile",
+     llvm::cl::desc("Keep Triton-specific suffix passes enabled"),
+-    llvm::cl::init(false));
++    llvm::cl::init(true));
+
+ static llvm::cl::opt<bool> disableAutoCVWorkSpaceManage(
+     "disable-auto-cv-work-space-manage",

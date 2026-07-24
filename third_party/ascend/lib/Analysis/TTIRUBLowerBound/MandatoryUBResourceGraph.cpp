@@ -121,6 +121,10 @@ void MandatoryUBResourceGraph::addRelation(
     malformed_ = true;
     return;
   }
+  if (resources_[lhs].executionScope != resources_[rhs].executionScope) {
+    malformed_ = true;
+    return;
+  }
   if (rhs < lhs)
     std::swap(lhs, rhs);
   relations.emplace_back(lhs, rhs);
@@ -147,6 +151,16 @@ MandatoryUBResourceGraph::addWitness(CoexistenceWitness witness) {
   }
   for (ResourceId id : witness.resources) {
     if (id >= resources_.size()) {
+      malformed_ = true;
+      return InvalidWitnessId;
+    }
+  }
+  if (!witness.resources.empty()) {
+    const UBExecutionScope scope =
+        resources_[witness.resources.front()].executionScope;
+    if (llvm::any_of(witness.resources, [&](ResourceId id) {
+          return resources_[id].executionScope != scope;
+        })) {
       malformed_ = true;
       return InvalidWitnessId;
     }

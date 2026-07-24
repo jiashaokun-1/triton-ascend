@@ -1169,6 +1169,7 @@ LogicalResult materializeDynamicCVDotExp(
   fixpipe.minPayloadBytes = *payload;
   fixpipe.minInstances = 1;
   fixpipe.origin = "tt.dot";
+  fixpipe.executionScope = UBExecutionScope::AIC;
   fixpipe.kind = MaterializationKind::DynamicCVFixpipeOutput;
   fixpipe.birth.ordinal = dotOrdinal;
   fixpipe.lastRequiredUse.ordinal = expOrdinal;
@@ -1183,6 +1184,7 @@ LogicalResult materializeDynamicCVDotExp(
   vector.minPayloadBytes = *payload;
   vector.minInstances = 1;
   vector.origin = "math.exp";
+  vector.executionScope = UBExecutionScope::AIV;
   vector.kind = MaterializationKind::DynamicCVVectorOutput;
   vector.birth.ordinal = expOrdinal;
   vector.lastRequiredUse.ordinal = storeOrdinal;
@@ -1193,12 +1195,9 @@ LogicalResult materializeDynamicCVDotExp(
   ResourceId vectorId = graph.addResource(std::move(vector));
   if (fixpipeId == InvalidResourceId || vectorId == InvalidResourceId)
     return defer(reasons, "malformed-resource-graph");
-  graph.addMayAlias(fixpipeId, vectorId);
-  CoexistenceWitness witness;
-  witness.resources = {fixpipeId, vectorId};
-  witness.contractTrace.push_back("ttir-dynamic-cv-dot-exp-v1");
-  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
-    return defer(reasons, "malformed-resource-graph");
+  // Dynamic CV splits this logical producer/consumer edge across MIX AIC and
+  // AIV functions.  Their UB allocations are physically independent: there
+  // is neither an alias relation nor a cross-core coexistence witness.
   return success();
 }
 
@@ -1233,12 +1232,6 @@ LogicalResult materializeIrregularIndirectAdd(
   auto valueType = cast<RankedTensorType>(valueLoad.getType());
   if (indexType.getNumElements() != valueType.getNumElements())
     return defer(reasons, "unsupported-irregular-shape");
-  FailureOr<int64_t> indexPayload =
-      getStaticTensorPayloadBytes(indexType, 1, reasons);
-  FailureOr<int64_t> valuePayload =
-      getStaticTensorPayloadBytes(valueType, 1, reasons);
-  if (failed(indexPayload) || failed(valuePayload))
-    return failure();
 
   auto indirect = valueLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
   auto valueBaseSplat =
@@ -1286,51 +1279,14 @@ LogicalResult materializeIrregularIndirectAdd(
       addPtrs.size() != 3 || loads.size() != 2 || adds.size() != 1 ||
       stores.size() != 1)
     return defer(reasons, "unsupported-irregular-structure");
+  // The source pointer carries no allocation extent in this TTIR form.  The
+  // real full-compiler boundary therefore materializes memref<?xf32> before
+  // gather_load, and PlanMemory cannot derive a static UB size.  The 8-element
+  // index/result tensors alone are not a safe lower-bound model of the
+  // mandatory source buffer.
   for (Operation &operation : entry.without_terminator())
     matched.insert(&operation);
-
-  const uint64_t indexOrdinal =
-      std::distance(entry.begin(), indexLoad->getIterator());
-  const uint64_t valueOrdinal =
-      std::distance(entry.begin(), valueLoad->getIterator());
-  const uint64_t addOrdinal =
-      std::distance(entry.begin(), add->getIterator());
-  MandatoryUBResource index;
-  index.debugName = "irregular-index";
-  index.minPayloadBytes = *indexPayload;
-  index.minInstances = 1;
-  index.origin = "tt.load";
-  index.kind = MaterializationKind::IrregularIndex;
-  index.birth.ordinal = indexOrdinal;
-  index.lastRequiredUse.ordinal = valueOrdinal;
-  index.sourceElements = indexType.getNumElements();
-  index.elementBitWidth = 64;
-  index.consumer = "tt.addptr";
-  index.contractTrace.push_back("ttir-irregular-indirect-add-v1");
-  ResourceId indexId = graph.addResource(std::move(index));
-
-  MandatoryUBResource value;
-  value.debugName = "irregular-gather";
-  value.minPayloadBytes = *valuePayload;
-  value.minInstances = 1;
-  value.origin = "tt.load";
-  value.kind = MaterializationKind::IrregularGather;
-  value.birth.ordinal = valueOrdinal;
-  value.lastRequiredUse.ordinal = addOrdinal;
-  value.sourceElements = valueType.getNumElements();
-  value.elementBitWidth = 32;
-  value.consumer = "arith.addf";
-  value.contractTrace.push_back("ttir-irregular-indirect-add-v1");
-  ResourceId valueId = graph.addResource(std::move(value));
-  if (indexId == InvalidResourceId || valueId == InvalidResourceId)
-    return defer(reasons, "malformed-resource-graph");
-  graph.addMayAlias(indexId, valueId);
-  CoexistenceWitness witness;
-  witness.resources = {indexId, valueId};
-  witness.contractTrace.push_back("ttir-irregular-indirect-add-v1");
-  if (graph.addWitness(std::move(witness)) == InvalidWitnessId)
-    return defer(reasons, "malformed-resource-graph");
-  return success();
+  return defer(reasons, "unsupported-irregular-source-extent");
 }
 
 } // namespace

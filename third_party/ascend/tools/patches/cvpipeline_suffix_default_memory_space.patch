@@ -1,0 +1,41 @@
+--- a/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp
++++ b/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp
+@@ -295,7 +295,11 @@
+
+ bool isAnyOfLocalBuffer(const SmallVectorImpl<MemRefType> &memrefTypes) {
+   bool anyOfLocalBuffer = llvm::any_of(memrefTypes, [](MemRefType mtype) {
+-    return isLocalBuffer(getHIVMAddressSpaceAttr(mtype));
++    auto memorySpace =
++        dyn_cast_or_null<AddressSpaceAttr>(mtype.getMemorySpace());
++    return isLocalBuffer(memorySpace
++                             ? std::optional<AddressSpaceAttr>(memorySpace)
++                             : std::nullopt);
+   });
+   return anyOfLocalBuffer;
+ }
+@@ -820,7 +824,10 @@
+   for (Value operand : op->getOperands()) {
+     if (auto memrefType = dyn_cast<MemRefType>(operand.getType())) {
+       auto memSpace = memrefType.getMemorySpace();
+-      assert(memSpace && "memSpace must not be null");
++      // An absent memory-space attribute is MLIR's valid default space. It is
++      // not a local HIVM buffer and must not be dyn_cast as a null Attribute.
++      if (!memSpace)
++        continue;
+       if (auto spaceAttr = dyn_cast<AddressSpaceAttr>(memSpace)) {
+         if (spaceAttr.getAddressSpace() != hivm::AddressSpace::GM) {
+           hasNonGMMemref = true;
+--- a/bishengir/lib/Dialect/HIVM/IR/HIVMInterfaces.cpp
++++ b/bishengir/lib/Dialect/HIVM/IR/HIVMInterfaces.cpp
+@@ -260,8 +260,9 @@
+
+     auto memrefType = cast<MemRefType>(type);
+     auto addressSpaceAttr =
+-        dyn_cast<AddressSpaceAttr>(memrefType.getMemorySpace());
+-    if (hivmSpace == addressSpaceAttr.getAddressSpace()) {
++        dyn_cast_or_null<AddressSpaceAttr>(memrefType.getMemorySpace());
++    if (addressSpaceAttr &&
++        hivmSpace == addressSpaceAttr.getAddressSpace()) {
+       results.push_back(oper->get());
+     }
+   }

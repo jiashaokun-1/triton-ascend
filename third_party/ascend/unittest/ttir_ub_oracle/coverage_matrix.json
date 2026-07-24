@@ -20,8 +20,8 @@
       "family": "irregular-memory",
       "phase": "P4",
       "operations": ["tt.gather", "tt.scatter", "tt.index_select", "tt.index_put", "tt.load_unstructured", "tt.store_unstructured"],
-      "status": "replay-shadow",
-      "evidence": "exact simd_simt indirect-index load/add fixture has an executable source-preserve -> irregular-memory-replay -> result-preserve chain; all unmatched irregular forms retain unsupported-op-irregular-memory"
+      "status": "deliberate-defer",
+      "evidence": "the real full-compiler boundary contains memref.alloc(%dim) : memref<?xf32> before gather_load; the matched TTIR cannot bound that source extent, so the analyzer returns unsupported-irregular-source-extent and no certificate"
     },
     {
       "family": "elementwise",
@@ -119,7 +119,7 @@
       "phase": "P4",
       "operations": ["DynamicCVPipeline", "PlanComputeBlock", "SplitDataflow", "SeparateMemoryFromCompute", "AllocMultiCache", "AddControlFlowCondition", "SplitMix"],
       "status": "replay-shadow",
-      "evidence": "exact MIX dot-exp fixture has an executable source-preserve -> dynamic-cv-replay -> result-preserve chain and 20-seed semantic lower-bound validation; production promotion remains forbidden until a same-schema suffix oracle is available"
+      "evidence": "real full-compiler MIX dot-exp fixture has an executable source-preserve -> dynamic-cv-replay -> result-preserve chain; execution-scope-aware seed-0 PlanMemory reports 4096 bits independently for AIC and AIV, while full seeds/retry remain pending"
     }
   ],
   "contracts": [
@@ -143,7 +143,7 @@
     {"name": "LayoutConversionContract", "phase": "P4", "status": "deliberate-defer"},
     {"name": "ReductionMaterializationContract", "phase": "P3", "status": "implemented-slice"},
     {"name": "DescriptorMemoryContract", "phase": "P4", "status": "deliberate-defer"},
-    {"name": "IrregularMemoryContract", "phase": "P4", "status": "replay-shadow"},
+    {"name": "IrregularMemoryContract", "phase": "P4", "status": "deliberate-defer"},
     {"name": "DynamicCVPipelineContract", "phase": "P4", "status": "replay-shadow"},
     {"name": "PlanComputeBlockContract", "phase": "P4", "status": "deliberate-defer"},
     {"name": "SplitDataflowContract", "phase": "P4", "status": "deliberate-defer"},

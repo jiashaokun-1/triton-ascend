@@ -1,0 +1,26 @@
+--- a/bishengir/tools/bishengir-compile/bishengir-compile.cpp
++++ b/bishengir/tools/bishengir-compile/bishengir-compile.cpp
+@@ -40,6 +40,8 @@
+ #include "llvm/Support/InitLLVM.h"
+ #include "llvm/Support/SourceMgr.h"
+
++#include <cstdlib>
++
+ namespace {
+ // getMainExecutable needs an address inside this binary; ISO C++ forbids using
+ // `main` as a normal function pointer.
+@@ -104,7 +106,13 @@
+   // bishengir-compile-91095.
+   // TODO: this will be removed after bihengir-compile and bishengir-compile-a5
+   // are merged.
+-  if (hasRegBaseTarget(argc, argv))
++  // The suffix oracle build can explicitly keep this source revision's
++  // regbase pipeline in-process to capture a same-schema before-CVP boundary.
++  // Default compiler behavior remains delegation.
++  const char *inProcessOracle =
++      std::getenv("BISHENGIR_IN_PROCESS_REGBASE_ORACLE");
++  if (hasRegBaseTarget(argc, argv) &&
++      !(inProcessOracle && llvm::StringRef(inProcessOracle) == "1"))
+     return runBishengirCompile91095(argc, argv);
+
+   // Register dialects.

@@ -17,6 +17,7 @@ from typing import Callable, Iterable
 
 
 UB_SCOPE = "6"
+_IRREGULAR_SOURCE_EXTENT_REASON = "unsupported-irregular-source-extent"
 _MANIFEST_KEYS = frozenset({"schema", "cases"})
 _CASE_KEYS = frozenset({
     "name",
@@ -81,8 +82,8 @@ _OPERATION_FAMILIES = {
     },
     "dynamic-cv": {
         "matcher_trace": "ttir-dynamic-cv-dot-exp-v1",
-        "certificate_kind": "witness",
-        "certificate_resource_count": 2,
+        "certificate_kind": "singleton",
+        "certificate_resource_count": 1,
         "resource_count": 2,
         "allocation_count": 2,
         "contract_prefix": "dynamic-cv",
@@ -120,14 +121,8 @@ _DYNAMIC_CV_CONTRACT_PROPOSAL_KEYS = frozenset({
     "auto_tile_and_bind_subblock_outcome",
 })
 _IRREGULAR_MEMORY_CONTRACT_PROPOSAL_KEYS = frozenset({
-    "expected_resource_count",
-    "expected_elements",
-    "expected_index_bit_width",
-    "expected_value_bit_width",
-    "expected_index_payload_bytes",
-    "expected_value_payload_bytes",
-    "max_tiles",
-    "materialized_allocation_count",
+    "source_extent_kind",
+    "defer_reason",
     "materialization_stage",
     "auto_tile_and_bind_subblock_outcome",
 })
@@ -147,9 +142,14 @@ _OVERFLOW_RE = re.compile(
 )
 _SUB_BLOCK_INDEX_OP = "hivm.hir.get_sub_block_idx"
 _MAX_INT64 = (1 << 63) - 1
-_STATIC_ALLOC_RE = re.compile(
+_GENERIC_ALLOC_RE = re.compile(
     r'"memref\.alloc"\([^\n]*\)[^\n]*\s:\s*\([^\n]*\)\s*->\s*'
     r'memref<([^\n]+)>'
+)
+_CUSTOM_ALLOC_RE = re.compile(
+    r'^\s*%[A-Za-z0-9_.$-]+\s*=\s*memref\.alloc(?:\([^\n)]*\))?'
+    r'[^\n]*:\s*memref<([^\n]+)>$',
+    re.MULTILINE,
 )
 
 
@@ -220,10 +220,68 @@ def detect_auto_tile_outcome(input_ir: str, after_tile_ir: str) -> bool:
     return _SUB_BLOCK_INDEX_OP in after_tile_ir
 
 
+def validate_p4_full_compiler_boundary(text: str) -> None:
+    """Reject TTIR-to-Linalg adapters masquerading as before-CVP dumps."""
+    required_markers = (
+        "module attributes {",
+        "dlti.target_system_spec",
+        "hacc.target = #hacc.target<",
+        "hacc.entry",
+        "hacc.function_kind = #hacc.function_kind<DEVICE>",
+        "hivm.func_core_type",
+    )
+    if any(marker not in text for marker in required_markers):
+        raise OracleUnavailable(
+            "P4 boundary lacks full-compiler target/function provenance"
+        )
+
+
+def validate_irregular_dynamic_source_boundary(text: str) -> None:
+    """Require the real unbounded source allocation that makes this slice defer."""
+    required_markers = (
+        "memref.dim",
+        "memref.alloc(%dim) : memref<?xf32>",
+        "hivm.hir.load",
+        "hivm.hir.gather_load",
+    )
+    if any(marker not in text for marker in required_markers):
+        raise OracleUnavailable(
+            "irregular boundary lacks the expected dynamic source allocation"
+        )
+    try:
+        parse_boundary_allocation_bytes(text)
+    except OracleUnavailable:
+        return
+    raise OracleUnavailable(
+        "irregular boundary unexpectedly has only static ranked allocations"
+    )
+
+
+def is_deliberate_irregular_defer(analysis: dict) -> bool:
+    """Recognize the one audited P4 form that is intentionally unmodellable."""
+    return (
+        analysis.get("operation_family") == "irregular-memory"
+        and analysis.get("decision") == "defer"
+        and analysis.get("lower_bound_bytes") == 0
+        and analysis.get("certificates") == []
+        and analysis.get("unsupported_reasons")
+        == [_IRREGULAR_SOURCE_EXTENT_REASON]
+    )
+
+
 def parse_boundary_allocation_bytes(text: str) -> list[int]:
     """Extract every supported local static allocation at the CVPipeline boundary."""
-    matches = _STATIC_ALLOC_RE.findall(text)
-    if not matches or len(matches) != text.count('"memref.alloc"'):
+    generic_matches = _GENERIC_ALLOC_RE.findall(text)
+    custom_matches = _CUSTOM_ALLOC_RE.findall(text)
+    matches = [*generic_matches, *custom_matches]
+    operation_count = text.count('"memref.alloc"') + len(
+        re.findall(
+            r'^\s*%[A-Za-z0-9_.$-]+\s*=\s*memref\.alloc\b',
+            text,
+            re.MULTILINE,
+        )
+    )
+    if not matches or len(matches) != operation_count:
         raise OracleUnavailable(
             "boundary allocations must all be supported static ranked memrefs"
         )
@@ -253,7 +311,10 @@ def parse_boundary_allocation_bytes(text: str) -> list[int]:
 
 def parse_explicit_ub_allocation_bytes(text: str) -> list[int]:
     """Return only allocations explicitly typed in the HiVM UB address space."""
-    matches = _STATIC_ALLOC_RE.findall(text)
+    matches = [
+        *_GENERIC_ALLOC_RE.findall(text),
+        *_CUSTOM_ALLOC_RE.findall(text),
+    ]
     all_allocations = parse_boundary_allocation_bytes(text)
     return [
         allocation
@@ -418,7 +479,11 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError(
                 "contract_proposal.auto_tile_and_bind_subblock_outcome must be boolean or null"
             )
-        if proposal["expected_resource_count"] != _OPERATION_FAMILIES[family]["resource_count"]:
+        if (
+            family != "irregular-memory"
+            and proposal["expected_resource_count"]
+            != _OPERATION_FAMILIES[family]["resource_count"]
+        ):
             raise ManifestError(
                 "contract_proposal.expected_resource_count disagrees with operation_family"
             )
@@ -455,34 +520,14 @@ def load_manifest(path: Path) -> dict:
             cases.append(case)
             continue
         if family == "irregular-memory":
-            for field in (
-                "expected_resource_count",
-                "expected_elements",
-                "expected_index_bit_width",
-                "expected_value_bit_width",
-                "expected_index_payload_bytes",
-                "expected_value_payload_bytes",
-                "max_tiles",
-                "materialized_allocation_count",
-            ):
-                if type(proposal[field]) is not int or proposal[field] <= 0:
-                    raise ManifestError(
-                        f"contract_proposal.{field} must be a positive integer"
-                    )
-            index_width = proposal["expected_index_bit_width"]
-            value_width = proposal["expected_value_bit_width"]
-            if (index_width < 8 or index_width % 8 or value_width < 8
-                    or value_width % 8):
-                raise ManifestError("irregular-memory bit widths must be whole bytes")
             if (
-                proposal["expected_index_payload_bytes"]
-                != proposal["expected_elements"] * (index_width // 8)
-                or proposal["expected_value_payload_bytes"]
-                != proposal["expected_elements"] * (value_width // 8)
-                or proposal["materialized_allocation_count"] != 1
+                proposal["source_extent_kind"] != "dynamic-unbounded"
+                or proposal["defer_reason"] != _IRREGULAR_SOURCE_EXTENT_REASON
                 or proposal["materialization_stage"] != "ttir.triton-to-linalg"
             ):
-                raise ManifestError("irregular-memory contract proposal is inconsistent")
+                raise ManifestError(
+                    "irregular-memory deliberate-defer proposal is inconsistent"
+                )
             case = dict(item)
             case["ttir"] = _fixture_path(root, item["ttir"], "ttir")
             case["before_cvpipelining"] = _fixture_path(
@@ -551,9 +596,14 @@ def build_proposed_contract_profile(
     if family is None:
         raise OracleUnavailable(f"unsupported operation family: {operation_family}")
     materialization_stage = proposal["materialization_stage"]
-    if sum(stage["stage_name"] == materialization_stage for stage in pipeline_stages) != 1:
-        raise OracleUnavailable("materialization stage must occur exactly once in the real pipeline")
-    if operation_family in ("dynamic-cv", "irregular-memory"):
+    if sum(
+        stage["stage_name"] == materialization_stage
+        for stage in pipeline_stages
+    ) != 1:
+        raise OracleUnavailable(
+            "materialization stage must occur exactly once in the real pipeline"
+        )
+    if operation_family == "irregular-memory":
         if sum(
             stage["stage_name"] == "bisheng.ub-affecting-suffix"
             for stage in pipeline_stages
@@ -561,33 +611,38 @@ def build_proposed_contract_profile(
             raise OracleUnavailable(
                 "P4 pipeline must contain exactly one UB-affecting suffix stage"
             )
-        if operation_family == "dynamic-cv":
-            parameters = {
-                name: str(proposal[name])
-                for name in (
-                    "expected_resource_count",
-                    "expected_output_elements",
-                    "expected_element_bit_width",
-                    "expected_source_payload_bytes",
-                    "projected_payload_bytes",
-                    "fixpipe_min_instances",
-                    "vector_min_instances",
-                )
-            }
-        else:
-            parameters = {
-                name: str(proposal[name])
-                for name in (
-                    "expected_resource_count",
-                    "expected_elements",
-                    "expected_index_bit_width",
-                    "expected_value_bit_width",
-                    "expected_index_payload_bytes",
-                    "expected_value_payload_bytes",
-                    "max_tiles",
-                    "materialized_allocation_count",
-                )
-            }
+        return {
+            "schema": "ttir-ub-lb-profile-v1",
+            "profiles": [{
+                "pipeline_identity": identity,
+                "pipeline_stages": [{
+                    **stage,
+                    "contract_id": "invalidate-unmodeled-stage",
+                    "contract_version": "1",
+                    "contract_parameters": {},
+                } for stage in pipeline_stages],
+            }],
+        }
+    if operation_family == "dynamic-cv":
+        if sum(
+            stage["stage_name"] == "bisheng.ub-affecting-suffix"
+            for stage in pipeline_stages
+        ) != 1:
+            raise OracleUnavailable(
+                "P4 pipeline must contain exactly one UB-affecting suffix stage"
+            )
+        parameters = {
+            name: str(proposal[name])
+            for name in (
+                "expected_resource_count",
+                "expected_output_elements",
+                "expected_element_bit_width",
+                "expected_source_payload_bytes",
+                "projected_payload_bytes",
+                "fixpipe_min_instances",
+                "vector_min_instances",
+            )
+        }
         materialized = False
         bindings = []
         for stage in pipeline_stages:
@@ -760,45 +815,20 @@ def has_valid_materialization_bridge(analysis: dict) -> bool:
         if type(parameters) is not dict:
             return False
         try:
+            source_payload = int(parameters["expected_source_payload_bytes"])
             projected = int(parameters["projected_payload_bytes"])
             fixpipe_instances = int(parameters["fixpipe_min_instances"])
             vector_instances = int(parameters["vector_min_instances"])
         except (KeyError, TypeError, ValueError):
             return False
         return (
-            projected > 0
-            and allocations == [projected, projected]
-            and lower_bound
-            == projected * (fixpipe_instances + vector_instances)
-        )
-    if analysis.get("operation_family") == "irregular-memory":
-        replay_stages = [
-            stage for stage in stages
-            if type(stage) is dict
-            and stage.get("contract_id") == "irregular-memory-replay"
-        ]
-        if len(replay_stages) != 1:
-            return False
-        parameters = replay_stages[0].get("contract_parameters")
-        if type(parameters) is not dict:
-            return False
-        try:
-            index_payload = int(parameters["expected_index_payload_bytes"])
-            value_payload = int(parameters["expected_value_payload_bytes"])
-            max_tiles = int(parameters["max_tiles"])
-            materialized_count = int(
-                parameters["materialized_allocation_count"]
+            source_payload > 0
+            and projected > 0
+            and allocations == [source_payload, source_payload]
+            and lower_bound == max(
+                projected * fixpipe_instances,
+                projected * vector_instances,
             )
-        except (KeyError, TypeError, ValueError):
-            return False
-        if max_tiles <= 0:
-            return False
-        projected_index = (index_payload + max_tiles - 1) // max_tiles
-        projected_value = (value_payload + max_tiles - 1) // max_tiles
-        return (
-            materialized_count == 1
-            and allocations == [projected_index]
-            and lower_bound == projected_index + projected_value
         )
     materialization_id = f"{family['contract_prefix']}-max-tiles"
     materialization_stages = [
@@ -1080,6 +1110,22 @@ def analyze_case(case: dict) -> dict:
         boundary_ir = case["before_cvpipelining"].read_text(encoding="utf-8")
     except OSError as error:
         raise OracleUnavailable(f"cannot read before-CVPipelining fixture: {error}") from error
+    if case["operation_family"] in ("dynamic-cv", "irregular-memory"):
+        validate_p4_full_compiler_boundary(boundary_ir)
+    if case["operation_family"] == "irregular-memory":
+        validate_irregular_dynamic_source_boundary(boundary_ir)
+        result["before_cvpipelining_allocations_bytes"] = []
+        result["before_cvpipelining_allocation_bytes"] = 0
+        result["has_dynamic_source_allocation"] = True
+        result["ttir_fixture_sha256"] = file_sha256(case["ttir"])
+        result["before_cvpipelining_sha256"] = file_sha256(
+            case["before_cvpipelining"]
+        )
+        if not is_deliberate_irregular_defer(result):
+            raise OracleUnavailable(
+                "irregular dynamic source must produce the named fail-closed defer"
+            )
+        return result
     allocations = (
         parse_explicit_ub_allocation_bytes(boundary_ir)
         if case["operation_family"] == "dynamic-cv"
@@ -1091,13 +1137,9 @@ def analyze_case(case: dict) -> dict:
     ]["allocation_count"]
     if case["operation_family"] == "dynamic-cv":
         expected_allocations = [
-            proposal["projected_payload_bytes"],
-            proposal["projected_payload_bytes"],
+            proposal["expected_source_payload_bytes"],
+            proposal["expected_source_payload_bytes"],
         ]
-    elif case["operation_family"] == "irregular-memory":
-        expected_allocations = [(
-            proposal["expected_index_payload_bytes"] + proposal["max_tiles"] - 1
-        ) // proposal["max_tiles"]]
     else:
         expected_allocation_bytes = (
             proposal["expected_input_payload_bytes"] + proposal["max_tiles"] - 1
@@ -1152,6 +1194,10 @@ def evaluate(
                     "expected": expected_decision,
                     "actual": analysis["decision"],
                 })
+            if is_deliberate_irregular_defer(analysis):
+                case_report["validation_status"] = "deliberate-defer"
+                report["cases"].append(case_report)
+                continue
             boundary_bytes = analysis.get("before_cvpipelining_allocation_bytes")
             if type(boundary_bytes) is not int or boundary_bytes <= 0:
                 raise OracleUnavailable("analyzer omitted the before-CVPipelining allocation")
@@ -1159,8 +1205,7 @@ def evaluate(
                 report["violations"].append({
                     "case": case["name"], "kind": "invalid-materialization-bridge",
                 })
-            if (case["operation_family"] not in (
-                    "reduction-sum", "irregular-memory")
+            if (case["operation_family"] != "reduction-sum"
                     and not effective_auto_multibuffer(case["options"])
                     and analysis.get("lower_bound_bytes", 0) > boundary_bytes):
                 report["violations"].append({
@@ -1214,10 +1259,21 @@ def evaluate(
                     "case": case["name"], "kind": "reject-without-ub-capacity-result", "seed": seed,
                 })
             if semantic_model is not None:
+                expected_capacity_bytes = analysis.get("capacity_bytes")
+                expected_capacity_bits = (
+                    expected_capacity_bytes * 8
+                    if type(expected_capacity_bytes) is int
+                    else None
+                )
+                semantic_arguments = list(pipeline_arguments)
+                if expected_capacity_bits is not None:
+                    semantic_arguments.append(
+                        f"--ub-capacity-bits={expected_capacity_bits}"
+                    )
                 try:
                     replay = semantic_runner(
                         semantic_model, case["before_cvpipelining"], seed,
-                        pipeline_arguments,
+                        semantic_arguments,
                     )
                     actual["semantic_replay"] = replay
                 except OracleUnavailable as error:
@@ -1226,10 +1282,6 @@ def evaluate(
                         "reason": str(error),
                     })
                     continue
-                expected_capacity_bits = analysis.get("capacity_bytes")
-                expected_capacity_bits = (
-                    expected_capacity_bits * 8 if type(expected_capacity_bits) is int else None
-                )
                 if replay.get("capacity_bits") != expected_capacity_bits:
                     report["violations"].append({
                         "case": case["name"], "kind": "semantic-replay-capacity-mismatch", "seed": seed,
@@ -1291,7 +1343,15 @@ def build_profile_candidate(report: dict) -> dict:
     ).hexdigest()
     profiles = []
     fingerprints = set()
-    for case in cases:
+    promotable_cases = [
+        case for case in cases
+        if not is_deliberate_irregular_defer(case.get("analysis", {}))
+    ]
+    if not promotable_cases:
+        raise OracleUnavailable(
+            "profile candidate contains only deliberate-defer cases"
+        )
+    for case in promotable_cases:
         analysis = case.get("analysis", {})
         identity = analysis.get("pipeline_identity_detail")
         stages = analysis.get("pipeline_stages_detail")

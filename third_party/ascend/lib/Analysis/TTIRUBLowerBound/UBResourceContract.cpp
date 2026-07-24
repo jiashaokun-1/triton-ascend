@@ -881,8 +881,7 @@ public:
         projectedPayloadBytes <= 0 ||
         projectedPayloadBytes > expectedSourcePayloadBytes ||
         fixpipeMinInstances <= 0 || vectorMinInstances <= 0 ||
-        graph.resources().size() != 2 || graph.witnesses().size() != 1 ||
-        !graph.hasPairwiseMayAliasWitness(0))
+        graph.resources().size() != 2 || !graph.witnesses().empty())
       return ContractDisposition::Invalidate;
     const MandatoryUBResource &fixpipe = graph.resources()[0];
     const MandatoryUBResource &vector = graph.resources()[1];
@@ -890,6 +889,8 @@ public:
         vector.validity != ValidityState::Valid ||
         fixpipe.kind != MaterializationKind::DynamicCVFixpipeOutput ||
         vector.kind != MaterializationKind::DynamicCVVectorOutput ||
+        fixpipe.executionScope != UBExecutionScope::AIC ||
+        vector.executionScope != UBExecutionScope::AIV ||
         fixpipe.origin != "tt.dot" || vector.origin != "math.exp" ||
         fixpipe.consumer != "math.exp" || vector.consumer != "tt.store" ||
         fixpipe.sourceElements != expectedOutputElements ||
@@ -904,8 +905,7 @@ public:
     if (failed(graph.updateResourceLowerBound(
             0, projectedPayloadBytes, fixpipeMinInstances, id())) ||
         failed(graph.updateResourceLowerBound(
-            1, projectedPayloadBytes, vectorMinInstances, id())) ||
-        failed(graph.refineWitnessToMustDistinct(0, id())))
+            1, projectedPayloadBytes, vectorMinInstances, id())))
       return ContractDisposition::InternalError;
     return ContractDisposition::Transform;
   }
@@ -952,10 +952,7 @@ public:
         projectedPayloadBytes <= 0 ||
         projectedPayloadBytes > expectedSourcePayloadBytes ||
         fixpipeMinInstances <= 0 || vectorMinInstances <= 0 ||
-        graph.resources().size() != 2 || graph.witnesses().size() != 1)
-      return ContractDisposition::Invalidate;
-    if (resultState ? !graph.hasPairwiseDistinctWitness(0)
-                    : !graph.hasPairwiseMayAliasWitness(0))
+        graph.resources().size() != 2 || !graph.witnesses().empty())
       return ContractDisposition::Invalidate;
     const MandatoryUBResource &fixpipe = graph.resources()[0];
     const MandatoryUBResource &vector = graph.resources()[1];
@@ -965,6 +962,8 @@ public:
         vector.validity != ValidityState::Valid ||
         fixpipe.kind != MaterializationKind::DynamicCVFixpipeOutput ||
         vector.kind != MaterializationKind::DynamicCVVectorOutput ||
+        fixpipe.executionScope != UBExecutionScope::AIC ||
+        vector.executionScope != UBExecutionScope::AIV ||
         fixpipe.origin != "tt.dot" || vector.origin != "math.exp" ||
         fixpipe.consumer != "math.exp" || vector.consumer != "tt.store" ||
         fixpipe.sourceElements != expectedOutputElements ||
@@ -992,152 +991,6 @@ private:
   int64_t projectedPayloadBytes;
   int64_t fixpipeMinInstances;
   int64_t vectorMinInstances;
-  bool resultState;
-};
-
-class IrregularMemoryReplayContract final : public ReplayContractBase {
-public:
-  IrregularMemoryReplayContract(const PipelineStageContext &stage,
-                                int64_t expectedResourceCount,
-                                int64_t expectedElements,
-                                unsigned expectedIndexBitWidth,
-                                unsigned expectedValueBitWidth,
-                                int64_t expectedIndexPayloadBytes,
-                                int64_t expectedValuePayloadBytes,
-                                int64_t maxTiles)
-      : ReplayContractBase(stage),
-        expectedResourceCount(expectedResourceCount),
-        expectedElements(expectedElements),
-        expectedIndexBitWidth(expectedIndexBitWidth),
-        expectedValueBitWidth(expectedValueBitWidth),
-        expectedIndexPayloadBytes(expectedIndexPayloadBytes),
-        expectedValuePayloadBytes(expectedValuePayloadBytes),
-        maxTiles(maxTiles) {}
-
-  StringRef id() const override { return "irregular-memory-replay"; }
-
-  ContractDisposition
-  apply(MandatoryUBResourceGraph &graph,
-        const PipelineStageContext &) const override {
-    if (expectedResourceCount != 2 || expectedElements <= 0 ||
-        expectedIndexBitWidth == 0 || expectedValueBitWidth == 0 ||
-        expectedIndexPayloadBytes <= 0 ||
-        expectedValuePayloadBytes <= 0 || maxTiles <= 0 ||
-        graph.resources().size() != 2 || graph.witnesses().size() != 1 ||
-        !graph.hasPairwiseMayAliasWitness(0))
-      return ContractDisposition::Invalidate;
-    const MandatoryUBResource &index = graph.resources()[0];
-    const MandatoryUBResource &value = graph.resources()[1];
-    if (index.validity != ValidityState::Valid ||
-        value.validity != ValidityState::Valid ||
-        index.kind != MaterializationKind::IrregularIndex ||
-        value.kind != MaterializationKind::IrregularGather ||
-        index.sourceElements != expectedElements ||
-        value.sourceElements != expectedElements ||
-        index.elementBitWidth != expectedIndexBitWidth ||
-        value.elementBitWidth != expectedValueBitWidth ||
-        index.minPayloadBytes != expectedIndexPayloadBytes ||
-        value.minPayloadBytes != expectedValuePayloadBytes ||
-        index.minInstances != 1 || value.minInstances != 1 ||
-        index.lastRequiredUse.ordinal != value.birth.ordinal)
-      return ContractDisposition::Invalidate;
-    const int64_t projectedIndex =
-        expectedIndexPayloadBytes / maxTiles +
-        (expectedIndexPayloadBytes % maxTiles != 0);
-    const int64_t projectedValue =
-        expectedValuePayloadBytes / maxTiles +
-        (expectedValuePayloadBytes % maxTiles != 0);
-    if (failed(graph.updateResourceLowerBound(0, projectedIndex, 1, id())) ||
-        failed(graph.updateResourceLowerBound(1, projectedValue, 1, id())) ||
-        failed(graph.refineWitnessToMustDistinct(0, id())))
-      return ContractDisposition::InternalError;
-    return ContractDisposition::Transform;
-  }
-
-private:
-  int64_t expectedResourceCount;
-  int64_t expectedElements;
-  unsigned expectedIndexBitWidth;
-  unsigned expectedValueBitWidth;
-  int64_t expectedIndexPayloadBytes;
-  int64_t expectedValuePayloadBytes;
-  int64_t maxTiles;
-};
-
-class IrregularMemoryPreserveContract final : public ReplayContractBase {
-public:
-  IrregularMemoryPreserveContract(const PipelineStageContext &stage,
-                                  int64_t expectedResourceCount,
-                                  int64_t expectedElements,
-                                  unsigned expectedIndexBitWidth,
-                                  unsigned expectedValueBitWidth,
-                                  int64_t expectedIndexPayloadBytes,
-                                  int64_t expectedValuePayloadBytes,
-                                  int64_t maxTiles, bool resultState)
-      : ReplayContractBase(stage),
-        expectedResourceCount(expectedResourceCount),
-        expectedElements(expectedElements),
-        expectedIndexBitWidth(expectedIndexBitWidth),
-        expectedValueBitWidth(expectedValueBitWidth),
-        expectedIndexPayloadBytes(expectedIndexPayloadBytes),
-        expectedValuePayloadBytes(expectedValuePayloadBytes),
-        maxTiles(maxTiles), resultState(resultState) {}
-
-  StringRef id() const override {
-    return resultState ? "irregular-memory-result-preserve"
-                       : "irregular-memory-source-preserve";
-  }
-
-  ContractDisposition
-  apply(MandatoryUBResourceGraph &graph,
-        const PipelineStageContext &) const override {
-    if (expectedResourceCount != 2 || expectedElements <= 0 ||
-        expectedIndexBitWidth == 0 || expectedValueBitWidth == 0 ||
-        expectedIndexPayloadBytes <= 0 || expectedValuePayloadBytes <= 0 ||
-        maxTiles <= 0 || graph.resources().size() != 2 ||
-        graph.witnesses().size() != 1)
-      return ContractDisposition::Invalidate;
-    if (resultState ? !graph.hasPairwiseDistinctWitness(0)
-                    : !graph.hasPairwiseMayAliasWitness(0))
-      return ContractDisposition::Invalidate;
-    const MandatoryUBResource &index = graph.resources()[0];
-    const MandatoryUBResource &value = graph.resources()[1];
-    const int64_t projectedIndex =
-        expectedIndexPayloadBytes / maxTiles +
-        (expectedIndexPayloadBytes % maxTiles != 0);
-    const int64_t projectedValue =
-        expectedValuePayloadBytes / maxTiles +
-        (expectedValuePayloadBytes % maxTiles != 0);
-    if (index.validity != ValidityState::Valid ||
-        value.validity != ValidityState::Valid ||
-        index.kind != MaterializationKind::IrregularIndex ||
-        value.kind != MaterializationKind::IrregularGather ||
-        index.sourceElements != expectedElements ||
-        value.sourceElements != expectedElements ||
-        index.elementBitWidth != expectedIndexBitWidth ||
-        value.elementBitWidth != expectedValueBitWidth ||
-        index.minPayloadBytes !=
-            (resultState ? projectedIndex : expectedIndexPayloadBytes) ||
-        value.minPayloadBytes !=
-            (resultState ? projectedValue : expectedValuePayloadBytes) ||
-        index.minInstances != 1 || value.minInstances != 1 ||
-        index.lastRequiredUse.ordinal != value.birth.ordinal)
-      return ContractDisposition::Invalidate;
-    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal)
-      if (failed(graph.appendResourceTrace(
-              static_cast<ResourceId>(ordinal), id())))
-        return ContractDisposition::InternalError;
-    return ContractDisposition::Preserve;
-  }
-
-private:
-  int64_t expectedResourceCount;
-  int64_t expectedElements;
-  unsigned expectedIndexBitWidth;
-  unsigned expectedValueBitWidth;
-  int64_t expectedIndexPayloadBytes;
-  int64_t expectedValuePayloadBytes;
-  int64_t maxTiles;
   bool resultState;
 };
 
@@ -1385,39 +1238,6 @@ std::unique_ptr<UBResourceContract> makeDynamicCVResultPreserveContract(
       /*resultState=*/true);
 }
 
-std::unique_ptr<UBResourceContract> makeIrregularMemoryReplayContract(
-    const PipelineStageContext &stage, int64_t expectedResourceCount,
-    int64_t expectedElements, unsigned expectedIndexBitWidth,
-    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
-    int64_t expectedValuePayloadBytes, int64_t maxTiles) {
-  return std::make_unique<IrregularMemoryReplayContract>(
-      stage, expectedResourceCount, expectedElements, expectedIndexBitWidth,
-      expectedValueBitWidth, expectedIndexPayloadBytes,
-      expectedValuePayloadBytes, maxTiles);
-}
-
-std::unique_ptr<UBResourceContract> makeIrregularMemorySourcePreserveContract(
-    const PipelineStageContext &stage, int64_t expectedResourceCount,
-    int64_t expectedElements, unsigned expectedIndexBitWidth,
-    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
-    int64_t expectedValuePayloadBytes, int64_t maxTiles) {
-  return std::make_unique<IrregularMemoryPreserveContract>(
-      stage, expectedResourceCount, expectedElements, expectedIndexBitWidth,
-      expectedValueBitWidth, expectedIndexPayloadBytes,
-      expectedValuePayloadBytes, maxTiles, /*resultState=*/false);
-}
-
-std::unique_ptr<UBResourceContract> makeIrregularMemoryResultPreserveContract(
-    const PipelineStageContext &stage, int64_t expectedResourceCount,
-    int64_t expectedElements, unsigned expectedIndexBitWidth,
-    unsigned expectedValueBitWidth, int64_t expectedIndexPayloadBytes,
-    int64_t expectedValuePayloadBytes, int64_t maxTiles) {
-  return std::make_unique<IrregularMemoryPreserveContract>(
-      stage, expectedResourceCount, expectedElements, expectedIndexBitWidth,
-      expectedValueBitWidth, expectedIndexPayloadBytes,
-      expectedValuePayloadBytes, maxTiles, /*resultState=*/true);
-}
-
 std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {
   static const llvm::StringMap<int64_t> capacities = {
       {"Ascend910B", 192 * 1024},
@@ -1433,10 +1253,14 @@ std::optional<int64_t> getUBCapacityBytes(StringRef targetArch) {
       {"Ascend310B2", 248 * 1024},
       {"Ascend310B3", 248 * 1024},
       {"Ascend310B4", 248 * 1024},
-      {"Ascend910_95", 256 * 1024},
-      {"Ascend950", 256 * 1024},
-      {"Ascend910_9579", 256 * 1024}, {"Ascend910_9581", 256 * 1024},
-      {"Ascend910_9589", 256 * 1024}, {"Ascend910_9599", 256 * 1024},
+      // These targets expose 256 KiB of nominal UB, but the PlanMemory
+      // implementation in the pipeline pinned by this compiler reserves
+      // 64 KiB and rejects plans above 192 KiB.  The early filter must compare
+      // against that real allocator threshold, not the nominal hardware size.
+      {"Ascend910_95", 192 * 1024},
+      {"Ascend950", 192 * 1024},
+      {"Ascend910_9579", 192 * 1024}, {"Ascend910_9581", 192 * 1024},
+      {"Ascend910_9589", 192 * 1024}, {"Ascend910_9599", 192 * 1024},
   };
   const auto capacity = capacities.find(targetArch);
   if (capacity == capacities.end())

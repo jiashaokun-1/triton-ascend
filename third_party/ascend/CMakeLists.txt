@@ -9,7 +9,16 @@ set(ASCENDNPU_IR_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/AscendNPU-IR")
 set(ASCENDNPU_IR_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/AscendNPU-IR")
 
 set(BISHENGIR_ENABLE_A5_UNPUBLISHED_FEATURES ON)
-set(BISHENGIR_BUILD_STANDALONE_IR_ONLY ON)
+option(
+  TRITON_ASCEND_BUILD_BISHENGIR_ORACLE_TOOLS
+  "Build the same-schema BiShengIR tools used by the TTIR UB oracle"
+  OFF
+)
+if(TRITON_ASCEND_BUILD_BISHENGIR_ORACLE_TOOLS)
+  set(BISHENGIR_BUILD_STANDALONE_IR_ONLY OFF)
+else()
+  set(BISHENGIR_BUILD_STANDALONE_IR_ONLY ON)
+endif()
 
 # Temporarily save and clear the RULE_LAUNCH_* attributes in the current directory to ensure AscendNPU-IR is not affected.
 get_property(_saved_launch_compile DIRECTORY PROPERTY RULE_LAUNCH_COMPILE)

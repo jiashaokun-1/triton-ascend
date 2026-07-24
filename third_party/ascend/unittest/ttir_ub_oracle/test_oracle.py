@@ -110,6 +110,53 @@ def test_dynamic_cv_boundary_extracts_ranked_explicit_ub_allocations():
     assert oracle.parse_explicit_ub_allocation_bytes(text) == [1024, 1024]
 
 
+def test_full_compiler_custom_boundary_and_dynamic_allocations_are_distinguished():
+    custom = (
+        "%alloc = memref.alloc() : "
+        "memref<16x16xf32, #hivm.address_space<ub>>\n"
+        "%alloc_0 = memref.alloc() : memref<16x16xf32>\n"
+    )
+    assert oracle.parse_boundary_allocation_bytes(custom) == [1024, 1024]
+    assert oracle.parse_explicit_ub_allocation_bytes(custom) == [1024]
+
+    with pytest.raises(oracle.OracleUnavailable, match="static ranked shape"):
+        oracle.parse_boundary_allocation_bytes(
+            "%alloc = memref.alloc(%dim) : memref<?xf32>\n"
+        )
+
+
+def test_p4_boundary_requires_full_compiler_provenance():
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "dynamic-cv-mix-dot-exp.before_cvpipelining.mlir"
+    ).read_text(encoding="utf-8")
+    oracle.validate_p4_full_compiler_boundary(fixture)
+
+    with pytest.raises(oracle.OracleUnavailable, match="provenance"):
+        oracle.validate_p4_full_compiler_boundary(
+            '"builtin.module"() ({ "func.func"() ({}) : () -> () })'
+        )
+
+
+def test_irregular_boundary_requires_the_real_dynamic_source_allocation():
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "irregular-indirect-add.before_cvpipelining.mlir"
+    ).read_text(encoding="utf-8")
+    oracle.validate_irregular_dynamic_source_boundary(fixture)
+    with pytest.raises(
+        oracle.OracleUnavailable, match="dynamic source allocation"
+    ):
+        oracle.validate_irregular_dynamic_source_boundary(
+            fixture.replace(
+                "memref.alloc(%dim) : memref<?xf32>",
+                "memref.alloc() : memref<8xf32>",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -507,16 +554,10 @@ def test_dynamic_cv_contract_chain_replays_then_preserves_result():
         "1024"
 
 
-def test_irregular_memory_contract_chain_replays_at_linalg():
+def test_irregular_memory_uses_only_fail_closed_stage_contracts():
     proposal = {
-        "expected_resource_count": 2,
-        "expected_elements": 8,
-        "expected_index_bit_width": 64,
-        "expected_value_bit_width": 32,
-        "expected_index_payload_bytes": 64,
-        "expected_value_payload_bytes": 32,
-        "max_tiles": 1,
-        "materialized_allocation_count": 1,
+        "source_extent_kind": "dynamic-unbounded",
+        "defer_reason": "unsupported-irregular-source-extent",
         "materialization_stage": "ttir.triton-to-linalg",
         "auto_tile_and_bind_subblock_outcome": False,
     }
@@ -528,15 +569,14 @@ def test_irregular_memory_contract_chain_replays_at_linalg():
     profile = oracle.build_proposed_contract_profile(
         {"sha256": "identity"}, stages, proposal, "irregular-memory"
     )
-    bindings = profile["profiles"][0]["pipeline_stages"]
-    assert [binding["contract_id"] for binding in bindings] == [
-        "irregular-memory-source-preserve",
-        "irregular-memory-replay",
-        "irregular-memory-result-preserve",
-    ]
-    assert bindings[1]["contract_parameters"][
-        "materialized_allocation_count"
-    ] == "1"
+    assert {
+        binding["contract_id"]
+        for binding in profile["profiles"][0]["pipeline_stages"]
+    } == {"invalidate-unmodeled-stage"}
+    assert all(
+        binding["contract_parameters"] == {}
+        for binding in profile["profiles"][0]["pipeline_stages"]
+    )
 
 
 def test_binary_add_contract_chain_uses_binary_contracts():
@@ -878,8 +918,7 @@ def test_evaluate_accepts_available_defer_results(tmp_path):
     assert [item["seed"] for item in report["cases"][0]["runs"]] == [0, 1, -1]
 
 
-def test_evaluate_allows_irregular_replay_to_add_gather_value_resource(
-        monkeypatch):
+def test_evaluate_records_irregular_dynamic_source_as_deliberate_defer():
     manifest = oracle.load_manifest(
         Path(__file__).parent / "fixtures" / "manifest.json"
     )
@@ -890,32 +929,25 @@ def test_evaluate_allows_irregular_replay_to_add_gather_value_resource(
     analysis = {
         "operation_family": "irregular-memory",
         "decision": "defer",
-        "lower_bound_bytes": 96,
-        "capacity_bytes": 262144,
-        "before_cvpipelining_allocation_bytes": 64,
+        "lower_bound_bytes": 0,
+        "capacity_bytes": 196608,
+        "before_cvpipelining_allocation_bytes": 0,
+        "before_cvpipelining_allocations_bytes": [],
         "auto_tile_and_bind_subblock_outcome": False,
+        "certificates": [],
+        "unsupported_reasons": ["unsupported-irregular-source-extent"],
     }
-    monkeypatch.setattr(
-        oracle, "has_valid_materialization_bridge", lambda _analysis: True
-    )
-    monkeypatch.setattr(
-        oracle, "has_valid_certificate", lambda _analysis: True
-    )
 
     def run(_compiler, _input, seed, _pipeline_arguments):
-        return {
-            "seed": seed,
-            "status": "success",
-            "overflow_scope": None,
-            "actual_peak_bits": 1024,
-            "auto_tile_and_bind_subblock_outcome": False,
-        }
+        raise AssertionError("deliberate defer must not run PlanMemory")
 
     report = oracle.evaluate(
         manifest, Path("compiler"), [0], False, lambda _case: analysis, run
     )
     assert report["violations"] == []
     assert report["unavailable"] == []
+    assert report["cases"][0]["runs"] == []
+    assert report["cases"][0]["validation_status"] == "deliberate-defer"
 
 
 def test_evaluate_derives_one_consistent_auto_tile_outcome(tmp_path):
@@ -1022,6 +1054,7 @@ def test_evaluate_detects_invalid_lower_bound_and_reject_result(tmp_path):
 
 def test_evaluate_requires_semantic_replay_to_match_real_suffix(tmp_path):
     manifest = oracle.load_manifest(_write_manifest(tmp_path))
+    semantic_arguments = []
 
     def run(_compiler, _input, seed, _pipeline_arguments):
         return {
@@ -1029,14 +1062,18 @@ def test_evaluate_requires_semantic_replay_to_match_real_suffix(tmp_path):
             "actual_peak_bits": 1024, "auto_tile_and_bind_subblock_outcome": False,
         }
 
+    def replay(_model, _input, seed, pipeline_arguments):
+        semantic_arguments.extend(pipeline_arguments)
+        return _semantic_result(seed)
+
     report = oracle.evaluate(
         manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run,
-        Path("semantic-model"),
-        lambda _model, _input, seed, _pipeline_arguments: _semantic_result(seed),
+        Path("semantic-model"), replay,
     )
     assert report["summary"]["semantic_replay_checked"] is True
     assert report["violations"] == []
     assert report["cases"][0]["runs"][0]["semantic_replay"] == _semantic_result(0)
+    assert "--ub-capacity-bits=1572864" in semantic_arguments
 
     mismatch = oracle.evaluate(
         manifest, Path("compiler"), [0], False, lambda _case: _analysis(), run,
@@ -1188,6 +1225,21 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
             "unavailable": 0,
         },
     }
+    report["cases"].append({
+        "name": "irregular-deliberate-defer",
+        "analysis": {
+            "operation_family": "irregular-memory",
+            "decision": "defer",
+            "lower_bound_bytes": 0,
+            "certificates": [],
+            "unsupported_reasons": [
+                "unsupported-irregular-source-extent"
+            ],
+        },
+        "runs": [],
+        "validation_status": "deliberate-defer",
+    })
+    report["summary"]["cases"] = 3
     candidate = oracle.build_profile_candidate(report)
     assert candidate["profiles"][0]["pipeline_identity"]["sha256"] == "identity"
     assert candidate["profiles"][0]["validated_seeds"] == list(range(20))
@@ -1204,6 +1256,39 @@ def test_profile_candidate_records_exact_identity_and_retry(tmp_path):
     }
     false_only_candidate = oracle.build_profile_candidate(false_only_report)
     assert false_only_candidate["profiles"][0]["auto_tile_and_bind_subblock_outcome"] is False
+
+
+def test_profile_candidate_refuses_only_deliberate_defer_cases():
+    report = {
+        "schema": "ttir-ub-oracle-report-v1",
+        "suffix_compiler_sha256": "c" * 64,
+        "semantic_model_sha256": "d" * 64,
+        "cases": [{
+            "name": "irregular",
+            "analysis": {
+                "operation_family": "irregular-memory",
+                "decision": "defer",
+                "lower_bound_bytes": 0,
+                "certificates": [],
+                "unsupported_reasons": [
+                    "unsupported-irregular-source-extent"
+                ],
+            },
+            "runs": [],
+        }],
+        "violations": [],
+        "unavailable": [],
+        "summary": {
+            "cases": 1,
+            "seeds": list(range(20)),
+            "retry_checked": True,
+            "semantic_replay_checked": True,
+            "violations": 0,
+            "unavailable": 0,
+        },
+    }
+    with pytest.raises(oracle.OracleUnavailable, match="only deliberate-defer"):
+        oracle.build_profile_candidate(report)
 
 
 def test_profile_candidate_requires_semantic_replay():

@@ -70,25 +70,32 @@ def test_p4_unsafe_generalization_is_shadow_or_deliberate_defer():
 
 def test_p4_replay_shadow_evidence_is_hash_bound_and_never_promotable():
     evidence = json.loads(P4_EVIDENCE.read_text(encoding="utf-8"))
-    assert evidence["schema"] == "ttir-ub-p4-defer-evidence-v1"
-    for field in (
-        "producer_libtriton_sha256",
-        "consumer_suffix_compiler_sha256",
-        "consumer_semantic_model_sha256",
-    ):
-        value = evidence[field]
-        assert len(value) == 64
-        assert set(value) <= set("0123456789abcdef")
+    assert evidence["schema"] == "ttir-ub-p4-defer-evidence-v2"
+    assert evidence["server_validation"] == "pending-server-unavailable"
+    producer = evidence["producer_libtriton_sha256"]
+    assert len(producer) == 64
+    assert set(producer) <= set("0123456789abcdef")
+    assert evidence["consumer_suffix_compiler_sha256"] is None
+    assert evidence["consumer_semantic_model_sha256"] is None
     assert {case["name"] for case in evidence["cases"]} == {
         "dynamic-cv-mix-dot-exp",
         "irregular-indirect-add",
     }
-    for case in evidence["cases"]:
-        assert case["status"] == "replay-shadow"
+    cases = {case["name"]: case for case in evidence["cases"]}
+    for case in cases.values():
+        assert case["status"] in {"replay-shadow", "deliberate-defer"}
         assert case["promotion_allowed"] is False
         assert case["reason"]
-        assert case["validated_seeds"] == "0..19"
-        assert 0 < case["analyzer_lower_bound_bits"] <= \
-            case["semantic_replay_peak_bits"]
         assert len(case["ttir_sha256"]) == 64
         assert len(case["boundary_sha256"]) == 64
+    dynamic = cases["dynamic-cv-mix-dot-exp"]
+    assert dynamic["validated_seeds"] == [0]
+    assert dynamic["analyzer_lower_bound_bits"] == 4096
+    assert dynamic["analyzer_lower_bound_bits"] == max(
+        dynamic["planmemory_peak_bits_by_scope"].values()
+    )
+    irregular = cases["irregular-indirect-add"]
+    assert irregular["validated_seeds"] == []
+    assert irregular["analyzer_lower_bound_bits"] == 0
+    assert irregular["planmemory_peak_bits_by_scope"] is None
+    assert irregular["reason"] == "unsupported-irregular-source-extent"

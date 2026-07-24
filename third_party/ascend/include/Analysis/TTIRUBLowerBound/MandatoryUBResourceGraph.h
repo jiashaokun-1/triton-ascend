@@ -29,15 +29,17 @@ inline constexpr WitnessId InvalidWitnessId =
 
 enum class ValidityState { Valid, Invalid };
 enum class UBAddressSpace { UB };
+// A UB allocation belongs to one physical execution domain.  AIC and AIV
+// cores have independent UB instances, so resources in different domains
+// must never be added into one coexistence certificate.
+enum class UBExecutionScope { SingleCore, AIC, AIV };
 enum class MaterializationKind {
   GMToUBLoad,
   ViewAlias,
   ReductionScratch,
   ReductionAccumulator,
   DynamicCVFixpipeOutput,
-  DynamicCVVectorOutput,
-  IrregularIndex,
-  IrregularGather
+  DynamicCVVectorOutput
 };
 
 struct ProgramPoint {
@@ -50,6 +52,7 @@ struct MandatoryUBResource {
   int64_t minInstances;
   std::string origin;
   UBAddressSpace addressSpace = UBAddressSpace::UB;
+  UBExecutionScope executionScope = UBExecutionScope::SingleCore;
   MaterializationKind kind = MaterializationKind::GMToUBLoad;
   ProgramPoint birth;
   ProgramPoint lastRequiredUse;
