@@ -237,8 +237,12 @@ ctest --test-dir .build-ttir-ub \
   build 也已成功，但 pinned LLVM 19.1.7 快照缺少官方 `0051` 补丁所需的
   `LinalgExtensions.cpp`，因此不能生成真实 `BiShengIRLinalgDialectExt`。后两个
   组件仍受 source/patch-version incompatibility 阻塞，不能用安装版 BiShengIR 替代。
+  另一个可生成该 target 的旧 Ascend LLVM `2f203398` 已成功构建 suffix，但不能解析
+  当前 P4 boundary 的 `eviction_policy=<EvictFirst>`，因此同样不能用于 same-schema
+  验证。
 - [~] 记录 binaries 和 semantic model 的 SHA256：已记录 `libtriton` 和安装版
-  BiShengIR hash；suffix/model 因未能构建而无有效 hash。
+  BiShengIR hash；旧 LLVM `2f203398` suffix 的 hash 已记录于 validation record，
+  但它不能消费当前 boundary，因而不是有效 same-schema hash；semantic model 仍无有效 hash。
 - [~] 运行完整 C++ GTest 和 pybind/Python focused tests：focused suite 已在 rebuilt
   binary 上 `348 passed`；C++ GTest target 未构建。
 - [ ] Dynamic seeds `0..19`（需要 same-schema suffix oracle）。
