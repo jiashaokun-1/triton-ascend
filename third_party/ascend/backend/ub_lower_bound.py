@@ -118,6 +118,27 @@ def _is_valid_profile_stage(stage):
     if contract_version != "1":
         return False
     parameters = stage["contract_parameters"]
+    alignment_suffix = "+ub-alignment"
+    if contract_id.endswith(alignment_suffix):
+        base_contract_id = contract_id[:-len(alignment_suffix)]
+        if type(parameters) is not dict:
+            return False
+        alignment_bytes = parameters.get("alignment_bytes")
+        if (not base_contract_id or alignment_suffix in base_contract_id
+                or not base_contract_id.startswith(
+                    ("direct-copy-", "binary-add-", "loop-carried-add-",
+                     "reshape-copy-", "reduction-sum-", "dynamic-cv-")
+                )
+                or type(alignment_bytes) is not str
+                or not alignment_bytes.isdecimal()
+                or not 0 < int(alignment_bytes) <= _INT64_MAX):
+            return False
+        base_parameters = dict(parameters)
+        del base_parameters["alignment_bytes"]
+        base_stage = dict(stage)
+        base_stage["contract_id"] = base_contract_id
+        base_stage["contract_parameters"] = base_parameters
+        return _is_valid_profile_stage(base_stage)
     if contract_id == "invalidate-unmodeled-stage":
         return parameters == {}
     if contract_id == "direct-copy-preserve":
@@ -147,6 +168,8 @@ def _is_valid_profile_stage(stage):
         return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS | {"max_tiles"})
     if contract_id == "reduction-sum-extra-buffer":
         return _has_positive_decimal_parameters(parameters, _REDUCTION_PARAMETER_KEYS)
+    if contract_id == "ub-alignment":
+        return False
     if contract_id in {
         "dynamic-cv-source-preserve",
         "dynamic-cv-replay",
@@ -238,20 +261,22 @@ def _is_valid_profile_entry(entry):
         return False
     if not all(_is_valid_profile_stage(stage) for stage in stages):
         return False
-    active_contract_ids = [
-        stage["contract_id"] for stage in stages
+    family_contract_ids = [
+        stage["contract_id"].removesuffix("+ub-alignment")
+        for stage in stages
         if stage["contract_id"].startswith(
             ("direct-copy-", "binary-add-", "loop-carried-add-",
              "reshape-copy-", "reduction-sum-", "dynamic-cv-")
         )
     ]
+    active_contract_ids = family_contract_ids
     if active_contract_ids:
         dynamic_contracts = [
-            contract_id for contract_id in active_contract_ids
+            contract_id for contract_id in family_contract_ids
             if contract_id.startswith("dynamic-cv-")
         ]
         if dynamic_contracts:
-            if (len(dynamic_contracts) != len(active_contract_ids)
+            if (len(dynamic_contracts) != len(family_contract_ids)
                     or relevant_options.get("compile_mode") != "simd"
                     or relevant_options.get("enable_dynamic_cv_pipeline") is not True):
                 return False
@@ -269,7 +294,7 @@ def _is_valid_profile_entry(entry):
         elif has_multibuffer_contract:
             if not effective_multibuffer or any(
                     not contract_id.startswith("loop-carried-add-")
-                    for contract_id in active_contract_ids):
+                    for contract_id in family_contract_ids):
                 return False
         elif effective_multibuffer:
             return False

@@ -60,6 +60,26 @@ module {
 }
 )mlir";
 
+constexpr StringLiteral kAtomicRMW = R"mlir(
+module {
+  tt.func public @atomic_rmw(%ptr: !tt.ptr<i32>, %value: i32) {
+    %old = tt.atomic_rmw add, acq_rel, gpu, %ptr, %value
+      : (!tt.ptr<i32>, i32) -> i32
+    tt.return
+  }
+}
+)mlir";
+
+constexpr StringLiteral kAtomicCAS = R"mlir(
+module {
+  tt.func public @atomic_cas(%ptr: !tt.ptr<i32>, %compare: i32, %value: i32) {
+    %old = tt.atomic_cas acq_rel, gpu, %ptr, %compare, %value
+      : (!tt.ptr<i32>, i32, i32) -> i32
+    tt.return
+  }
+}
+)mlir";
+
 constexpr StringLiteral kBinaryAdd = R"mlir(
 module {
   tt.func public @add(%lhs: !tt.ptr<f32>, %rhs: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
@@ -325,6 +345,50 @@ TEST(MandatoryUBResourceGraph, ResourceInstancesAreMonotonicLowerBounds) {
   EXPECT_TRUE(failed(invalid.solveSingletonLowerBound()));
 }
 
+TEST(MandatoryUBResourceGraph, AlignmentRoundsPayloadUpAndFailsClosed) {
+  MandatoryUBResourceGraph graph;
+  auto id = graph.addResource({"unaligned", 33, 2});
+  ASSERT_TRUE(succeeded(graph.alignResourcePayload(id, 32, "ub-alignment")));
+  EXPECT_EQ(graph.resources()[id].minPayloadBytes, 64);
+  EXPECT_EQ(graph.resources()[id].minInstances, 2);
+  EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 128);
+  EXPECT_EQ(graph.resources()[id].contractTrace,
+            SmallVector<std::string>({"ub-alignment"}));
+
+  MandatoryUBResourceGraph overflow;
+  auto overflowId = overflow.addResource({"overflow", INT64_MAX, 1});
+  EXPECT_TRUE(
+      failed(overflow.alignResourcePayload(overflowId, 32, "ub-alignment")));
+  EXPECT_TRUE(failed(overflow.solveWitnessLowerBound()));
+}
+
+TEST(MandatoryUBResourceGraph,
+     AlignmentRespectsAliasClassesAndDistinctWitnesses) {
+  MandatoryUBResourceGraph aliasGraph;
+  auto source = aliasGraph.addResource({"source", 33, 1});
+  auto view = aliasGraph.addResource({"view", 40, 1});
+  aliasGraph.addMustAlias(source, view);
+  ASSERT_TRUE(
+      succeeded(aliasGraph.alignResourcePayload(source, 32, "alignment")));
+  ASSERT_TRUE(
+      succeeded(aliasGraph.alignResourcePayload(view, 32, "alignment")));
+  EXPECT_EQ(aliasGraph.solveWitnessLowerBound()->bytes, 64);
+
+  MandatoryUBResourceGraph distinctGraph;
+  auto lhs = distinctGraph.addResource({"lhs", 33, 1});
+  auto rhs = distinctGraph.addResource({"rhs", 65, 1});
+  distinctGraph.addMustDistinct(lhs, rhs);
+  distinctGraph.addWitness({lhs, rhs});
+  ASSERT_TRUE(
+      succeeded(distinctGraph.alignResourcePayload(lhs, 32, "alignment")));
+  ASSERT_TRUE(
+      succeeded(distinctGraph.alignResourcePayload(rhs, 32, "alignment")));
+  auto result = distinctGraph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->kind, "witness");
+  EXPECT_EQ(result->bytes, 160);
+}
+
 TEST(MandatoryUBResourceGraph, PairwiseOverlapIsNotAThreeWayWitness) {
   MandatoryUBResourceGraph graph;
   auto a = graph.addResource({"a", 32, 1});
@@ -556,6 +620,58 @@ TEST(UBResourceContract, TransformCanOnlyLowerToProvenMinimum) {
   EXPECT_TRUE(
       succeeded(registry.applyOrInvalidateAll(graph, {.stageName = "tile"})));
   EXPECT_EQ(graph.resources()[id].minPayloadBytes, 131072);
+}
+
+TEST(UBResourceContract, AlignmentRequiresExactResourceCountAndStageOptions) {
+  PipelineStageContext stage{.stageName = "hivm.plan-memory"};
+  stage.options["alignment_bytes"] = "32";
+
+  MandatoryUBResourceGraph graph;
+  auto lhs = graph.addResource({"lhs", 33, 1});
+  auto rhs = graph.addResource({"rhs", 65, 1});
+  graph.addMustDistinct(lhs, rhs);
+  graph.addWitness({lhs, rhs});
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeUBAlignmentContract(stage, 2, 32));
+  EXPECT_TRUE(succeeded(registry.applyOrInvalidateAll(graph, stage)));
+  auto result = graph.solveWitnessLowerBound();
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->bytes, 160);
+  EXPECT_EQ(graph.resources()[lhs].contractTrace,
+            SmallVector<std::string>({"ub-alignment"}));
+  EXPECT_EQ(graph.resources()[rhs].contractTrace,
+            SmallVector<std::string>({"ub-alignment"}));
+
+  MandatoryUBResourceGraph mismatch;
+  mismatch.addResource({"only-one", 33, 1});
+  PipelineContractRegistry mismatchRegistry;
+  mismatchRegistry.addForTesting(makeUBAlignmentContract(stage, 2, 32));
+  EXPECT_TRUE(
+      succeeded(mismatchRegistry.applyOrInvalidateAll(mismatch, stage)));
+  EXPECT_EQ(mismatch.solveSingletonLowerBound()->bytes, 0);
+}
+
+TEST(UBResourceContract,
+     SequentialContractAppliesMaterializationBeforeAlignment) {
+  PipelineStageContext stage{.stageName = "materialize-and-align"};
+  stage.options["pipeline_variant"] = "test";
+  std::vector<std::unique_ptr<UBResourceContract>> contracts;
+  contracts.push_back(makeFixedTileContract(stage.stageName, 2));
+  contracts.push_back(makeUBAlignmentContract(stage, 1, 32));
+
+  MandatoryUBResourceGraph graph;
+  auto resource = graph.addResource({"payload", 65, 1});
+  PipelineContractRegistry registry;
+  registry.addForTesting(makeSequentialContract(
+      "testing-fixed-tile+ub-alignment", "1", stage,
+      std::move(contracts)));
+
+  ASSERT_TRUE(
+      succeeded(registry.applyOrInvalidateAll(graph, stage)));
+  EXPECT_EQ(graph.resources()[resource].minPayloadBytes, 64);
+  EXPECT_EQ(graph.resources()[resource].contractTrace,
+            SmallVector<std::string>(
+                {"testing-fixed-tile", "ub-alignment"}));
 }
 
 MandatoryUBResource directCopyResource(int64_t payloadBytes = 262144) {
@@ -1550,7 +1666,18 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
 }
 
 TEST_F(TTIRUBLowerBoundAnalysisTest,
-       P4OperationFamiliesDeferWithStableNamedReasons) {
+       AtomicRMWAndCASSourceFormsBothDeferWithoutCertificates) {
+  for (StringRef source : {StringRef(kAtomicRMW), StringRef(kAtomicCAS)}) {
+    TTIRUBAnalysisResult result = analyze(source, options());
+    EXPECT_EQ(result.decision, TTIRUBDecision::Defer);
+    EXPECT_EQ(result.lowerBoundBytes, 0);
+    EXPECT_TRUE(result.certificates.empty());
+    EXPECT_TRUE(hasReason(result, "unsupported-op-atomic"));
+  }
+}
+
+TEST_F(TTIRUBLowerBoundAnalysisTest,
+       UnsupportedOperationFamiliesDeferWithStableNamedReasons) {
   const std::pair<StringRef, StringRef> cases[] = {
       {"tt.descriptor_gather", "unsupported-op-descriptor-memory"},
       {"tt.gather", "unsupported-op-irregular-memory"},
@@ -1558,6 +1685,9 @@ TEST_F(TTIRUBLowerBoundAnalysisTest,
       {"tt.scan", "unsupported-op-scan"},
       {"tt.cat", "unsupported-op-shape-construction"},
       {"tt.atomic_rmw", "unsupported-op-atomic"},
+      {"tt.dot_scaled", "unsupported-dot-scaled-requires-full-boundary"},
+      {"ttascend.custom_op", "unsupported-op-custom"},
+      {"hivm.custom_op", "unsupported-op-custom"},
       {"tt.print", "unsupported-op-launch-or-diagnostics"},
       {"scf.while", "unsupported-op-control-flow"},
   };

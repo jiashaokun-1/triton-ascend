@@ -120,6 +120,27 @@
       "operations": ["DynamicCVPipeline", "PlanComputeBlock", "SplitDataflow", "SeparateMemoryFromCompute", "AllocMultiCache", "AddControlFlowCondition", "SplitMix"],
       "status": "replay-shadow",
       "evidence": "real full-compiler MIX dot-exp fixture has an executable source-preserve -> dynamic-cv-replay -> result-preserve chain; execution-scope-aware seed-0 PlanMemory reports 4096 bits independently for AIC and AIV, while full seeds/retry remain pending"
+    },
+    {
+      "family": "dot-general",
+      "phase": "P5",
+      "operations": ["tt.dot", "tt.dot_scaled"],
+      "status": "deliberate-defer",
+      "evidence": "A/B and accumulator belong to L1/L0C in the existing real MIX boundary and cannot be counted as UB; plain dot returns unsupported-dot-requires-full-boundary and dot_scaled returns unsupported-dot-scaled-requires-full-boundary until a full-compiler boundary proves a mandatory UB Fixpipe allocation"
+    },
+    {
+      "family": "atomic",
+      "phase": "P5",
+      "operations": ["tt.atomic_rmw", "tt.atomic_cas"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-atomic"
+    },
+    {
+      "family": "custom-ops",
+      "phase": "P5",
+      "operations": ["ttascend.*", "hivm.custom_*"],
+      "status": "deliberate-defer",
+      "evidence": "unsupported-op-custom; every custom op requires an explicit materialization contract"
     }
   ],
   "contracts": [
@@ -159,11 +180,15 @@
     {"name": "DistinctAllocationContract", "phase": "P2", "status": "implemented-slice"},
     {"name": "LifetimeContract", "phase": "P3", "status": "implemented-slice"},
     {"name": "MultiBufferContract", "phase": "P3", "status": "implemented-factor-2"},
+    {"name": "DotMaterializationContract", "phase": "P5", "status": "deliberate-defer"},
+    {"name": "AtomicMemoryContract", "phase": "P5", "status": "deliberate-defer"},
+    {"name": "SequentialResourceContract", "phase": "P5", "status": "implemented"},
+    {"name": "AlignmentContract", "phase": "P5", "status": "candidate-primitive"},
     {"name": "PlanMemoryInterpretationContract", "phase": "P0", "status": "implemented"}
   ],
-  "out_of_scope_after_p4": [
-    "DotMaterializationContract",
-    "AtomicMemoryContract",
-    "AlignmentContract"
+  "p5_server_gates": [
+    "plain-dot-full-compiler-boundary",
+    "alignment-planmemory-ledger-seeds-and-retry",
+    "atomic-full-compiler-boundary"
   ]
 }

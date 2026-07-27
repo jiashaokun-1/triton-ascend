@@ -15,6 +15,10 @@ EXPECTED_ASCENDNPU_IR_REVISION = (
     "de76a453a7e22afa08a8bf00ad059d6afddc43e6"
 )
 PATCH_NAME = "0001-feat-port-same-schema-CVPipeline-suffix-oracle.patch"
+COMPAT_PATCH_NAME = (
+    "0002-fix-disable-bishengir-python-bindings-for-suffix-oracle.patch"
+)
+ORACLE_CODEGEN_BACKEND = "ascend"
 BASE_FILE_SHA256 = {
     "bishengir/include/bishengir/Dialect/HIVM/Transforms/Passes.td":
         "52935a51153ba5ee35ac1bc24836dfd559fb20273569bf605940fe39b07969e8",
@@ -54,6 +58,13 @@ PATCHED_FILE_SHA256 = {
     "bishengir-cvpipeline-suffix-compile.cpp":
         "dbb7016da94efeeba0a23a668ddb073bed2e0fcac7bc4cbec852eedb2adf4840",
 }
+
+COMPAT_BASE_FILE_SHA256 = (
+    "eb29b6bc0fad418d73c35792f9992eaf3b6e98802e35b864ca34eb09f282a571"
+)
+COMPAT_PATCHED_FILE_SHA256 = (
+    "3351c40eb65490f4959d165c63a0ff67a23b7d8fe79c07d12087801aa27c399f"
+)
 
 
 def _run(
@@ -126,6 +137,26 @@ def patch_state(source: Path, patch: Path) -> str:
     return state
 
 
+def compat_patch_state(source: Path, patch: Path) -> str:
+    digest = _file_sha256(source / "CMakeLists.txt")
+    if digest == COMPAT_BASE_FILE_SHA256:
+        state = "ready"
+    elif digest == COMPAT_PATCHED_FILE_SHA256:
+        state = "applied"
+    else:
+        raise RuntimeError("same-schema suffix compatibility source fingerprint mismatch")
+    arguments = ["git", "apply", "--ignore-space-change"]
+    if state == "applied":
+        arguments.append("--reverse")
+    result = _run([*arguments, "--check", str(patch)], check=False, cwd=source)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"same-schema suffix compatibility patch state {state!r} did not "
+            f"pass git apply --check:\n{result.stderr.strip()}"
+        )
+    return state
+
+
 def _require_clean_source(source: Path) -> None:
     if source_revision(source) is None:
         return
@@ -136,6 +167,30 @@ def _require_clean_source(source: Path) -> None:
         raise RuntimeError(
             "AscendNPU-IR source is dirty before applying the oracle patch"
         )
+
+
+def _configure_command(
+    triton_root: Path, build_dir: Path, cmake: str, cmake_args: list[str]
+) -> list[str]:
+    """Configure the top-level build with the Ascend plugin enabled.
+
+    The suffix compiler lives below ``third_party/ascend``.  Configuring the
+    top-level project without this codegen backend succeeds but silently omits
+    the oracle target, so this argument is part of the oracle's identity.
+    """
+    return [
+        cmake,
+        "-S",
+        str(triton_root),
+        "-B",
+        str(build_dir),
+        f"-DTRITON_CODEGEN_BACKENDS={ORACLE_CODEGEN_BACKEND}",
+        "-DTRITON_ASCEND_BUILD_BISHENGIR_ORACLE_TOOLS=ON",
+        "-DTRITON_BUILD_UT=OFF",
+        "-DTRITON_BUILD_PYTHON_MODULE=OFF",
+        "-DBISHENGIR_BUILD_PYTHON_BINDINGS=OFF",
+        *cmake_args,
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=tool.parent / "patches" / PATCH_NAME,
     )
+    parser.add_argument(
+        "--compat-patch",
+        type=Path,
+        default=tool.parent / "patches" / COMPAT_PATCH_NAME,
+    )
     parser.add_argument("--apply-patch", action="store_true")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--cmake", default="cmake")
@@ -166,10 +226,13 @@ def main(argv: list[str] | None = None) -> int:
 
     source = arguments.source.resolve()
     patch = arguments.patch.resolve()
+    compat_patch = arguments.compat_patch.resolve()
     if not (source / "CMakeLists.txt").is_file():
         parser.error(f"invalid AscendNPU-IR source: {source}")
     if not patch.is_file():
         parser.error(f"missing same-schema suffix patch: {patch}")
+    if not compat_patch.is_file():
+        parser.error(f"missing same-schema suffix compatibility patch: {compat_patch}")
     if arguments.jobs <= 0:
         parser.error("--jobs must be positive")
 
@@ -186,24 +249,23 @@ def main(argv: list[str] | None = None) -> int:
         _run(["git", "apply", str(patch)], cwd=source)
         state = patch_state(source, patch)
 
+    compat_state = compat_patch_state(source, compat_patch)
+    if compat_state == "ready" and arguments.apply_patch:
+        _require_clean_source(source)
+        _run(["git", "apply", "--ignore-space-change", str(compat_patch)],
+             cwd=source)
+        compat_state = compat_patch_state(source, compat_patch)
+
     binary = None
     if arguments.build_dir is not None:
-        if state != "applied":
+        if state != "applied" or compat_state != "applied":
             raise RuntimeError(
-                "--build-dir requires an applied patch; pass --apply-patch"
+                "--build-dir requires applied patches; pass --apply-patch"
             )
         build_dir = arguments.build_dir.resolve()
-        _run([
-            arguments.cmake,
-            "-S",
-            str(triton_root),
-            "-B",
-            str(build_dir),
-            "-DTRITON_ASCEND_BUILD_BISHENGIR_ORACLE_TOOLS=ON",
-            "-DTRITON_BUILD_UT=OFF",
-            "-DTRITON_BUILD_PYTHON_MODULE=OFF",
-            *arguments.cmake_arg,
-        ])
+        _run(_configure_command(
+            triton_root, build_dir, arguments.cmake, arguments.cmake_arg
+        ))
         _run([
             arguments.cmake,
             "--build",
@@ -224,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         "revision": revision or f"snapshot:{EXPECTED_ASCENDNPU_IR_REVISION}",
         "patch": str(patch),
         "patch_state": state,
+        "compat_patch": str(compat_patch),
+        "compat_patch_state": compat_state,
         "binary": str(binary) if binary is not None else None,
     }, sort_keys=True))
     return 0

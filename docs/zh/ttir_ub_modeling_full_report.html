@@ -525,11 +525,11 @@ R0.trace = ["ttir-direct-load-v1"]</div>
         <div class="contract"><code>InPlaceAliasContract</code><span>建立 mustAlias/mayAlias，禁止把可能 inplace 的输出作为独立资源相加；reshape-copy 候选链已实现单 allocation 证明。</span><span class="status now">P2 slice implemented</span></div>
         <div class="contract"><code>DistinctAllocationContract</code><span>只有证明不可共享的 allocations 才建立 mustDistinct；binary-add 与 loop-carried-add 候选链已实现双 allocation 证明，reduction-sum 候选链由 suffix extra-buffer 合同证明 input/scratch/accumulator 三者 pairwise mustDistinct。</span><span class="status now">P2/P3 slices implemented</span></div>
         <div class="contract"><code>LifetimeContract</code><span>维护 birth、lastRequiredUse、alive-at 与 CoexistenceWitness；binary-add 要求两个不同 birth、同一 lastRequiredUse；reduction-sum 要求 input/scratch/accumulator 在 reduce 点共存；loop-carried-add 要求 accumulator 跨越整个 loop，iteration input 在 loop program point 产生并消费。</span><span class="status now">Binary/reduction/loop slices implemented</span></div>
-        <div class="contract"><code>AlignmentContract</code><span>证明 planner 强制 alignment 的最小 padding；首版可忽略以保持更小下界。</span><span class="status todo">P5</span></div>
+        <div class="contract"><code>AlignmentContract</code><span>逐 allocation 对 <span class="mono">constBits</span> 做 checked round-up；通过 <span class="mono">&lt;family-contract&gt;+ub-alignment</span> 在同一真实 stage 内排在 materialization 之后。</span><span class="status now">P5 candidate composite</span></div>
         <div class="contract"><code>MultiBufferContract</code><span>最小实例数、实例独立性和同一 witness 下的共存；当前 <span class="mono">loop-carried-add-multibuffer@1</span> 只接受 loop-local step load 的固定 factor=2，并把该资源的 <span class="mono">minInstances</span> 从 1 提升为 2。</span><span class="status now">P3 factor=2 slice implemented</span></div>
         <div class="contract"><code>PlanMemoryInterpretationContract</code><span>定义证书中的 UB address space、capacity 与 oracle 输出如何对应。</span><span class="status now">Implemented</span></div>
 
-        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 13 个 versioned contract：<span class="mono">invalidate-unmodeled-stage@1</span>；direct-copy、binary-add、reshape-copy、loop-carried-add 各自的 <span class="mono">preserve@1</span> / <span class="mono">max-tiles@1</span>；<span class="mono">loop-carried-add-multibuffer@1</span>；以及 <span class="mono">reduction-sum-preserve@1</span>、<span class="mono">reduction-sum-max-tiles@1</span>、<span class="mono">reduction-sum-extra-buffer@1</span>。它们严格核对资源数量、source facts、alias/lifetime、输入/临时 payload、实例数和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑，正常编译入口会按未知 profile 安全 defer。packaged profile 仍为空，经 oracle 认证后自动安装的合同仍为 0。</div>
+        <div class="callout amber"><strong>当前合同状态：</strong>production loader 已认识 direct-copy、binary-add、reshape-copy、loop-carried-add、reduction-sum、Dynamic CV 的 versioned leaf contracts，以及 <span class="mono">&lt;family-contract&gt;+ub-alignment@1</span> composite。composite 只占一个真实 stage binding，但证书 trace 会保留 materialization 与 alignment 两个有序 leaf ID；standalone alignment profile 被拒绝。所有 active contract 都严格核对资源数量、source facts、alias/lifetime、输入/临时 payload、实例数和 stage options；未认证时只能由离线 oracle 的 candidate-only API 试跑。packaged profile 仍为空。</div>
       </section>
 
       <section class="sheet" id="solver">
@@ -618,9 +618,10 @@ R0.trace = ["ttir-direct-load-v1"]</div>
             <p class="small"><strong>验收状态：</strong>服务器失联前已完成 Dynamic seed 0 的真实 full PlanMemory：AIC 与 AIV scope peak 均为 4096 bits，与 4096-bit analyzer 下界一致；irregular 的真实 suffix 明确因动态 source buffer 无法取得静态 shape 而不可执行，正好验证具名 defer 的必要性。默认 memory-space 兼容补丁、同 schema suffix 回移植、full-compiler in-process boundary dump 和 runtime capacity 补丁均已实现并通过本地 <span class="mono">git apply --check</span>。服务器恢复后只剩 rebuilt binary hashes、seeds 0..19、retry 与 exact semantic replay 的最终门禁；完成前不会 promotion。</p>
           </div>
           <div class="phase">
-            <h3>P5 · Dot、alignment 与长尾</h3>
-            <p>明确 Cube 资源非目标边界；只在 UB/AIV 部分有完备合同后支持 dot；补 alignment、atomic、custom ops。</p>
-            <p class="small"><strong>验收：</strong>各 operation family 均有 coverage matrix：supported / deliberate-defer / unsupported-reason。</p>
+            <h3>P5 · Dot、alignment 与长尾 <span class="tag proposed">In progress · fail closed</span></h3>
+            <p>已从真实 MIX boundary 明确 Cube A/B 位于 L1、accumulator 位于 L0C，不能计入 UB。plain dot 在取得 full-compiler boundary 前稳定返回 <span class="mono">unsupported-dot-requires-full-boundary</span>；atomic 与未注册 Ascend custom op 分别返回 <span class="mono">unsupported-op-atomic</span>、<span class="mono">unsupported-op-custom</span>，不会由 generic Preserve 静默放行。</p>
+            <p>Alignment 已实现为 graph-level checked transfer：每个资源的 payload 按精确 alignment 独立向上取整，然后再按 mustAlias class 折叠，并对同 witness 的 mustDistinct allocations 求和。<span class="mono">SequentialContract</span> 让同一真实 stage 使用 <span class="mono">&lt;family-contract&gt;+ub-alignment</span>，严格先 materialization 后 alignment；profile loader、C++ binding 和 oracle 都拒绝 standalone alignment。</p>
+            <p class="small"><strong>本地已完成：</strong>PlanMemory 源码确认 <span class="mono">alignedConstBits</span> 是逐 allocation size rounding；offset 由 aligned extent 排布，scope capacity 只是上限而不是额外 reservation。剩余门禁只是在具体 family 的真实 ledger 上确认 alignment 参数，并完成 20 seeds + retry。general dot、atomic 的正向支持同样等待服务器 boundary 和 exact replay；此前保持零证书具名 defer。</p>
           </div>
           <div class="phase">
             <h3>Rollout · off → shadow → enforce</h3>

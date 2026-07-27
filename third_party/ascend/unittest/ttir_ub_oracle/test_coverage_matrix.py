@@ -4,7 +4,7 @@ from pathlib import Path
 
 MATRIX = Path(__file__).with_name("coverage_matrix.json")
 P4_EVIDENCE = Path(__file__).with_name("p4_defer_evidence.json")
-PHASES = {"P0", "P1", "P2", "P3", "P4"}
+PHASES = {"P0", "P1", "P2", "P3", "P4", "P5"}
 OPERATION_STATUSES = {
     "candidate-supported",
     "deliberate-defer",
@@ -19,6 +19,7 @@ CONTRACT_STATUSES = {
     "deliberate-defer",
     "replay-shadow",
     "oracle-validated",
+    "candidate-primitive",
 }
 
 
@@ -66,6 +67,37 @@ def test_p4_unsafe_generalization_is_shadow_or_deliberate_defer():
     for item in matrix["contracts"]:
         if item["phase"] == "P4":
             assert item["status"] in {"replay-shadow", "deliberate-defer"}
+
+
+def test_p5_is_explicitly_fail_closed_until_server_oracle_gates_pass():
+    matrix = load_matrix()
+    families = {
+        item["family"]: item for item in matrix["operation_families"]
+        if item["phase"] == "P5"
+    }
+    assert {"dot-general", "atomic", "custom-ops"} <= set(families)
+    assert {
+        item["status"] for item in families.values()
+    } == {"deliberate-defer"}
+    assert "unsupported-dot-requires-full-boundary" in \
+        families["dot-general"]["evidence"]
+    assert "unsupported-dot-scaled-requires-full-boundary" in \
+        families["dot-general"]["evidence"]
+    assert families["atomic"]["evidence"] == "unsupported-op-atomic"
+    assert "unsupported-op-custom" in families["custom-ops"]["evidence"]
+    contracts = {
+        item["name"]: item for item in matrix["contracts"]
+        if item["phase"] == "P5"
+    }
+    assert contracts["DotMaterializationContract"]["status"] == "deliberate-defer"
+    assert contracts["AtomicMemoryContract"]["status"] == "deliberate-defer"
+    assert contracts["SequentialResourceContract"]["status"] == "implemented"
+    assert contracts["AlignmentContract"]["status"] == "candidate-primitive"
+    assert set(matrix["p5_server_gates"]) == {
+        "plain-dot-full-compiler-boundary",
+        "alignment-planmemory-ledger-seeds-and-retry",
+        "atomic-full-compiler-boundary",
+    }
 
 
 def test_p4_replay_shadow_evidence_is_hash_bound_and_never_promotable():

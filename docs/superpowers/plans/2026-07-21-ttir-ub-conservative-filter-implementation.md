@@ -1,965 +1,461 @@
-# TTIR UB Conservative Filter Implementation Plan
+# TTIR UB Multi-Resource Conservative Filter Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+日期：2026-07-21
 
-**Goal:** Build a zero-false-reject TTIR UB lower-bound analyzer that filters an autotune config only when a versioned proof certificate shows its mandatory UB use exceeds the target capacity.
+修订：2026-07-24
 
-**Architecture:** Canonicalized per-config TTIR is converted into a `MandatoryUBResourceGraph` (MURG). A versioned `UBResourceContract` chain validates or invalidates every resource across the real lowering pipeline; Python applies `off/shadow/enforce` policy and the Ascend autotuner discards only `UBLowerBoundOverflow` configs.
+基准分支：`codex/ttir-ub-conservative-filter`
 
-**Tech Stack:** C++17, LLVM/MLIR, Triton TTIR, pybind11, Python 3, pytest, GoogleTest, CMake/Ninja, BiShengIR suffix compiler and PlanMemory oracle.
+审计基线：`2782c69aabde56f73222ed3c78d2019623250787`
 
-## Global Constraints
+## 0. 计划目标与状态约定
 
-- Correctness invariant: `lower_bound_bytes <= actual PlanMemory UB peak bytes` for every supported config.
-- Hard rejection condition: `decision == "reject"` and `lower_bound_bytes > capacity_bytes`.
-- Unknown target, unknown pass, unmatched pipeline identity, unsupported TTIR or analyzer error must return `defer`.
-- The production contract profile list starts empty; an identity enters it only after the real oracle reports zero violations for seeds `0..19` and retry mode.
-- `off` is the default and must preserve current compilation behavior.
-- V1 enables singleton resources only; MURG coexistence data structures are tested but multi-resource summation remains disabled in production.
-- V1 counts raw payload bytes with `minInstances=1`; alignment and multi-buffer increases are not added.
-- The probabilistic AST model must never feed the hard-rejection decision.
-- Do not modify or commit unrelated files. Every commit uses DCO: `git commit -s`.
-- Before compiling, initialize this worktree's submodules with `git submodule update --init --recursive` and create a build environment in which `python -c 'import triton'` succeeds.
-- Configure unit-test builds at `.build-ttir-ub` with `TRITON_BUILD_UT=ON`; all commands below run from the worktree root.
+本计划取代旧的 singleton-first 8-task 清单。新计划以多资源 MURG、
+`CoexistenceWitness` 和 execution scope 为主；singleton 仅是退化证书。
 
----
+状态：
 
-## File Map
+- `[x]`：代码、测试和所需证据已完成；
+- `[ ]`：尚未完成；
+- `[~]`：代码已完成，但缺目标 CANN/PlanMemory 最终门禁；
+- `DEFER`：有意不支持，并已有结构化 reason；
+- `ROLLOUT`：实现完成但尚未安装 production profile。
 
-New C++ analysis files:
+正确性门禁：
 
 ```text
-third_party/ascend/include/Analysis/TTIRUBLowerBound/
-  MandatoryUBResourceGraph.h       graph data and lower-bound solver
-  UBResourceContract.h             stage contract interface and pipeline identity
-  TTIRUBLowerBound.h               public analyzer/result API
-
-third_party/ascend/lib/Analysis/TTIRUBLowerBound/
-  MandatoryUBResourceGraph.cpp
-  UBResourceContract.cpp
-  DirectTensorLoadMaterialization.cpp
-  TTIRUBLowerBound.cpp
-  CMakeLists.txt
+per-scope lower bound <= per-scope actual PlanMemory peak
+reject iff proven lower bound > trusted allocator capacity
+unknown / mismatch / error / malformed graph -> defer
 ```
 
-New Python and binding files:
+production profile 必须保持空，除非同一 binary identity 的 seeds `0..19`、retry、
+full compiler、PlanMemory 和 exact semantic replay 全部通过且经人工审核。
 
-```text
-third_party/ascend/ttir_ub_lower_bound_bindings.cc
-third_party/ascend/backend/ub_lower_bound.py
-third_party/ascend/backend/errors.py
-third_party/ascend/backend/ub_contract_profiles.json
-```
+## 1. 当前总体进度
 
-New tests and tools:
+| 阶段 | 状态 | 完成边界 |
+|---|---|---|
+| P0 基础链路 | 完成 | MURG、contract registry、identity、policy、autotune、oracle |
+| P1 direct memory | 完成切片 | direct-copy，candidate 未安装 |
+| P2 elementwise/view | 完成切片 | binary-add、reshape-copy，多资源/alias 证书 |
+| P3 reduction/loop/multibuffer | 完成切片 | sum、loop-carried-add、factor=2 |
+| P4 Dynamic CV/MIX/irregular | 本地完成，服务器门禁待办 | dot→exp 分 scope；irregular 具名 defer |
+| P5 dot/alignment/long-tail | 本地部分完成 | Alignment candidate primitive；general dot/atomic/custom fail-closed |
+| Rollout | 未完成 | profile 为空，尚未 CI shadow 和 enforce 灰度 |
 
-```text
-third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp
-third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py
-third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py
-python/test/unit/runtime/test_async_compile_context.py
-third_party/ascend/tools/ttir_ub_oracle.py
-third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py
-third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json
-```
+## 2. P0：多资源基础设施
 
-Existing integration files:
+### 2.1 MURG 与安全求解
 
-```text
-third_party/ascend/include/CMakeLists.txt
-third_party/ascend/lib/CMakeLists.txt
-third_party/ascend/CMakeLists.txt
-third_party/ascend/triton_ascend.cc
-third_party/ascend/backend/compiler.py
-third_party/ascend/backend/runtime/utils.py
-third_party/ascend/backend/runtime/autotuner.py
-python/triton/compiler/compiler.py
-python/triton/runtime/_async_compile.py
-third_party/ascend/unittest/CMakeLists.txt
-```
+- [x] `MandatoryUBResource` 支持 payload、instances、origin、lifetime、trace。
+- [x] 支持 `mayAlias`、`mustAlias`、`mustDistinct`。
+- [x] 支持显式 `CoexistenceWitness`。
+- [x] `mustAlias` 使用 equivalence class 去重。
+- [x] witness 只有 pairwise `mustDistinct` 才允许求和。
+- [x] `minPayloadBytes * minInstances` 使用 checked arithmetic。
+- [x] stable resource/witness ID overflow fail closed。
+- [x] malformed relation、重复 ID、关系冲突 fail closed。
+- [x] singleton 作为 witness 不成立时的安全退化证书。
+- [x] `UBExecutionScope` 支持 `SingleCore/AIC/AIV`。
+- [x] 跨 scope alias/relation/witness fail closed。
 
-### Task 1: Mandatory UB Resource Graph and safe solver
-
-**Files:**
-- Create: `third_party/ascend/include/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h`
-- Create: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.cpp`
-- Create: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/CMakeLists.txt`
-- Modify: `third_party/ascend/lib/CMakeLists.txt`
-- Create: `third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp`
-- Modify: `third_party/ascend/unittest/CMakeLists.txt`
-
-**Interfaces:**
-- Produces: `MandatoryUBResourceGraph::addResource`, `addMayAlias`, `addMustAlias`, `addMustDistinct`, `addWitness`, `invalidate`, and `solveSingletonLowerBound`.
-- Produces: `MandatoryUBResource`, `CoexistenceWitness`, `LowerBoundCertificate`, `ValidityState`, and stable numeric IDs.
-
-- [ ] **Step 1: Write graph tests before the implementation**
-
-Add tests with these exact cases:
-
-```cpp
-TEST(MandatoryUBResourceGraph, SingletonUsesLargestMandatoryResource) {
-  MandatoryUBResourceGraph graph;
-  graph.addResource({"load0", 64 * 1024, 1});
-  graph.addResource({"load1", 192 * 1024 + 4, 1});
-  auto result = graph.solveSingletonLowerBound();
-  ASSERT_TRUE(succeeded(result));
-  EXPECT_EQ(result->bytes, 192 * 1024 + 4);
-  EXPECT_EQ(result->resourceIds.size(), 1u);
-}
-
-TEST(MandatoryUBResourceGraph, InvalidResourceCannotContribute) {
-  MandatoryUBResourceGraph graph;
-  auto id = graph.addResource({"load0", 256 * 1024, 1});
-  graph.invalidate(id, "unknown-stage");
-  auto result = graph.solveSingletonLowerBound();
-  ASSERT_TRUE(succeeded(result));
-  EXPECT_EQ(result->bytes, 0);
-}
-
-TEST(MandatoryUBResourceGraph, ArithmeticOverflowFailsClosed) {
-  MandatoryUBResourceGraph graph;
-  graph.addResource({"load0", INT64_MAX, 2});
-  EXPECT_TRUE(failed(graph.solveSingletonLowerBound()));
-}
-
-TEST(MandatoryUBResourceGraph, PairwiseOverlapIsNotAThreeWayWitness) {
-  MandatoryUBResourceGraph graph;
-  auto a = graph.addResource({"a", 32, 1});
-  auto b = graph.addResource({"b", 64, 1});
-  auto c = graph.addResource({"c", 128, 1});
-  graph.addMustDistinct(a, b);
-  graph.addMustDistinct(b, c);
-  graph.addMustDistinct(a, c);
-  graph.addWitness({a, b});
-  graph.addWitness({b, c});
-  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 192);
-}
-
-TEST(MandatoryUBResourceGraph, PossibleAliasCannotBeSummed) {
-  MandatoryUBResourceGraph graph;
-  auto a = graph.addResource({"a", 64, 1});
-  auto b = graph.addResource({"b", 128, 1});
-  graph.addMayAlias(a, b);
-  graph.addWitness({a, b});
-  EXPECT_EQ(graph.solveWitnessLowerBound()->bytes, 128);
-}
-```
-
-- [ ] **Step 2: Run the test target and confirm it fails to compile**
-
-Run:
+验收测试：
 
 ```bash
 cmake --build .build-ttir-ub --target TestAscendTTIRUBLowerBound -j8
+ctest --test-dir .build-ttir-ub \
+  -R TestAscendTTIRUBLowerBound --output-on-failure
 ```
 
-Expected: compilation fails because `MandatoryUBResourceGraph.h` and its types do not exist.
+本地限制：当前 worktree 的完整 GTest link 受外部 MLIR/Triton revision mismatch 阻塞；
+修改过的 UB C++ objects、GTest object 和 pybind object 已独立编译通过。最终 link/test
+放入服务器门禁。
 
-- [ ] **Step 3: Implement graph storage and checked arithmetic**
+### 2.2 Contract registry 与 capacity
 
-Use this public shape; keep MLIR operations out of this file so graph tests remain lightweight:
+- [x] 精确 profile identity 和 ordered stage binding。
+- [x] 每个 stage 必须恰好命中一个 versioned contract。
+- [x] 未知 stage 使用 Invalidate，不默认 Preserve。
+- [x] Preserve/Transform/Invalidate/InternalError 语义。
+- [x] contract 参数漂移和 stage 顺序漂移 fail closed。
+- [x] C++ capacity 是单一来源，Python runtime 使用 binding。
+- [x] 未知 target 返回 `None/defer`。
+- [x] 910_95/950 使用真实 PlanMemory allocator threshold 192 KiB。
+- [x] packaged profile 初始并继续保持为空。
+- [x] 无 `allow_unvalidated` 或概率拒绝入口。
 
-```cpp
-namespace mlir::triton::ascend::ub {
-using ResourceId = uint32_t;
-using WitnessId = uint32_t;
+### 2.3 Python policy、compiler 和 autotune
 
-enum class ValidityState { Valid, Invalid };
-enum class UBAddressSpace { UB };
-enum class MaterializationKind { GMToUBLoad };
+- [x] `off/shadow/enforce` option 校验，默认 `off`。
+- [x] `off` 不构造 identity、不调用 analyzer。
+- [x] policy 位于 canonical TTIR 后、未来 lowering 前。
+- [x] `UBLowerBoundOverflow` 可 pickle，并穿过 compiler wrapper。
+- [x] serial/parallel autotune 捕获资源异常并丢弃对应 config。
+- [x] `ContextVar` 传入异步 worker。
+- [x] `UBFilterStats` 提供 analyzed/rejected/deferred/passed-to-backend。
+- [x] debug dump 保存完整 JSON；普通 metadata 保持紧凑。
+- [x] Python 二次验证 capacity、identity、schema 和 `LB > capacity`。
 
-struct ProgramPoint {
-  uint64_t ordinal = 0;
-};
+## 3. PipelineIdentity
 
-struct MandatoryUBResource {
-  std::string debugName;
-  int64_t minPayloadBytes;
-  int64_t minInstances;
-  std::string origin;
-  UBAddressSpace addressSpace = UBAddressSpace::UB;
-  MaterializationKind kind = MaterializationKind::GMToUBLoad;
-  ProgramPoint birth;
-  ProgramPoint lastRequiredUse;
-  ValidityState validity = ValidityState::Valid;
-  SmallVector<std::string> contractTrace;
-  std::string invalidReason;
-};
+- [x] 绑定 normalized stage order。
+- [x] 绑定 canonical TTIR SHA256。
+- [x] 绑定 target、compile mode、core kind。
+- [x] 绑定完整 UB-affecting options closed golden。
+- [x] 绑定 compiler kind 和 content hash。
+- [x] 绑定 CANN/BiSheng、Triton/Ascend、libdevice。
+- [x] 绑定会改变 lowering 的 environment switches。
+- [x] 任一 forwarded BiSheng flag 未进入 identity 时测试失败。
+- [x] caller 不能通过自带 profile 或 identity 启用 rejection。
 
-struct CoexistenceWitness {
-  SmallVector<ResourceId> resources;
-  SmallVector<std::string> contractTrace;
-};
+新增 option/pass 时必须同时：
 
-struct LowerBoundCertificate {
-  int64_t bytes = 0;
-  SmallVector<ResourceId> resourceIds;
-  std::string kind;
-};
+1. 更新 `UB_AFFECTING_OPTIONS`；
+2. 更新 forwarded flags closed golden；
+3. 更新 identity 测试；
+4. 使旧 profile 不再命中。
 
-class MandatoryUBResourceGraph {
-public:
-  ResourceId addResource(MandatoryUBResource resource);
-  void addMayAlias(ResourceId lhs, ResourceId rhs);
-  void addMustAlias(ResourceId lhs, ResourceId rhs);
-  void addMustDistinct(ResourceId lhs, ResourceId rhs);
-  WitnessId addWitness(CoexistenceWitness witness);
-  void invalidate(ResourceId id, StringRef reason);
-  FailureOr<LowerBoundCertificate> solveSingletonLowerBound() const;
-  FailureOr<LowerBoundCertificate> solveWitnessLowerBound() const;
-  ArrayRef<MandatoryUBResource> resources() const;
-};
-}
+## 4. P1：Direct memory 多阶段闭环
+
+### 4.1 已完成
+
+- [x] strict contiguous `load → store` SSA matcher。
+- [x] static ranked shape 和 element width checked payload。
+- [x] mask、dynamic、descriptor、非连续 pointer、额外 use 具名 defer。
+- [x] source resource 保存 elements/bit-width/consumer facts。
+- [x] `direct-copy-preserve@1`。
+- [x] `direct-copy-max-tiles@1`。
+- [x] before-CVPipelining allocation bridge。
+- [x] PlanMemory parser、seed/retry runner、candidate generator。
+- [x] candidate 只生成不自动安装。
+
+### 4.2 Rollout 状态
+
+- [x] historical CANN seeds 0..19 + retry：zero violation/unavailable。
+- [ ] production profile 人工审核与安装。`ROLLOUT`
+
+安装前必须确认 candidate identity 与同一 binaries 的 shadow metadata 完全一致。
+
+## 5. P2：Elementwise、view、alias 与 coexistence
+
+### 5.1 Binary add
+
+- [x] 严格匹配 `load(lhs) + load(rhs) → addf → store`。
+- [x] 建立 lhs/rhs 两个 resource。
+- [x] source 阶段为 pairwise `mayAlias`。
+- [x] 建立同 program point witness。
+- [x] materialization contract 验证两个 allocation 后精化为 `mustDistinct`。
+- [x] witness certificate 对两个资源求和。
+- [x] mayAlias、不同 witness、缺失 distinct 都不能求和。
+- [x] full compiler、PlanMemory、semantic replay 历史门禁完成。
+
+### 5.2 Reshape copy
+
+- [x] 严格匹配受限 rank-1→rank-2→rank-1 inverse reshape。
+- [x] 建立 load 和 logical view 两个 resource。
+- [x] materialization contract 验证单 allocation 后精化为 `mustAlias`。
+- [x] alias class 只计一次，禁止 view 重复计数。
+- [x] broadcast/expand_dims/bitcast 保持 operation-specific defer。
+- [x] full compiler、PlanMemory、semantic replay 历史门禁完成。
+
+### 5.3 Rollout 状态
+
+- [x] binary-add/reshape candidate 可生成。
+- [ ] production profile 人工审核与安装。`ROLLOUT`
+
+## 6. P3：Reduction、loop 与 multibuffer
+
+### 6.1 Reduction sum
+
+- [x] 严格匹配一维 contiguous f32 sum reduction。
+- [x] 建立 input、scratch、accumulator 三个 resource。
+- [x] 建立三资源 reduce-point witness。
+- [x] source 阶段不提前声称 physical distinct。
+- [x] suffix `extra-buffer` contract 后精化 pairwise `mustDistinct`。
+- [x] solver 生成三资源 witness certificate。
+- [x] 多 tile、其他 reducer、scan/argmin/argmax 具名 defer。
+- [x] full compiler、PlanMemory、semantic replay 历史门禁完成。
+
+### 6.2 Loop-carried add
+
+- [x] 严格匹配固定 trip-count 的单 carried-tensor loop。
+- [x] 建立 accumulator 和 loop-step-input。
+- [x] accumulator lifetime 跨越 loop。
+- [x] 建立 loop program point witness。
+- [x] materialization 后精化两个 allocation 为 `mustDistinct`。
+- [x] full compiler、PlanMemory、semantic replay 历史门禁完成。
+
+### 6.3 MultiBuffer factor=2
+
+- [x] `loop-carried-add-multibuffer@1` 只接受 exact factor=2。
+- [x] step input 的 `minInstances` 从 1 提升为 2。
+- [x] `num_stages=1` 不错误启用 multibuffer。
+- [x] factor≠2、preload factor=4 和未知策略具名 defer。
+- [x] full compiler、PlanMemory、semantic replay 历史门禁完成。
+
+### 6.4 Rollout 状态
+
+- [x] reduction/loop/multibuffer candidate 可生成。
+- [ ] production profile 人工审核与安装。`ROLLOUT`
+
+## 7. P4：Dynamic CV / MIX / irregular memory
+
+### 7.1 Dynamic CV MIX dot→exp
+
+- [x] fixture 使用真实 full-compiler canonical TTIR。
+- [x] fixture 使用真实 `before-CVPipelining` boundary。
+- [x] manifest 绑定两个输入 SHA256 和 full-compiler provenance。
+- [x] strict matcher 校验 dot、exp、shape、type、property、use-def 和 operation 集。
+- [x] ordered contract chain：
+  `dynamic-cv-source-preserve@1`
+  → `dynamic-cv-replay@1`
+  → `dynamic-cv-result-preserve@1`。
+- [x] source 投影为 AIC Fixpipe 和 AIV vector resource。
+- [x] AIC/AIV 使用不同 `UBExecutionScope`。
+- [x] 禁止跨 scope alias/coexistence 和求和。
+- [x] analyzer 得到每 scope 512-byte singleton 下界。
+- [x] default memory-space、legacy Fixpipe、runtime capacity 和 same-schema suffix
+  compatibility patches 已实现并通过本地 `git apply --check`。
+- [x] server 失联前 Dynamic seed 0 full PlanMemory 成功：
+  AIC=4096 bits，AIV=4096 bits。
+
+### 7.2 Irregular memory
+
+- [x] 使用真实 indirect-add full-compiler boundary。
+- [x] 识别 gather 前动态 `memref.alloc(%dim) : memref<?xf32>`。
+- [x] 删除不安全的旧 96-byte irregular contracts/factories/schema。
+- [x] 返回 `unsupported-irregular-source-extent`。
+- [x] 不生成 certificate，不允许 profile promotion。
+
+### 7.3 目标 CANN 最终门禁
+
+以下任务必须在用户提供的 CANN 容器完成；本地开发阶段明确跳过：
+
+- [~] 在同一环境重建 `libtriton`、suffix compiler、`cvpipeline_ub_model_cpp`：
+  `libtriton` 已在 2026-07-27 CANN 9.0.0 环境重建；后两个组件受匹配 LLVM/MLIR
+  development package 缺失阻塞，不能用安装版 BiShengIR 替代。
+- [~] 记录 binaries 和 semantic model 的 SHA256：已记录 `libtriton` 和安装版
+  BiShengIR hash；suffix/model 因未能构建而无有效 hash。
+- [~] 运行完整 C++ GTest 和 pybind/Python focused tests：focused suite 已在 rebuilt
+  binary 上 `348 passed`；C++ GTest target 未构建。
+- [ ] Dynamic seeds `0..19`（需要 same-schema suffix oracle）。
+- [ ] Dynamic retry seed `-1`（需要 same-schema suffix oracle）。
+- [ ] 对照 analyzer per-scope LB、full PlanMemory 和 exact semantic replay。
+- [ ] 确认 auto-tile outcome、capacity、peak 和 status 一致。
+- [ ] 最终报告 `violations=0`、`unavailable=0`。
+- [ ] 人工审核是否生成/安装 Dynamic profile。`ROLLOUT`
+
+服务器约束记录：
+
+```text
+host: root@192.168.25.217
+container: sgl-sky
+container code root: /home/sky/code
+任何宿主机修改必须先交用户审核
 ```
 
-Implement multiplication and addition with explicit `INT64_MAX` division/subtraction checks. Do not wrap or saturate; return `failure()` so the caller can `defer`. `must-alias` resources are collapsed to one equivalence class using the maximum member lower bound; `may-alias` resources cannot be summed; a witness sums resources only when every pair has an explicit `must-distinct` relation.
+2026-07-27 的可审计结果见
+`../validation/2026-07-27-cann-9.0.0-server-validation.md`。
 
-- [ ] **Step 4: Register the library and test target**
+## 8. P5：General dot、alignment、atomic 与长尾
 
-`third_party/ascend/lib/Analysis/TTIRUBLowerBound/CMakeLists.txt`:
+P5 必须继续以多资源 witness 为主，不得退回“按 op 查一个 UB 公式”。
 
-```cmake
-add_triton_library(TTIRUBLowerBound
-  MandatoryUBResourceGraph.cpp
+### 8.1 General DotMaterializationContract
 
-  LINK_LIBS PUBLIC
-  MLIRIR
-  MLIRSupport
-  TritonIR
-)
-```
+- [x] 从现有真实 MIX boundary 确认资源边界：A/B 位于 L1、accumulator 位于
+  L0C，均不得进入 UB graph；跨核 Fixpipe 输出和后续 vector allocation 才属于 UB。
+- [x] plain dot 与 dot_scaled 在正向 boundary 缺失时分别返回稳定
+  `unsupported-dot-requires-full-boundary` /
+  `unsupported-dot-scaled-requires-full-boundary`。
+- [~] 已捕获 plain dot 的真实 full-compiler boundary；Fixpipe/UB physical
+  materialization 仍待 same-schema suffix + PlanMemory 证明，保持具名 defer。
+- [ ] 只为真实 boundary 中明确位于 UB 的 Fixpipe output、AIV consumer、
+  workspace/scratch 建立资源清单。
+- [ ] 为每个资源定义 execution scope 和 materialization kind。
+- [ ] 严格匹配 dot/dot_scaled 的 shape、layout、precision 和 accumulator 类型。
+- [ ] 建立初始 mayAlias、lifetime 和候选 witnesses。
+- [ ] 从 real boundary 证明 physical mustAlias/mustDistinct。
+- [ ] 为 tiling、SplitMix、Dynamic CV、bufferization 建立 ordered contracts。
+- [ ] 验证 A/B/accumulator 是否在同 scope 同时存在；禁止跨核相加。
+- [ ] 增加至少一个 supported fixture 和完整 defer mutation matrix。
+- [ ] 完成 full compiler + PlanMemory + exact replay seeds/retry。
 
-Add `add_subdirectory(Analysis/TTIRUBLowerBound)` to `third_party/ascend/lib/CMakeLists.txt` and add this target to `third_party/ascend/unittest/CMakeLists.txt`:
+完成条件：不是“能识别 `tt.dot`”，而是至少一个 dot family 的完整多资源证书闭环。
 
-```cmake
-add_triton_ut(
-  NAME TestAscendTTIRUBLowerBound
-  SRCS TTIRUBLowerBoundTest.cpp
-  LIBS TTIRUBLowerBound TritonIR MLIRIR MLIRSupport
-)
-```
+### 8.2 AlignmentContract
 
-- [ ] **Step 5: Run tests and commit**
+- [x] 从 `PlanMemory.cpp` 确认每个 local allocation 的 `constBits` 会按
+  `GetBufferSpaceInfo(scope).alignUnit` 独立向上取整。
+- [x] 区分 payload rounding、allocation offset alignment 和 scope reservation：
+  `alignedConstBits` 是逐 allocation size rounding；offset 由 aligned extent 排布；
+  scope capacity 只是上限，不是额外加入下界的 reservation。
+- [x] 新增 graph-level checked payload alignment primitive。
+- [x] 新增 `UBAlignmentContract`，精确绑定 stage options、resource count 和
+  alignment bytes。
+- [x] Python profile loader 与 C++ binding 支持
+  `<family-contract>+ub-alignment@1` composite schema，并拒绝 standalone
+  alignment profile。
+- [x] 新增 `SequentialContract`，在同一个真实 stage 内按
+  family materialization → alignment 顺序执行，不伪造逻辑 stage。
+- [x] 对 mustAlias class 只计物理 allocation 的最大 aligned payload。
+- [x] 对 witness 中 mustDistinct allocations 分别对齐后再求和。
+- [x] checked round-up，任何 overflow/未知 alignment fail closed。
+- [x] 增加边界测试：差 1 byte、multiple instances、alias view、distinct witness。
+- [ ] 证明具体 family 的 alignment 是最小强制增加量，而不是经验 padding。
+- [x] 解决 suffix 内 tiling/materialization/alignment 多个 transfer function 的
+  composition：一个 profile binding 装载有序 composite，证书 trace 展开为两个
+  leaf contract ID。
+- [ ] 用 PlanMemory offset/size ledger 验证 seeds/retry。
 
-Run:
+### 8.3 AtomicMemoryContract
+
+- [x] 审计 `LoadStoreConverter`：atomic lowering 至少分 result-used/result-unused、
+  hardware/software atomic、RMW kind、CAS、mask 和 target 支持路径；不能用单一
+  `value tensor bytes` 公式覆盖。
+- [x] `tt.atomic_rmw` / `tt.atomic_cas` 当前统一返回稳定
+  `unsupported-op-atomic`。
+- [x] 对合法 TTIR atomic_rmw/atomic_cas source form 增加零证书 defer 测试。
+- [ ] 对 atomic_rmw 和 atomic_cas 分开建模。
+- [ ] 识别 read-modify-write 输入、结果、compare/value 和临时资源。
+- [ ] 建立副作用导致的不可消除事实。
+- [ ] 证明输出与输入是 mustAlias、mayAlias 还是 distinct。
+- [ ] 建立 atomic program point witness 和 lifetime。
+- [x] 未知 memory ordering、scope、mask 或 converter 路径统一具名 defer，
+  在分路径建模完成前不产生 atomic certificate。
+- [~] 已捕获 RMW 和 CAS 的真实 full-compiler boundary；PlanMemory/replay fixture
+  仍待 same-schema suffix oracle，保持 defer。
+
+### 8.4 Custom ops 与 coverage long tail
+
+- [x] `ttascend.*` / `hivm.custom_*` 未注册 custom path 返回稳定
+  `unsupported-op-custom`。
+- [x] 每个未注册 Ascend custom op 走统一 structured defer；未来逐 op 支持时再增加
+  explicit materialization contract。
+- [x] descriptor、layout transform、scan、复杂 control flow 保持 defer-first。
+- [x] coverage matrix 已为 general dot、atomic、custom ops 增加 P5
+  deliberate-defer 状态，并为 Alignment 标记 candidate primitive。
+- [x] atomic、custom ops 有稳定 reason mutation 测试；general dot 的 full-boundary
+  defer 已进入 coverage test。
+- [x] coverage matrix 中每个 operation family 有：
+  `candidate-supported | deliberate-defer | source-fact-only`。
+- [x] 每个 deliberate-defer 都有稳定 reason，并由 classifier mutation 或
+  machine-readable coverage test 覆盖。
+- [x] generic unknown op 通过 `unsupported-op` 测试确认不会 silently Preserve。
+
+## 9. Rollout：off → shadow → enforce
+
+### 9.1 已实现的产品能力
+
+- [x] 默认 `off`。
+- [x] `shadow` 记录分析结果但继续编译。
+- [x] `enforce` 只拒绝 production-valid certificate。
+- [x] profile loader 拒绝 identity/schema/option/contract drift。
+- [x] telemetry 支持 serial/parallel autotune。
+- [x] 回退只需设为 `off`，不修改 TTIR。
+
+### 9.2 待执行 rollout
+
+- [ ] `[SERVER]` P4 server gate 完成。
+- [ ] `[HUMAN]` 对 P1–P4 candidates 做人工 code/fixture/identity 审核。
+- [ ] `[HUMAN]` 选择第一批最小 production profiles，不一次性全装。
+- [ ] `[ROLLOUT]` 在 CI 开启 shadow，保存按 profile 分组的
+  violation/unavailable 指标。
+- [ ] `[ROLLOUT]` 在代表性 autotune workloads 开启 shadow。
+- [ ] `[ROLLOUT]` 记录 analyzed/rejected/deferred/passed-to-backend 和编译耗时收益。
+- [ ] `[ROLLOUT]` 连续观察窗口内保持 zero false reject 和 zero lower-bound violation。
+- [ ] `[ROLLOUT]` 任一反例立即删除对应 profile identity。
+- [ ] `[HUMAN]` 零违规门禁后允许用户显式 `enforce`。
+- [x] 首版不改变默认模式。
+
+这些未勾项不是剩余本地编码任务：`SERVER` 需要目标 CANN 环境，`HUMAN` 需要审核和
+发布授权，`ROLLOUT` 需要 CI/代表性 workload 的真实观察窗口。production profile 为空时，
+提前打开 shadow 不能验证任何 active candidate。
+
+## 10. 本地验证清单
+
+不需要 CANN server 的工作：
 
 ```bash
-cmake --build .build-ttir-ub --target TestAscendTTIRUBLowerBound -j8
-ctest --test-dir .build-ttir-ub -R TestAscendTTIRUBLowerBound --output-on-failure
+/opt/anaconda3/bin/python3 -m pytest -q \
+  --confcutdir=third_party/ascend/unittest/ttir_ub_oracle \
+  third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py \
+  third_party/ascend/unittest/ttir_ub_oracle/test_fixture_bundle.py \
+  third_party/ascend/unittest/ttir_ub_oracle/test_prepare_same_schema_oracle.py \
+  third_party/ascend/unittest/ttir_ub_oracle/test_coverage_matrix.py \
+  third_party/ascend/unittest/ttir_ub_oracle/test_profile_schema.py
+
+/opt/anaconda3/bin/python3 -m py_compile \
+  third_party/ascend/tools/ttir_ub_oracle.py \
+  third_party/ascend/tools/ttir_ub_fixture_bundle.py \
+  third_party/ascend/backend/ub_lower_bound.py
+
+git apply --check third_party/ascend/tools/patches/0001-feat-port-same-schema-CVPipeline-suffix-oracle.patch
 git diff --check
 ```
 
-Expected: all four graph tests pass and `git diff --check` prints nothing.
-
-Commit:
-
-```bash
-git add third_party/ascend/include/Analysis/TTIRUBLowerBound/MandatoryUBResourceGraph.h \
-        third_party/ascend/lib/Analysis/TTIRUBLowerBound \
-        third_party/ascend/lib/CMakeLists.txt \
-        third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp \
-        third_party/ascend/unittest/CMakeLists.txt
-git commit -s -m "feat: add mandatory UB resource graph"
-```
-
-### Task 2: UBResourceContract, capacity and pipeline profile registry
-
-**Files:**
-- Create: `third_party/ascend/include/Analysis/TTIRUBLowerBound/UBResourceContract.h`
-- Create: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/UBResourceContract.cpp`
-- Modify: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/CMakeLists.txt`
-- Modify: `third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp`
-- Create: `third_party/ascend/backend/ub_contract_profiles.json`
-
-**Interfaces:**
-- Consumes: `MandatoryUBResourceGraph` from Task 1.
-- Produces: `PipelineIdentity`, `PipelineStageContext`, `ContractDisposition`, `UBResourceContract`, `PipelineContractRegistry`, and `getUBCapacityBytes`.
-
-- [ ] **Step 1: Add failing contract and capacity tests**
-
-```cpp
-TEST(UBResourceContract, UnknownStageInvalidatesResources) {
-  MandatoryUBResourceGraph graph;
-  graph.addResource({"load0", 262144, 1});
-  PipelineContractRegistry registry;
-  registry.applyOrInvalidateAll(graph, {.stageName = "unknown-pass"});
-  EXPECT_EQ(graph.solveSingletonLowerBound()->bytes, 0);
-}
-
-TEST(UBResourceContract, TransformCanOnlyLowerToProvenMinimum) {
-  MandatoryUBResourceGraph graph;
-  auto id = graph.addResource({"load0", 262144, 1});
-  PipelineContractRegistry registry;
-  registry.addForTesting(makeFixedTileContract("tile", 2));
-  registry.applyOrInvalidateAll(graph, {.stageName = "tile"});
-  EXPECT_EQ(graph.resources()[id].minPayloadBytes, 131072);
-}
-
-TEST(UBResourceContract, CapacityHasNoUnknownDefault) {
-  EXPECT_EQ(*getUBCapacityBytes("Ascend910B"), 192 * 1024);
-  EXPECT_EQ(*getUBCapacityBytes("Ascend910_95"), 256 * 1024);
-  EXPECT_EQ(*getUBCapacityBytes("Ascend950"), 256 * 1024);
-  EXPECT_FALSE(getUBCapacityBytes("future-chip").has_value());
-}
-```
-
-- [ ] **Step 2: Run and confirm missing interfaces**
-
-Run the Task 1 build command. Expected: compile failure naming `PipelineContractRegistry` and `getUBCapacityBytes`.
-
-- [ ] **Step 3: Implement contract semantics**
-
-```cpp
-enum class ContractDisposition { Preserve, Transform, Invalidate, InternalError };
-
-struct PipelineIdentity {
-  std::string openSourcePipeline;
-  std::string relevantOptionsJson;
-  std::string targetArch;
-  std::string tritonVersion;
-  std::string cannVersionHash;
-  std::string sha256;
-};
-
-struct PipelineStageContext {
-  std::string stageName;
-  StringMap<std::string> options;
-};
-
-class UBResourceContract {
-public:
-  virtual ~UBResourceContract() = default;
-  virtual StringRef id() const = 0;
-  virtual StringRef version() const = 0;
-  virtual bool matches(const PipelineStageContext &) const = 0;
-  virtual ContractDisposition apply(MandatoryUBResourceGraph &,
-                                    const PipelineStageContext &) const = 0;
-};
-```
-
-`applyOrInvalidateAll` must invalidate every currently valid resource when no contract matches. A matching contract returning `InternalError` returns `failure()` to the top-level analyzer.
-
-- [ ] **Step 4: Add the empty production profile file**
-
-```json
-{
-  "schema": "ttir-ub-lb-profile-v1",
-  "profiles": []
-}
-```
-
-Tests inject synthetic profiles through `addForTesting`; production code must not contain an `allow_unvalidated` option.
-
-- [ ] **Step 5: Run tests and commit**
-
-Run the graph test target and `git diff --check`. Expected: all tests pass.
-
-Commit:
-
-```bash
-git add third_party/ascend/include/Analysis/TTIRUBLowerBound/UBResourceContract.h \
-        third_party/ascend/lib/Analysis/TTIRUBLowerBound \
-        third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp \
-        third_party/ascend/backend/ub_contract_profiles.json
-git commit -s -m "feat: add UB resource contracts"
-```
-
-### Task 3: Strict TTIR direct-load source rule
-
-**Files:**
-- Create: `third_party/ascend/include/Analysis/TTIRUBLowerBound/TTIRUBLowerBound.h`
-- Create: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/TTIRUBLowerBound.cpp`
-- Create: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/DirectTensorLoadMaterialization.cpp`
-- Modify: `third_party/ascend/lib/Analysis/TTIRUBLowerBound/CMakeLists.txt`
-- Modify: `third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp`
-
-**Interfaces:**
-- Consumes: MURG and registry from Tasks 1–2.
-- Produces: `TTIRUBAnalysisOptions`, `TTIRUBAnalysisResult`, `analyzeTTIRUBLowerBound(ModuleOp, options, registry)`.
-
-- [ ] **Step 1: Add a failing positive analyzer test**
-
-Parse this fixture in the GTest with `parseSourceString<ModuleOp>` after loading `arith::ArithDialect` and `triton::TritonDialect`:
-
-```mlir
-module {
-  tt.func public @copy(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
-    %range = tt.make_range {end = 65536 : i32, start = 0 : i32} : tensor<65536xi32>
-    %srcs = tt.splat %src : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
-    %src_ptrs = tt.addptr %srcs, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
-    %dsts = tt.splat %dst : !tt.ptr<f32> -> tensor<65536x!tt.ptr<f32>>
-    %dst_ptrs = tt.addptr %dsts, %range : tensor<65536x!tt.ptr<f32>>, tensor<65536xi32>
-    %value = tt.load %src_ptrs : tensor<65536x!tt.ptr<f32>>
-    tt.store %dst_ptrs, %value : tensor<65536x!tt.ptr<f32>>
-    tt.return
-  }
-}
-```
-
-Assert a synthetic all-preserve profile returns `lowerBoundBytes == 262144` and `decision == Reject` for `Ascend910B`.
-
-- [ ] **Step 2: Add failing defer tests**
-
-Create one mutation per case and assert `decision == Defer` with the named reason:
-
-```text
-masked-load
-dynamic-shape
-non-contiguous-pointer
-load-not-reaching-store
-nested-region
-unsupported-op-reduction
-sub-byte-element-type
-unknown-pipeline-profile
-```
-
-Also test 49152 `f32` values on 192 KiB returns `defer` because equality does not overflow.
-
-- [ ] **Step 3: Run and observe failures**
-
-Run the GTest target. Expected: compile failure because `analyzeTTIRUBLowerBound` does not exist.
-
-- [ ] **Step 4: Implement the minimal source matcher**
-
-Define the public result types before implementing the matcher:
-
-```cpp
-enum class TTIRUBDecision { Reject, Defer };
-
-struct TTIRUBAnalysisOptions {
-  std::string targetArch;
-  std::string compileMode;
-  PipelineIdentity pipelineIdentity;
-  SmallVector<PipelineStageContext> stages;
-};
-
-struct TTIRUBAnalysisResult {
-  TTIRUBDecision decision = TTIRUBDecision::Defer;
-  int64_t lowerBoundBytes = 0;
-  std::optional<int64_t> capacityBytes;
-  SmallVector<LowerBoundCertificate> certificates;
-  SmallVector<std::string> unsupportedReasons;
-  std::string contractVersion = "ttir-ub-lb-v1";
-};
-```
-
-V1 accepts only this chain:
-
-```text
-function pointer block argument
-  → tt.splat
-  → tt.addptr(offset = tt.make_range(start=0, end=N))
-  → unmasked ranked tt.load
-  → direct unmasked tt.store
-```
-
-Require the load and store to be in the function entry block, reject any enclosing region other than `tt.func`, require one load result use, and accept only integer/float element widths in `{8, 16, 32, 64}`. Compute bytes as:
-
-```cpp
-numElements * llvm::divideCeil(elementBitWidth, 8u)
-```
-
-Use checked multiplication. Do not accept arithmetic elementwise chains in V1.
-
-Build a `GMToUBLoad` singleton resource, apply every stage in the supplied registry, solve singleton LB, and return `Reject` only when `bytes > capacity`.
-
-- [ ] **Step 5: Run tests and commit**
-
-Run GTest and `git diff --check`. Expected: positive and all defer reason tests pass.
-
-Commit:
-
-```bash
-git add third_party/ascend/include/Analysis/TTIRUBLowerBound/TTIRUBLowerBound.h \
-        third_party/ascend/lib/Analysis/TTIRUBLowerBound \
-        third_party/ascend/unittest/TTIRUBLowerBoundTest.cpp
-git commit -s -m "feat: analyze mandatory TTIR UB loads"
-```
-
-### Task 4: pybind API, Python policy and unified capacity source
-
-**Files:**
-- Create: `third_party/ascend/ttir_ub_lower_bound_bindings.cc`
-- Modify: `third_party/ascend/triton_ascend.cc`
-- Modify: `third_party/ascend/CMakeLists.txt`
-- Create: `third_party/ascend/backend/ub_lower_bound.py`
-- Create: `third_party/ascend/backend/errors.py`
-- Modify: `third_party/ascend/backend/runtime/utils.py`
-- Create: `third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py`
-
-**Interfaces:**
-- Consumes: `analyzeTTIRUBLowerBound` and `getUBCapacityBytes`.
-- Produces: `ascend.analysis.ttir_ub_lower_bound(module, options)` and `ascend.analysis.get_ub_capacity_bytes(arch)`.
-- Produces: `apply_ub_lower_bound_policy(mod, metadata, opt, pipeline_identity)`.
-- Produces: picklable `UBLowerBoundOverflow`.
-
-- [ ] **Step 1: Write binding and policy tests with a mocked analysis result**
-
-```python
-def test_shadow_records_but_does_not_raise(monkeypatch):
-    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", lambda *_: {
-        "decision": "reject", "lower_bound_bytes": 262144,
-        "capacity_bytes": 196608, "certificates": [{"kind": "singleton"}],
-        "unsupported_reasons": [], "contract_version": "ttir-ub-lb-v1",
-        "pipeline_identity": "test-id",
-    })
-    metadata = {"hash": "abc"}
-    apply_ub_lower_bound_policy(object(), metadata, Options("shadow"), "test-id")
-    assert metadata["ub_lower_bound_decision"] == "reject"
-
-def test_enforce_raises_only_proven_reject(monkeypatch):
-    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound", proven_reject)
-    with pytest.raises(UBLowerBoundOverflow) as error:
-        apply_ub_lower_bound_policy(object(), {}, Options("enforce"), "test-id")
-    assert error.value.required == 262144
-    assert error.value.limit == 196608
-
-def test_analyzer_exception_fails_open(monkeypatch):
-    monkeypatch.setattr(ascend.analysis, "ttir_ub_lower_bound",
-                        lambda *_: (_ for _ in ()).throw(RuntimeError("bad")))
-    metadata = {}
-    apply_ub_lower_bound_policy(object(), metadata, Options("enforce"), "id")
-    assert metadata["ub_lower_bound_decision"] == "defer"
-    assert metadata["ub_lower_bound_unsupported_reasons"] == ["internal-error: bad"]
-```
-
-- [ ] **Step 2: Run and confirm import/interface failures**
-
-Run:
-
-```bash
-python -m pytest third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py -q
-```
-
-Expected: import failure for `ub_lower_bound` or missing `ascend.analysis`.
-
-- [ ] **Step 3: Implement binding serialization**
-
-Register an `analysis` submodule from `init_triton_ascend` and return only JSON-serializable dict/list/string/integer values. Accept a `ModuleOp &` and a dict containing `arch`, `compile_mode`, `pipeline_identity`, `pipeline_stages`, and `contract_profile`.
-
-Do not expose `allow_unvalidated`; profile lookup must come from packaged `ub_contract_profiles.json`.
-
-- [ ] **Step 4: Implement Python policy and exception**
-
-```python
-class UBLowerBoundOverflow(OutOfResources):
-    def __init__(self, required, limit, certificate, pipeline_identity):
-        super().__init__(required, limit, "Ascend UB proven lower bound")
-        self.certificate = certificate
-        self.pipeline_identity = pipeline_identity
-
-    def __reduce__(self):
-        return (type(self), (self.required, self.limit,
-                            self.certificate, self.pipeline_identity))
-```
-
-`apply_ub_lower_bound_policy` returns immediately in `off`, records a normalized metadata summary in `shadow/enforce`, catches analyzer exceptions as `defer`, and raises only in enforce plus reject.
-
-- [ ] **Step 5: Replace Python capacity hardcoding**
-
-Change `_init_npu_params()` to use:
-
-```python
-capacity = ascend.analysis.get_ub_capacity_bytes(target.arch)
-if capacity is None:
-    raise RuntimeError(f"Unknown Ascend UB capacity for {target.arch}")
-ub_size_in_kbytes = capacity // 1024
-```
-
-Keep RF-size logic separate. Add tests for 192/256 KiB and unknown arch.
-
-- [ ] **Step 6: Run tests and commit**
-
-Run the GTest target, the new pytest file, and `git diff --check`. Expected: all pass.
-
-Commit:
-
-```bash
-git add third_party/ascend/ttir_ub_lower_bound_bindings.cc \
-        third_party/ascend/triton_ascend.cc third_party/ascend/CMakeLists.txt \
-        third_party/ascend/backend/ub_lower_bound.py \
-        third_party/ascend/backend/errors.py \
-        third_party/ascend/backend/runtime/utils.py \
-        third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py
-git commit -s -m "feat: expose TTIR UB lower bound policy"
-```
-
-### Task 5: Real pipeline identity and compiler-stage integration
-
-**Files:**
-- Modify: `third_party/ascend/backend/compiler.py`
-- Modify: `python/triton/compiler/compiler.py`
-- Modify: `third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py`
-
-**Interfaces:**
-- Consumes: `apply_ub_lower_bound_policy`.
-- Produces: `_build_ttir_to_linalg_pass_manager`, `_ttir_ub_pipeline_identity`, and `NPUOptions.ub_lower_bound_mode`.
-
-- [ ] **Step 1: Add failing option and pipeline identity tests**
-
-```python
-def test_mode_validation():
-    assert NPUOptions(ub_lower_bound_mode="off").ub_lower_bound_mode == "off"
-    with pytest.raises(ValueError, match="ub_lower_bound_mode"):
-        NPUOptions(ub_lower_bound_mode="probabilistic")
-
-def test_pipeline_identity_changes_when_pass_order_changes(monkeypatch):
-    first = _ttir_ub_pipeline_identity("pass-a,pass-b", metadata())
-    second = _ttir_ub_pipeline_identity("pass-b,pass-a", metadata())
-    assert first != second
-
-def test_make_ttir_calls_policy_after_canonicalization(monkeypatch):
-    calls = []
-    monkeypatch.setattr(PM, "run", lambda self, mod: calls.append("pm"))
-    monkeypatch.setattr(compiler, "apply_ub_lower_bound_policy",
-                        lambda *args: calls.append("ub"))
-    make_ttir(module, {}, Options("shadow"))
-    assert calls == ["pm", "ub"]
-```
-
-- [ ] **Step 2: Refactor the pass manager without changing its pipeline string**
-
-Move the current pass additions from `ttir_to_linalg` into:
-
-```python
-def _build_ttir_to_linalg_pass_manager(mod, metadata, opt):
-    pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
-    # Add the existing passes in exactly their current order.
-    return pm
-```
-
-Before and after refactoring, capture `pm.get_pipeline_str()` for the existing default metadata fixture and assert byte-for-byte equality.
-
-- [ ] **Step 3: Compute a normalized identity**
-
-```python
-def _ttir_ub_pipeline_identity(pipeline: str, metadata: dict) -> str:
-    payload = {
-        "pipeline": pipeline,
-        "target": metadata["target"].arch,
-        "triton_version": metadata["triton_version"],
-        "cann_version_hash": get_cann_version_file_hash(),
-        "options": {name: metadata.get(name) for name in UB_AFFECTING_OPTIONS},
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode()).hexdigest()
-```
-
-`UB_AFFECTING_OPTIONS` must enumerate every option currently forwarded to BiSheng that can alter tiling, fusion, inplace, multi-buffer, CV or buffer reuse. A new forwarded option requires updating the tuple and its golden test.
-
-- [ ] **Step 4: Invoke the policy after `make_ttir` passes**
-
-Construct the future TTIR→Linalg PM only to obtain its normalized pipeline string; do not run it. Load the packaged profile matching the identity, then call the policy.
-
-When `opt.debug` is true, write full JSON to `kernel.ttir.ub-lower-bound.json` through the existing dump manager.
-
-- [ ] **Step 5: Preserve resource exceptions through the core stage wrapper**
-
-In `python/triton/compiler/compiler.py`:
-
-```python
-        try:
-            next_module = compile_ir(module, metadata)
-        except OutOfResources:
-            raise
-        except Exception as e:
-            # existing MLIRCompilationError wrapping remains unchanged
-```
-
-Add a unit test with a fake stage raising `UBLowerBoundOverflow` and assert the same exception type and fields reach the caller.
-
-- [ ] **Step 6: Run tests and commit**
-
-Run the new pytest file plus existing `test_debug_triton_opt_cmd.py`, then `git diff --check`.
-
-Commit:
-
-```bash
-git add third_party/ascend/backend/compiler.py \
-        python/triton/compiler/compiler.py \
-        third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py
-git commit -s -m "feat: run UB proof after TTIR canonicalization"
-```
-
-### Task 6: Parallel-safe Autotune filtering and telemetry
-
-**Files:**
-- Modify: `python/triton/runtime/_async_compile.py`
-- Create: `python/test/unit/runtime/test_async_compile_context.py`
-- Modify: `third_party/ascend/backend/ub_lower_bound.py`
-- Modify: `third_party/ascend/backend/runtime/autotuner.py`
-- Create: `third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py`
-
-**Interfaces:**
-- Produces: `ub_filter_telemetry_session()` and `UBFilterStats`.
-- Ensures async compiler workers inherit the active telemetry `ContextVar`.
-
-- [ ] **Step 1: Add a failing generic context propagation test**
-
-```python
-def test_async_compile_propagates_contextvars():
-    marker = ContextVar("marker", default="missing")
-    marker.set("present")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        with AsyncCompileMode(pool) as mode:
-            future = mode.submit("key", marker.get, lambda value: None)
-            assert future.result() == "present"
-```
-
-- [ ] **Step 2: Implement context capture in `submit`**
-
-```python
-from contextvars import ContextVar, copy_context
-
-context = copy_context()
-future = self.executor.submit(context.run, compile_fn)
-```
-
-Run `python -m pytest python/test/unit/runtime/test_async_compile_context.py -q`; expected: pass.
-
-- [ ] **Step 3: Add serial and parallel rejection tests**
-
-Mock one config to raise `UBLowerBoundOverflow`, one to compile, and assert both `_batch_bench` paths retain only the compiling config. The parallel test must call `Future.result()` and must not let `AsyncCompileMode.__exit__` rethrow the already classified exception.
-
-- [ ] **Step 4: Implement per-session telemetry**
-
-```python
-@dataclass
-class UBFilterStats:
-    analyzed: int = 0
-    rejected: int = 0
-    deferred: int = 0
-    passed_to_backend: int = 0
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
-_active_stats = ContextVar("ascend_ub_filter_stats", default=None)
-```
-
-`apply_ub_lower_bound_policy` updates the active object under its lock. `_batch_bench` opens one session around serial or parallel compilation, catches `OutOfResources` in both paths, and prints one summary only when `TRITON_PRINT_AUTOTUNING=1`.
-
-- [ ] **Step 5: Run tests and commit**
-
-Run:
-
-```bash
-python -m pytest python/test/unit/runtime/test_async_compile_context.py -q
-python -m pytest third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py -q
-python -m pytest third_party/ascend/unittest/autotune_ut/test_do_bench_compat.py -q
-git diff --check
-```
-
-Expected: all pass; the telemetry test reports exactly one analyzed, one rejected and one passed-to-backend config.
-
-Commit:
-
-```bash
-git add python/triton/runtime/_async_compile.py \
-        python/test/unit/runtime/test_async_compile_context.py \
-        third_party/ascend/backend/ub_lower_bound.py \
-        third_party/ascend/backend/runtime/autotuner.py \
-        third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py
-git commit -s -m "feat: filter UB overflow configs in autotune"
-```
-
-### Task 7: Real PlanMemory oracle and profile promotion gate
-
-**Files:**
-- Create: `third_party/ascend/tools/ttir_ub_oracle.py`
-- Create: `third_party/ascend/unittest/ttir_ub_oracle/test_oracle.py`
-- Create: `third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json`
-- Create: `third_party/ascend/unittest/ttir_ub_oracle/fixtures/direct_copy.ttir.mlir`
-- Create: `third_party/ascend/unittest/ttir_ub_oracle/fixtures/direct_copy.before_cvpipelining.mlir`
-- Modify after successful certification: `third_party/ascend/backend/ub_contract_profiles.json`
-
-**Interfaces:**
-- Consumes: analyzer binding, canonical TTIR and before-CVPipelining fixture pairs.
-- Consumes external real compiler: `bishengir-cvpipeline-suffix-compile` with `--ub-oracle-only` and `--plan-memory-seed`.
-- Produces: machine-readable violation report and an auditable profile candidate JSON.
-
-- [ ] **Step 1: Write oracle parser tests using captured stderr fixtures**
-
-Test these rules:
-
-```python
-assert parse_planmemory_peak(success_stderr, attempt=0, scope="6") == 1572864
-assert parse_overflow_scope(ub_overflow_stderr) == "UB"
-assert parse_overflow_scope(l1_overflow_stderr) == "L1"
-with pytest.raises(OracleUnavailable):
-    classify_failure("generic parser error")
-```
-
-The parser must not classify a non-UB failure as UB overflow.
-
-- [ ] **Step 2: Implement the manifest and subprocess runner**
-
-The manifest schema is:
-
-```json
-{
-  "schema": "ttir-ub-oracle-v1",
-  "cases": [
-    {
-      "name": "direct-copy-f32-65536-a2",
-      "ttir": "direct_copy.ttir.mlir",
-      "before_cvpipelining": "direct_copy.before_cvpipelining.mlir",
-      "arch": "Ascend910B",
-      "options": {"compile_mode": "simd", "multibuffer": false},
-      "expected_analyzer_decision": "reject"
-    }
-  ]
-}
-```
-
-The runner obtains `pipeline_identity` from the analyzer result and writes it
-to the profile candidate; a manifest must not provide or override that value.
-
-For each case, call the analyzer once and the suffix compiler for seeds 0 through 19:
-
-```text
-bishengir-cvpipeline-suffix-compile INPUT \
-  -o OUTPUT \
-  --plan-memory-seed=N \
-  --mlir-disable-threading \
-  --ub-oracle-only
-```
-
-Set `BISHENGIR_DUMP_PLAN_MEMORY_ATTEMPTS=1`, parse scope `6`, and also run once with `--plan-memory-seed=-1` for retry behavior.
-
-- [ ] **Step 3: Enforce the lower-bound assertions**
-
-For every available seed result:
-
-```python
-assert lower_bound_bits <= actual_peak_bits
-if analyzer_decision == "reject":
-    assert oracle_status == "overflow"
-    assert overflow_scope == "UB"
-```
-
-Exit code is `0` only when violations are zero; unavailable oracle cases use exit code `2`; proof violations use exit code `1`.
-
-- [ ] **Step 4: Generate but do not automatically install a profile**
-
-`--profile-candidate OUTPUT.json` writes the exact pipeline identity, contract version, target and CANN hash only when all 20 seeds and retry pass. It never edits the packaged profile file.
-
-Run:
-
-```bash
-python third_party/ascend/tools/ttir_ub_oracle.py \
-  --manifest third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json \
-  --suffix-compiler /Users/sky/Code/AscendNPU-IR/.worktrees/cvpipeline-ub-post-model/build/bin/bishengir-cvpipeline-suffix-compile \
-  --seeds 0-19 --check-retry \
-  --profile-candidate /tmp/ttir-ub-profile-candidate.json
-```
-
-Expected: `violations=0`, `unavailable=0`, exit code `0`.
-
-- [ ] **Step 5: Review and install the profile candidate**
-
-Compare the candidate identity with the shadow metadata from the same binaries. Copy the complete candidate object into `ub_contract_profiles.json` only when the command in Step 4 succeeded. Re-run the oracle after installation and assert the analyzer now returns a production-valid certificate.
-
-- [ ] **Step 6: Run unit tests and commit**
-
-Run parser tests without hardware, then the full oracle in a CANN/BiSheng environment. Commit the tool and fixtures; include the profile only if certified.
-
-```bash
-git add third_party/ascend/tools/ttir_ub_oracle.py \
-        third_party/ascend/unittest/ttir_ub_oracle
-git add third_party/ascend/backend/ub_contract_profiles.json
-git commit -s -m "test: validate TTIR UB lower bounds with PlanMemory"
-```
-
-### Task 8: End-to-end modes, documentation and release verification
-
-**Files:**
-- Create: `docs/zh/ttir_ub_conservative_filter.md`
-- Create: `docs/en/ttir_ub_conservative_filter.md`
-- Modify: `third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py`
-- Modify: `third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py`
-
-**Interfaces:**
-- Verifies the complete public behavior and documents activation/diagnostics/rollback.
-
-- [ ] **Step 1: Add end-to-end mode tests**
-
-Compile the same direct-copy TTIR with:
-
-```text
-off     → analyzer binding is not called
-shadow  → compilation continues and metadata contains the result
-enforce + no certified profile → defer and compilation continues
-enforce + certified profile + LB == capacity → compilation continues
-enforce + certified profile + LB > capacity → UBLowerBoundOverflow
-```
-
-Also assert the debug dump is valid JSON and contains the full contract trace.
-
-- [ ] **Step 2: Write bilingual user/developer documentation**
-
-Document this exact activation contract:
-
-```python
-triton.Config({"BLOCK_SIZE": 65536, "ub_lower_bound_mode": "shadow"})
-triton.Config({"BLOCK_SIZE": 65536, "ub_lower_bound_mode": "enforce"})
-```
-
-Explain that `defer` is not proof of fit, `reject` is proof of overflow, default is `off`, and rollback is `ub_lower_bound_mode="off"`. Include MURG and `UBResourceContract` extension steps and the oracle promotion command from Task 7.
-
-- [ ] **Step 3: Run focused verification**
-
-```bash
-cmake --build .build-ttir-ub --target TestAscendTTIRUBLowerBound -j8
-ctest --test-dir .build-ttir-ub -R TestAscendTTIRUBLowerBound --output-on-failure
-python -m pytest third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py -q
-python -m pytest third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py -q
-python -m pytest third_party/ascend/unittest/autotune_ut/test_do_bench_compat.py -q
-python -m pytest python/test/unit/runtime/test_async_compile_context.py -q
-git diff --check
-```
-
-Expected: all tests pass and no whitespace errors.
-
-- [ ] **Step 4: Run full release verification**
-
-In the configured CANN/NPU environment:
-
-```bash
-TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=ON" python setup.py bdist_wheel
-python -m pytest -q third_party/ascend/unittest/autotune_ut
-python -m pytest -q third_party/ascend/unittest/pytest_ut
-cmake --build .build-ttir-ub --target check-triton-ascend-lit-tests -j8
-python third_party/ascend/tools/ttir_ub_oracle.py \
-  --manifest third_party/ascend/unittest/ttir_ub_oracle/fixtures/manifest.json \
-  --suffix-compiler /Users/sky/Code/AscendNPU-IR/.worktrees/cvpipeline-ub-post-model/build/bin/bishengir-cvpipeline-suffix-compile \
-  --seeds 0-19 --check-retry
-```
-
-Expected: build succeeds, test suites pass, oracle reports zero violations/unavailable cases.
-
-- [ ] **Step 5: Measure analyzer overhead**
-
-Run the fixture corpus 100 times in shadow mode, discard the first 10 iterations, and report p50/p95 from `time.perf_counter_ns()`. Acceptance: p95 is below 5 ms per module. Store the measurement summary in the final handoff, not in a generated repository artifact.
-
-- [ ] **Step 6: Commit documentation and final test updates**
-
-```bash
-git add docs/zh/ttir_ub_conservative_filter.md \
-        docs/en/ttir_ub_conservative_filter.md \
-        third_party/ascend/unittest/pytest_ut/test_ttir_ub_lower_bound.py \
-        third_party/ascend/unittest/autotune_ut/test_ub_lower_bound_filter.py
-git commit -s -m "docs: document TTIR UB conservative filtering"
-```
-
-## Completion Checklist
-
-- [ ] Production profile is either empty or backed by a checked-in zero-violation oracle report identity.
-- [ ] No `allow_unvalidated`, confidence threshold, probability or heuristic reaches enforce policy.
-- [ ] Every unsupported path produces a structured `defer` reason.
-- [ ] `LB == capacity` is not rejected; only `LB > capacity` is rejected.
-- [ ] Serial and parallel autotune preserve at least every non-UB-failing config.
-- [ ] Pipeline pass order and UB-affecting options are included in the identity.
-- [ ] Full certificate JSON is debug-only; normal metadata remains compact and JSON serializable.
-- [ ] Existing capacity users consume the same C++ target contract.
-- [ ] Focused tests, full tests, real oracle and `git diff --check` pass.
-- [ ] All commits contain `Signed-off-by` trailers.
+已记录的本地结果：
+
+- [x] oracle/fixture/helper/coverage/profile-schema tests：111 passed。
+- [x] Python `py_compile`。
+- [x] 五个外部源补丁分别通过对应 source tree 的 `git apply --check`。
+- [x] UB implementation、GTest 和 pybind 修改对象独立编译。
+- [x] HTML/JSON 解析和 `git diff --check`。
+
+## 11. 服务器验证清单
+
+服务器恢复后按一个 coherent build identity 执行：
+
+1. 同步当前 commit 到容器 `/home/sky/code`。
+2. 应用并记录 suffix/semantic compatibility patches。
+3. 重建所有参与 identity 的 binaries。
+4. 记录 SHA256 和版本。
+5. 跑 C++ GTest、pybind/Python focused suites。
+6. 跑 P4 Dynamic seeds 0..19 + retry。
+7. 跑 exact semantic replay。
+8. [x] 捕获 P5 plain dot/dot_scaled 和 atomic RMW/CAS 的真实 full-compiler
+   boundary（2026-07-27；hash 见 validation record）。
+9. 导出 Alignment 的 per-allocation `constBits/alignedConstBits/offset/scope peak` ledger。
+10. 对获得正向模型的 P5 family 跑 seeds 0..19 + retry 与 exact replay。
+11. 保存 machine-readable report。
+12. 只有 `violations=0 && unavailable=0` 才允许生成 candidate。
+13. candidate 仍需人工审核，不自动安装。
+
+不得因服务器不可用把这些步骤勾成完成。
+
+## 12. 每个新 family 的 Definition of Done
+
+- [ ] strict matcher 覆盖完整 SSA pattern。
+- [ ] MURG 包含所有必需资源，不漏 source/scratch/accumulator/index/mask。
+- [ ] 每个资源有 payload、instances、scope、birth、last use。
+- [ ] alias/distinct 关系完整且无冲突。
+- [ ] 需要求和时有同 scope `CoexistenceWitness`。
+- [ ] 全真实 stage 有精确 Preserve/Transform/Invalidate contract。
+- [ ] pipeline identity 绑定所有影响 lowering 的输入。
+- [ ] supported positive fixture。
+- [ ] shape/type/attribute/use-def/stage drift defer mutations。
+- [ ] full compiler boundary fixture 和 hashes。
+- [ ] PlanMemory seeds 0..19 + retry。
+- [ ] exact semantic replay。
+- [ ] zero violation / zero unavailable。
+- [ ] coverage matrix 更新。
+- [ ] profile candidate 生成但不自动安装。
+
+## 13. 完成标准
+
+整个项目只有同时满足以下条件才算完成：
+
+- [ ] P0–P5 的目标切片均达到各自 Definition of Done。
+- [x] production profile 为空，或每个 identity 都有 checked-in zero-violation 报告。
+- [x] 所有 unsupported path 都有结构化 defer reason。
+- [x] multi-resource certificate 不重复计算 mustAlias。
+- [x] mayAlias、不同 lifetime、不同 scope 的资源不相加。
+- [x] `LB == capacity` 不拒绝。
+- [x] serial/parallel autotune 不丢失非 UB 资源错误以外的合法 config。
+- [x] full certificate 仅 debug dump；metadata JSON serializable。
+- [x] capacity C++/Python 单一来源。
+- [x] local focused tests、oracle 和 `git diff --check` 通过。
+- [ ] `[SERVER]` server release tests 与真实 oracle gate 通过。
+- [ ] rollout 经过 shadow 零违规窗口后才允许显式 enforce。
+- [ ] 所有提交包含 `Signed-off-by`。

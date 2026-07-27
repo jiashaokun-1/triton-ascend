@@ -9,7 +9,8 @@
 
 - 仓库：`triton-ascend`
 - 分支：`codex/ttir-ub-conservative-filter`
-- 本次交接基线提交：`fcb3ffa98240e02569eb947ef8e9cd2e0a2084e0`
+- 当前已提交基线：`2782c69aabde56f73222ed3c78d2019623250787`
+- P5 Alignment/long-tail 增量：当前工作树，完成本地验证后再提交
 - 设计文档：`docs/superpowers/specs/2026-07-21-ttir-ub-conservative-filter-design.md`
 - 实施计划：`docs/superpowers/plans/2026-07-21-ttir-ub-conservative-filter-implementation.md`
 - 用户说明：`docs/zh/ttir_ub_conservative_filter.md`
@@ -146,9 +147,10 @@ MURG 已定义：
 - `mustDistinct`：确定不能共享；
 - `CoexistenceWitness`：证明一组资源必须同时存在，可用于求和下界。
 
-当前生产分析只调用 `solveSingletonLowerBound()`，即取最大单资源下界。图层还实现了
-`solveWitnessLowerBound()`，但尚未接入生产决策。后续支持双输入 elementwise 或明确
-共存 scratch 时，才能在充分证明 distinct 和 overlap 后使用 witness。
+当前求解器同时计算 singleton 与有资格的 witness 下界，取其中最大值。witness 只有在
+资源属于同一 execution scope、共享同一个 `CoexistenceWitness`，并且物化合同已经证明
+资源 pairwise `mustDistinct` 后才允许求和；`mustAlias` 资源先折叠为同一物理 alias class，
+只计算该 class 的最大 payload，不能按 SSA value 数量重复计数。
 
 ### 4.4 算术和 ID 约束
 
@@ -528,6 +530,26 @@ LB_bits <= ReplayUBPeak_bits == ActualUBPeak_bits
   `triton._C`。因此运行态 GTest/pybind 与 CANN full-chain 不在本地伪装成已验证，统一留到
   服务器恢复后用同一 revision 重建执行。
 
+2026-07-24 P5 第一批本地增量验证：
+
+- 新增 graph-level checked payload alignment 和 `ub-alignment@1` contract；每个资源独立
+  round-up 后，再进行 alias class 折叠和 must-distinct witness 求和；
+- Alignment contract 精确核对 stage/options、resource count、正 payload/instance 与
+  alignment 参数；非法参数、数量漂移和整数溢出一律 fail closed；
+- 新增 `SequentialContract`；Python profile loader 与 C++ binding 只允许
+  `<family-contract>+ub-alignment` composite，先执行 materialization、再执行
+  alignment，并拒绝 standalone alignment profile；
+- oracle candidate builder 支持可选 `alignment_stage/alignment_bytes`，证书 trace
+  将 composite 展开为有序 leaf contract IDs；
+- general dot 在没有真实 full-compiler boundary 前返回
+  `unsupported-dot-requires-full-boundary`；atomic 与未注册 Ascend custom op 分别返回
+  `unsupported-op-atomic` 和 `unsupported-op-custom`；
+- oracle、fixture bundle、same-schema helper、coverage/profile-schema：111 项通过；
+- 最新 pybind object 单独编译成功，Python 文件通过 `py_compile`；
+- 完整 policy pytest 因本机没有可导入的 `triton._C.libtriton` 而无法收集；
+- 完整 GTest 目标仍只被既有 Triton/外部 MLIR header revision 不一致阻塞，失败点为
+  `DiscardableAttributes.cpp` 和 `Ops.cpp`，不在本次 P5 文件中。
+
 环境限制：
 
 - 4 个既有 autotune 文件依赖 `torch_npu`，本机无法收集；
@@ -636,6 +658,26 @@ promotion 完成，恢复服务器后只需执行以下环境验证，不再补�
 3. 确认 auto-tile outcome、status、capacity、peak 全部一致且 violations/unavailable 为 0；
 4. irregular case 必须保持 `unsupported-irregular-source-extent`，不得生成 profile；
 5. 只为有非空合法 certificate 的 case 生成 candidate，继续禁止自动安装 packaged profile。
+
+### P5：当前本地完成边界与服务器门禁
+
+本地已完成 Alignment 的 graph primitive、contract、profile/binding schema、alias/witness
+算术测试，以及 general dot、atomic、custom-op 的稳定 deliberate-defer 分类。Alignment
+通过 `<family-contract>+ub-alignment` 在同一个真实 stage 内有序组合，不需要伪造
+`bisheng.ub-alignment`，也不会覆盖 family materialization。PlanMemory 源码审计已区分：
+逐 allocation `alignedConstBits` 是可建模的 size rounding；offset 由 aligned extent 排布；
+scope capacity 只是上限，不是额外 reservation。packaged profile 继续为空。
+
+服务器恢复后需要：
+
+1. 从 plain dot / dot_scaled 的 full compiler dump 确认 Fixpipe 是直接写 GM，还是必然物化
+   UB；只把真实 UB/AIV allocation 加入 MURG，A/B L1 和 L0C accumulator 不得计入 UB；
+2. 从 PlanMemory ledger 逐 allocation 验证具体 family 的 `constBits → alignedConstBits`
+   参数与 offset/peak，不能只依据通用源码规则安装 profile；
+3. 对 composite candidate chain 执行 seeds `0..19` + retry，并比较 analyzer、
+   PlanMemory 与 exact replay；
+4. atomic 只有在 hardware/software/CAS/RMW/mask/ordering/target 路径分别取得真实 boundary
+   后才逐族建模；此前继续 `unsupported-op-atomic`。
 
 ### P1：为真实 pipeline 建立第一组有效合同
 

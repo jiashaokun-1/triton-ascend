@@ -84,6 +84,13 @@ private:
 
 std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
                                                           int64_t maxTiles);
+std::unique_ptr<UBResourceContract> makeUBAlignmentContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t alignmentBytes);
+std::unique_ptr<UBResourceContract> makeSequentialContract(
+    StringRef contractId, StringRef contractVersion,
+    const PipelineStageContext &stage,
+    std::vector<std::unique_ptr<UBResourceContract>> contracts);
 std::unique_ptr<UBResourceContract>
 makeInvalidateContract(const PipelineStageContext &stage);
 std::unique_ptr<UBResourceContract> makeDirectCopyPreserveContract(

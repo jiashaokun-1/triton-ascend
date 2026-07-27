@@ -395,6 +395,31 @@ def test_manifest_allows_oracle_to_derive_auto_tile_outcome(tmp_path):
     ] is None
 
 
+def test_manifest_accepts_checked_alignment_candidate_fields(tmp_path):
+    path = _write_manifest(tmp_path)
+    document = json.loads(path.read_text())
+    proposal = document["cases"][0]["contract_proposal"]
+    proposal["alignment_stage"] = "bisheng.ub-affecting-suffix"
+    proposal["alignment_bytes"] = 32
+    path.write_text(json.dumps(document))
+    loaded = oracle.load_manifest(path)
+    assert loaded["cases"][0]["contract_proposal"]["alignment_bytes"] == 32
+
+
+@pytest.mark.parametrize("alignment_bytes", [0, -1, 1 << 63])
+def test_manifest_rejects_invalid_alignment_candidate_fields(
+    tmp_path, alignment_bytes
+):
+    path = _write_manifest(tmp_path)
+    document = json.loads(path.read_text())
+    proposal = document["cases"][0]["contract_proposal"]
+    proposal["alignment_stage"] = "bisheng.ub-affecting-suffix"
+    proposal["alignment_bytes"] = alignment_bytes
+    path.write_text(json.dumps(document))
+    with pytest.raises(oracle.ManifestError, match="alignment fields"):
+        oracle.load_manifest(path)
+
+
 def test_manifest_allows_analyzer_decision_without_a_golden_expectation(tmp_path):
     path = _write_manifest(tmp_path, expected_analyzer_decision=None)
     loaded = oracle.load_manifest(path)
@@ -701,6 +726,67 @@ def test_reshape_copy_contract_chain_uses_view_contracts():
     )
     assert profile["profiles"][0]["pipeline_stages"][0]["contract_id"] == \
         "reshape-copy-max-tiles"
+
+
+def test_alignment_composes_after_family_contract_in_the_same_stage():
+    proposal = {
+        "expected_resource_count": 1,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 64,
+        "alignment_stage": "bisheng.ub-affecting-suffix",
+        "alignment_bytes": 32,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+        {"stage_name": "bisheng.ub-affecting-suffix", "options": {}},
+    ]
+    profile = oracle.build_proposed_contract_profile(
+        {"sha256": "identity"}, stages, proposal
+    )
+    bindings = profile["profiles"][0]["pipeline_stages"]
+    assert [binding["contract_id"] for binding in bindings] == [
+        "direct-copy-max-tiles",
+        "direct-copy-preserve+ub-alignment",
+    ]
+    assert bindings[1]["contract_parameters"]["alignment_bytes"] == "32"
+    assert oracle.expected_contract_trace({
+        "operation_family": "direct-copy",
+        "pipeline_stages_detail": bindings,
+    }) == [
+        "ttir-direct-load-v1",
+        "direct-copy-max-tiles",
+        "direct-copy-preserve",
+        "ub-alignment",
+    ]
+
+
+def test_alignment_composite_rejects_a_stage_before_materialization():
+    proposal = {
+        "expected_resource_count": 1,
+        "expected_source_elements": 65536,
+        "expected_element_bit_width": 32,
+        "expected_input_payload_bytes": 262144,
+        "materialization_stage": "ttir.triton-to-linalg",
+        "max_tiles": 64,
+        "alignment_stage": "ttir.source",
+        "alignment_bytes": 32,
+        "auto_tile_and_bind_subblock_outcome": False,
+    }
+    stages = [
+        {"stage_name": "ttir.source", "options": {}},
+        {"stage_name": "ttir.triton-to-linalg", "options": {}},
+    ]
+    with pytest.raises(
+        oracle.OracleUnavailable,
+        match="must not precede materialization",
+    ):
+        oracle.build_proposed_contract_profile(
+            {"sha256": "identity"}, stages, proposal
+        )
 
 
 def test_reduction_sum_contract_chain_models_suffix_extra_buffer():

@@ -134,9 +134,62 @@ std::optional<int64_t> getPositiveInt64Parameter(
 
 std::unique_ptr<UBResourceContract>
 makeProfileContract(const PipelineContractBinding &binding) {
+  constexpr StringLiteral alignmentSuffix = "+ub-alignment";
+  StringRef contractId = binding.contractId;
+  if (binding.contractVersion == "1" &&
+      contractId.ends_with(alignmentSuffix)) {
+    StringRef baseContractId = contractId.drop_back(alignmentSuffix.size());
+    if (baseContractId.empty() ||
+        baseContractId.ends_with(alignmentSuffix) ||
+        !binding.parameters.contains("expected_resource_count") ||
+        !binding.parameters.contains("alignment_bytes"))
+      return nullptr;
+
+    PipelineContractBinding baseBinding = binding;
+    baseBinding.contractId = baseContractId.str();
+    baseBinding.parameters.erase("alignment_bytes");
+    std::unique_ptr<UBResourceContract> baseContract =
+        makeProfileContract(baseBinding);
+    if (!baseContract)
+      return nullptr;
+
+    PipelineContractBinding alignmentBinding;
+    alignmentBinding.stage = binding.stage;
+    alignmentBinding.contractId = "ub-alignment";
+    alignmentBinding.contractVersion = "1";
+    alignmentBinding.parameters["expected_resource_count"] =
+        binding.parameters.at("expected_resource_count");
+    alignmentBinding.parameters["alignment_bytes"] =
+        binding.parameters.at("alignment_bytes");
+    std::unique_ptr<UBResourceContract> alignmentContract =
+        makeProfileContract(alignmentBinding);
+    if (!alignmentContract)
+      return nullptr;
+
+    std::vector<std::unique_ptr<UBResourceContract>> contracts;
+    contracts.push_back(std::move(baseContract));
+    contracts.push_back(std::move(alignmentContract));
+    return makeSequentialContract(binding.contractId, "1", binding.stage,
+                                  std::move(contracts));
+  }
   if (binding.contractId == "invalidate-unmodeled-stage" &&
       binding.contractVersion == "1" && binding.parameters.empty())
     return makeInvalidateContract(binding.stage);
+  if (binding.contractId == "ub-alignment" &&
+      binding.contractVersion == "1") {
+    constexpr std::array<StringRef, 2> names = {
+        "expected_resource_count", "alignment_bytes"};
+    if (!hasExactParameters(binding, names))
+      return nullptr;
+    auto resourceCount =
+        getPositiveInt64Parameter(binding, "expected_resource_count");
+    auto alignmentBytes =
+        getPositiveInt64Parameter(binding, "alignment_bytes");
+    if (!resourceCount || !alignmentBytes)
+      return nullptr;
+    return makeUBAlignmentContract(
+        binding.stage, *resourceCount, *alignmentBytes);
+  }
   const bool dynamicSourcePreserve =
       binding.contractId == "dynamic-cv-source-preserve" &&
       binding.contractVersion == "1";
@@ -429,21 +482,38 @@ bool loadMatchingProfile(const py::handle &value,
   if (!matchedBindings || matchedBindings->size() != actualStages.size())
     return false;
 
-  const bool containsActiveContract = llvm::any_of(
+  const auto isFamilyMaterializationContract =
+      [](const PipelineContractBinding &binding) {
+    StringRef contractId = binding.contractId;
+    constexpr StringLiteral alignmentSuffix = "+ub-alignment";
+    if (contractId.ends_with(alignmentSuffix))
+      contractId = contractId.drop_back(alignmentSuffix.size());
+    return contractId == "direct-copy-preserve" ||
+           contractId == "direct-copy-max-tiles" ||
+           contractId == "binary-add-preserve" ||
+           contractId == "binary-add-max-tiles" ||
+           contractId == "loop-carried-add-preserve" ||
+           contractId == "loop-carried-add-max-tiles" ||
+           contractId == "loop-carried-add-multibuffer" ||
+           contractId == "reshape-copy-preserve" ||
+           contractId == "reshape-copy-max-tiles" ||
+           contractId == "reduction-sum-preserve" ||
+           contractId == "reduction-sum-max-tiles" ||
+           contractId == "reduction-sum-extra-buffer" ||
+           contractId == "dynamic-cv-source-preserve" ||
+           contractId == "dynamic-cv-replay" ||
+           contractId == "dynamic-cv-result-preserve";
+  };
+  const bool containsFamilyMaterializationContract =
+      llvm::any_of(*matchedBindings, isFamilyMaterializationContract);
+  const bool containsAlignmentContract = llvm::any_of(
       *matchedBindings, [](const PipelineContractBinding &binding) {
-        return binding.contractId == "direct-copy-preserve" ||
-               binding.contractId == "direct-copy-max-tiles" ||
-               binding.contractId == "binary-add-preserve" ||
-               binding.contractId == "binary-add-max-tiles" ||
-               binding.contractId == "loop-carried-add-preserve" ||
-               binding.contractId == "loop-carried-add-max-tiles" ||
-               binding.contractId == "loop-carried-add-multibuffer" ||
-               binding.contractId == "reshape-copy-preserve" ||
-               binding.contractId == "reshape-copy-max-tiles" ||
-               binding.contractId == "reduction-sum-preserve" ||
-               binding.contractId == "reduction-sum-max-tiles" ||
-               binding.contractId == "reduction-sum-extra-buffer";
+        return binding.contractId == "ub-alignment";
       });
+  if (containsAlignmentContract)
+    return false;
+  const bool containsActiveContract =
+      containsFamilyMaterializationContract;
   if (containsActiveContract && !allowUncertifiedActiveContracts &&
       !matchedProfileIsCertified)
     return false;

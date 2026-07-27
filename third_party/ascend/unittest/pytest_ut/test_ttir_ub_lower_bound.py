@@ -1472,6 +1472,88 @@ def test_profile_loader_accepts_certified_direct_copy_schema(monkeypatch, tmp_pa
     assert load_contract_profiles() == document
 
 
+def test_profile_loader_accepts_family_materialization_then_alignment_composite(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] += "+ub-alignment"
+    stage["contract_parameters"]["alignment_bytes"] = "32"
+    document = {
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }
+    profile_path.write_text(json.dumps(document))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    assert load_contract_profiles() == document
+
+
+def test_profile_loader_rejects_standalone_alignment_contract(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    entry["pipeline_stages"] = [{
+        "stage_name": "bisheng.ub-alignment",
+        "options": {"alignment_bytes": "32"},
+        "contract_id": "ub-alignment",
+        "contract_version": "1",
+        "contract_parameters": {
+            "expected_resource_count": "1",
+            "alignment_bytes": "32",
+        },
+    }]
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
+        load_contract_profiles()
+
+
+@pytest.mark.parametrize(
+    ("contract_id", "parameter_updates"),
+    [
+        (
+            "direct-copy-max-tiles+ub-alignment",
+            {"alignment_bytes": "0"},
+        ),
+        (
+            "direct-copy-max-tiles+ub-alignment",
+            {"alignment_bytes": "32", "unexpected": "1"},
+        ),
+        (
+            "unknown-family+ub-alignment",
+            {"alignment_bytes": "32"},
+        ),
+        (
+            "direct-copy-max-tiles+ub-alignment+ub-alignment",
+            {"alignment_bytes": "32"},
+        ),
+    ],
+)
+def test_profile_loader_rejects_malformed_alignment_composite(
+    monkeypatch, tmp_path, contract_id, parameter_updates
+):
+    profile_path = tmp_path / "profiles.json"
+    entry = _direct_copy_profile_entry()
+    stage = entry["pipeline_stages"][0]
+    stage["contract_id"] = contract_id
+    stage["contract_parameters"].update(parameter_updates)
+    profile_path.write_text(json.dumps({
+        "schema": "ttir-ub-lb-profile-v1",
+        "identity_contract": ub_lower_bound._IDENTITY_CONTRACT,
+        "profiles": [entry],
+    }))
+    monkeypatch.setattr(ub_lower_bound, "_PROFILE_PATH", profile_path)
+    with pytest.raises(ValueError, match="invalid packaged"):
+        load_contract_profiles()
+
+
 def test_profile_loader_accepts_certified_p4_schema(monkeypatch, tmp_path):
     profile_path = tmp_path / "profiles.json"
     document = {
@@ -2716,7 +2798,10 @@ def _fake_active_driver(arch):
         ("Ascend910B1", 192, None),
         ("Ascend910_9362", 192, None),
         ("Ascend310B1", 248, None),
-        ("Ascend910_9599", 256, 128),
+        # The target exposes 256 KiB nominal UB, while the pinned PlanMemory
+        # allocator reserves 64 KiB.  Runtime tiling must use the same 192 KiB
+        # threshold as the C++ UB-capacity binding.
+        ("Ascend910_9599", 192, 128),
     ],
 )
 def test_runtime_capacity_uses_binding_and_keeps_rf_separate(monkeypatch, arch, expected_ub, expected_rf):

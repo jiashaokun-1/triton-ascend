@@ -197,6 +197,24 @@ LogicalResult MandatoryUBResourceGraph::lowerResourcePayload(
   return success();
 }
 
+LogicalResult MandatoryUBResourceGraph::alignResourcePayload(
+    ResourceId id, int64_t alignmentBytes, StringRef contractId) {
+  if (id >= resources_.size() || alignmentBytes <= 0 || contractId.empty()) {
+    malformed_ = true;
+    return failure();
+  }
+  const int64_t payload = resources_[id].minPayloadBytes;
+  if (payload < 0 || payload > INT64_MAX - (alignmentBytes - 1)) {
+    malformed_ = true;
+    return failure();
+  }
+  const int64_t alignedPayload =
+      ((payload + alignmentBytes - 1) / alignmentBytes) * alignmentBytes;
+  resources_[id].minPayloadBytes = alignedPayload;
+  resources_[id].contractTrace.push_back(contractId.str());
+  return success();
+}
+
 LogicalResult MandatoryUBResourceGraph::raiseResourceInstances(
     ResourceId id, int64_t minInstances, StringRef contractId) {
   if (id >= resources_.size() || minInstances <= 0 ||

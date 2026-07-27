@@ -94,6 +94,10 @@ StringRef classifyUnsupportedOperation(Operation *operation) {
     return "unsupported-op-shape-construction";
   if (name == "tt.atomic_rmw" || name == "tt.atomic_cas")
     return "unsupported-op-atomic";
+  if (name == "tt.dot_scaled")
+    return "unsupported-dot-scaled-requires-full-boundary";
+  if (name.starts_with("ttascend.") || name.starts_with("hivm.custom_"))
+    return "unsupported-op-custom";
   if (name == "tt.get_program_id" || name == "tt.get_num_programs" ||
       name == "tt.assert" || name == "tt.print")
     return "unsupported-op-launch-or-diagnostics";

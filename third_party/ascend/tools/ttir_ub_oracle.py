@@ -109,6 +109,10 @@ _CONTRACT_PROPOSAL_KEYS = frozenset({
 _MULTIBUFFER_CONTRACT_PROPOSAL_KEYS = (
     _CONTRACT_PROPOSAL_KEYS | {"expected_step_input_instances"}
 )
+_ALIGNMENT_CONTRACT_PROPOSAL_KEYS = frozenset({
+    "alignment_stage",
+    "alignment_bytes",
+})
 _DYNAMIC_CV_CONTRACT_PROPOSAL_KEYS = frozenset({
     "expected_resource_count",
     "expected_output_elements",
@@ -462,16 +466,32 @@ def load_manifest(path: Path) -> dict:
             raise ManifestError("expected_analyzer_decision must be defer, reject, or null")
         proposal = item["contract_proposal"]
         if family == "dynamic-cv":
-            expected_proposal_keys = _DYNAMIC_CV_CONTRACT_PROPOSAL_KEYS
+            base_proposal_keys = _DYNAMIC_CV_CONTRACT_PROPOSAL_KEYS
         elif family == "irregular-memory":
-            expected_proposal_keys = _IRREGULAR_MEMORY_CONTRACT_PROPOSAL_KEYS
+            base_proposal_keys = _IRREGULAR_MEMORY_CONTRACT_PROPOSAL_KEYS
         else:
-            expected_proposal_keys = (
+            base_proposal_keys = (
                 _MULTIBUFFER_CONTRACT_PROPOSAL_KEYS
                 if effective_multibuffer else _CONTRACT_PROPOSAL_KEYS
             )
-        if type(proposal) is not dict or set(proposal) != expected_proposal_keys:
+        if type(proposal) is not dict:
             raise ManifestError("contract_proposal fields do not match the schema")
+        proposal_keys = set(proposal)
+        aligned_proposal_keys = (
+            base_proposal_keys | _ALIGNMENT_CONTRACT_PROPOSAL_KEYS
+        )
+        if proposal_keys not in (base_proposal_keys, aligned_proposal_keys):
+            raise ManifestError("contract_proposal fields do not match the schema")
+        if "alignment_stage" in proposal:
+            if (family == "irregular-memory"
+                    or type(proposal["alignment_stage"]) is not str
+                    or not proposal["alignment_stage"]
+                    or type(proposal["alignment_bytes"]) is not int
+                    or proposal["alignment_bytes"] <= 0
+                    or proposal["alignment_bytes"] > _MAX_INT64):
+                raise ManifestError(
+                    "contract_proposal alignment fields are inconsistent"
+                )
         if type(proposal["materialization_stage"]) is not str or not proposal["materialization_stage"]:
             raise ManifestError("contract_proposal.materialization_stage must be non-empty")
         auto_tile_outcome = proposal["auto_tile_and_bind_subblock_outcome"]
@@ -645,7 +665,16 @@ def build_proposed_contract_profile(
         }
         materialized = False
         bindings = []
+        alignment_stage = proposal.get("alignment_stage")
+        if alignment_stage is not None and sum(
+            stage["stage_name"] == alignment_stage
+            for stage in pipeline_stages
+        ) != 1:
+            raise OracleUnavailable(
+                "alignment stage must occur exactly once in the real pipeline"
+            )
         for stage in pipeline_stages:
+            binding_parameters = dict(parameters)
             is_materialization = stage["stage_name"] == materialization_stage
             is_suffix = stage["stage_name"] == "bisheng.ub-affecting-suffix"
             if is_materialization:
@@ -663,11 +692,20 @@ def build_proposed_contract_profile(
                 )
             else:
                 contract_id = f"{family['contract_prefix']}-source-preserve"
+            if stage["stage_name"] == alignment_stage:
+                if not materialized:
+                    raise OracleUnavailable(
+                        "alignment stage occurs before P4 materialization"
+                    )
+                contract_id += "+ub-alignment"
+                binding_parameters["alignment_bytes"] = str(
+                    proposal["alignment_bytes"]
+                )
             bindings.append({
                 **stage,
                 "contract_id": contract_id,
                 "contract_version": "1",
-                "contract_parameters": dict(parameters),
+                "contract_parameters": binding_parameters,
             })
         return {
             "schema": "ttir-ub-lb-profile-v1",
@@ -698,6 +736,14 @@ def build_proposed_contract_profile(
     output_payload = (input_payload + proposal["max_tiles"] - 1) // proposal["max_tiles"]
     materialized = False
     bindings = []
+    alignment_stage = proposal.get("alignment_stage")
+    if alignment_stage is not None and sum(
+        stage["stage_name"] == alignment_stage
+        for stage in pipeline_stages
+    ) != 1:
+        raise OracleUnavailable(
+            "alignment stage must occur exactly once in the real pipeline"
+        )
     for stage in pipeline_stages:
         is_materialization = stage["stage_name"] == materialization_stage
         parameters = {
@@ -718,6 +764,13 @@ def build_proposed_contract_profile(
               and stage["stage_name"] == "bisheng.ub-affecting-suffix"):
             contract_id = "loop-carried-add-multibuffer"
             parameters["expected_step_input_instances"] = "2"
+        if stage["stage_name"] == alignment_stage:
+            if not materialized or contract_id == "invalidate-unmodeled-stage":
+                raise OracleUnavailable(
+                    "alignment stage must not precede materialization"
+                )
+            contract_id += "+ub-alignment"
+            parameters["alignment_bytes"] = str(proposal["alignment_bytes"])
         bindings.append({
             **stage,
             "contract_id": contract_id,
@@ -748,7 +801,11 @@ def expected_contract_trace(analysis: dict) -> list[str]:
         contract_id = stage.get("contract_id")
         if type(contract_id) is not str or not contract_id:
             raise OracleUnavailable("analyzer returned an invalid stage contract id")
-        contract_ids.append(contract_id)
+        if contract_id.endswith("+ub-alignment"):
+            contract_ids.append(contract_id.removesuffix("+ub-alignment"))
+            contract_ids.append("ub-alignment")
+        else:
+            contract_ids.append(contract_id)
     return [family["matcher_trace"], *contract_ids]
 
 

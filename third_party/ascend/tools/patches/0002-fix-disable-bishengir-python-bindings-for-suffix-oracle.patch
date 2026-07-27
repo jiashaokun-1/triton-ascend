@@ -1,0 +1,11 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -240,3 +240,5 @@
+-# TODO: Standalone build should support python binding
+-if(NOT BISHENGIR_BUILD_STANDALONE_IR_ONLY AND MLIR_ENABLE_BINDINGS_PYTHON)
++# The suffix oracle needs native tools but not Python extension modules.
++option(BISHENGIR_BUILD_PYTHON_BINDINGS
++  "Build the BiShengIR Python bindings." ON)
++if(NOT BISHENGIR_BUILD_STANDALONE_IR_ONLY AND MLIR_ENABLE_BINDINGS_PYTHON AND BISHENGIR_BUILD_PYTHON_BINDINGS)
+  # If parent projects want to configure where to place the python packages,

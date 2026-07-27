@@ -1,544 +1,520 @@
-# TTIR UB 保守过滤器设计
+# TTIR UB 多资源保守过滤器设计
 
 日期：2026-07-21
 
-## 1. 背景与决策
+修订：2026-07-24
+
+状态：multi-resource-first 设计基准
+
+本文取代同路径下早期的 singleton-first 版本。实现、测试、profile 审核和 rollout
+都应以本文为准。历史汇报和交接材料只能作为证据索引，不能放宽本文的正确性门禁。
+
+## 1. 背景与核心决策
 
 Triton-Ascend autotune 会为同一个 kernel 生成多组 tile 和编译选项。部分配置最终在
-HIVM `PlanMemory` 阶段因为 UB 容量不足而失败，但在失败前已经执行 TTIR lowering、
-CVPipeline、bufferization、PlanMemory 等大量后端工作。
+HIVM `PlanMemory` 阶段因为 UB 容量不足而失败，但在失败前已经执行大量 lowering。
 
-本设计在每个 config 完成 `make_ttir` 规范化之后、进入 TTIR→Linalg/HIVM 之前，计算
-UB 峰值的可证明下界。仅当下界已经超过物理 UB 容量时提前拒绝该 config：
+过滤器在每个 config 的 canonical TTIR 生成后、进入后端 lowering 前，构造该 config 的
+`Mandatory UB Resource Graph`（MURG），并沿真实 pipeline 应用版本化
+`UBResourceContract`。只有证书证明某个物理 UB execution scope 中必须同时存在的资源
+下界已经超过该 scope 的 allocator capacity，才提前拒绝配置。
+
+本方案以多资源证明为主：
+
+- source matcher 提取一个语义 pattern 必然产生的**完整资源集合**，而不是只找最大的 tensor；
+- alias、独立 allocation、生命周期和共存时刻都是证明的一部分；
+- solver 的主要输入是显式 `CoexistenceWitness`；
+- singleton 是合法的退化证书，用于只有一个必需资源或多资源关系尚未证明的情况；
+- AIC 和 AIV 是不同物理 UB domain，跨 scope 资源不能相加。
+
+正确性不变量按 execution scope 分别成立：
 
 \[
-LB(config) \le ActualUBPeak(config)
+LB_s(config) \le ActualUBPeak_s(config)
 \]
 
 \[
-Reject(config) \iff Proven(LB) \land LB(config) > Capacity(target)
+Reject(config) \iff
+\exists s.\ Proven(LB_s) \land LB_s(config) > Capacity_s(target)
 \]
 
-这是一条零误杀策略：允许把实际溢出的配置留给真实编译器，但不允许过滤一个真实可
-编译的配置。任何不确定性都返回 `defer`，行为等价于继续真实编译。
-
-2026-07-06 的 `ub-overflow-early-pruning-design.md` 中包含残差回归、overflow 概率和
-阈值策略。该方案仍可用于排序、诊断和召回率研究，但概率输出不得作为本设计的硬拒绝
-依据。本设计取代其硬拒绝合同。
+任何不确定性都返回 `defer`，继续真实编译。
 
 ## 2. 目标与非目标
 
 ### 2.1 目标
 
-- 在 per-config canonicalized TTIR 上运行轻量、确定性的静态分析。
-- 只依据可审核的证明证书提前过滤必然 UB overflow 的配置。
-- 在分析不支持、pipeline 漂移或内部异常时 fail-open，即返回 `defer`。
-- 把 TTIR 到最终 UB 物化之间的保证显式编码为版本化 `UBResourceContract`。
-- 用 `Mandatory UB Resource Graph` 表达必需资源、物化来源、alias、独立性和共存关系。
-- 使用真实 TTIR→HIVM→PlanMemory 作为 oracle，持续验证下界不变量。
-- 支持 `off`、`shadow` 和 `enforce` 三种运行模式。
+- 在 per-config canonical TTIR 上运行确定性的静态分析。
+- 对必需 UB payload、实例数、alias、lifetime、execution scope 建立可审核证明。
+- 通过多资源 witness 捕获真实 overflow 的主要来源。
+- 用精确 pipeline identity 防止旧合同被错误复用于新 pipeline。
+- 用真实 full compiler、PlanMemory 和 exact semantic replay 共同验证下界。
+- 支持 `off`、`shadow`、`enforce`，并保持 production profile 默认空。
+- 未支持 operation、未知 stage、动态 extent 或合同漂移全部具名 `defer`。
 
 ### 2.2 非目标
 
-- 首版不预测完整 UB 峰值，也不替代真实 `PlanMemory`。
-- 首版不为了提高召回率接受统计意义上的误杀概率。
-- 首版不对 Cube 的 L1/L0A/L0B/L0C 做容量规划。
-- 首版不覆盖 SIMT、MIX、dynamic shape、reduction、dot、atomic、复杂控制流和动态访问。
-- 首版不把 Python AST 估算值或机器学习输出转换为拒绝证书。
-- 首版不尝试在 `TileGenerator` 之前过滤；规则稳定后可另行前移。
+- 不预测完整峰值，也不替代 `PlanMemory`。
+- 不使用概率、回归或置信度作为硬拒绝依据。
+- 不把所有 TTIR tensor 都当成物理 UB allocation。
+- 不跨 AIC/AIV scope 汇总 UB。
+- 不对 Cube L1/L0A/L0B/L0C 做容量规划。
+- 不因扩大 matcher 而默认扩大合同适用范围。
+- 不为了召回率自动安装未经审核的 production profile。
 
-## 3. 术语与正确性边界
+## 3. 决策语义
 
-### 3.1 下界与证书
+分析结果只有两种：
 
-`lower_bound_bytes` 不是预测值，而是证书覆盖的所有真实 lowering 都不能低于的 UB 峰值。
-每个数值必须能追溯到：
+- `reject`：存在有效证书，且证书下界严格大于目标 allocator capacity；
+- `defer`：过滤器不作决定，真实编译器继续执行。
 
-- 哪个 TTIR operation/value 产生了资源；
-- 为什么该资源必然物化在 UB；
-- 为什么它不能被 scalarize、消除或进一步切成更小 tile；
-- 哪些 pipeline stage 保留或变换了这个结论；
-- 使用了哪个 target、编译器版本和 pass 选项合同。
+不存在 `keep` 证明。`defer` 不表示一定可编译。
 
-测试和 oracle 用于发现证明实现的错误，但不能把“样本中没有反例”替代成证明。
+边界条件必须是：
 
-### 3.2 决策状态
+```text
+LB > capacity   → reject
+LB == capacity  → defer
+LB < capacity   → defer
+```
 
-- `reject`：至少存在一张有效证书，且由证书得到的下界超过容量。
-- `defer`：没有足以拒绝的证书，包括支持范围之外和证书在中途失效的情况。
-
-不存在 `keep` 证明。`defer` 只表示过滤器不作决定，真实编译器仍是最终裁判。
-
-### 3.3 UB 容量
-
-首版使用目标芯片公开的物理 UB 容量：A2/A3 为 192 KiB，910_95/950 为 256 KiB。
-使用物理上限而不是可能更小的 planner 可用量会降低召回率，但不会引入误杀。未知 target
-必须 `defer`，不能套用默认容量。
+分析器错误、整数溢出、图冲突、未知 target、profile 未命中都必须 fail-open 为 `defer`。
 
 ## 4. 总体架构
 
 ```text
 Autotune config
-    ↓
-make_ttir: inliner/combine/canonicalize/CSE/LICM/unroll
-    ↓ canonicalized TTIR + compile options + pipeline identity
-TTIR UB Lower-Bound Analyzer
-    ↓
-TTIR source rules → Mandatory UB Resource Graph
-    ↓
-UBResourceContract chain
-    ↓
-validated MURG → lower-bound certificates
-    ├─ off/shadow/defer → ttir_to_linalg → BiShengIR → PlanMemory
-    └─ enforce + LB > capacity → UBLowerBoundOverflow → discard config
+    │
+    ▼
+canonical TTIR
+    │
+    ├─ mode=off ───────────────────────────────→ 原后端编译
+    │
+    ▼
+PipelineIdentity
+    │
+    ▼
+Strict source matcher
+    │  为一个完整语义 pattern 提取必需资源和初始关系
+    ▼
+MandatoryUBResourceGraph
+    │
+    ▼
+ordered UBResourceContract chain
+    │  Preserve / Transform / Invalidate
+    ▼
+validated MURG
+    │
+    ▼
+scope-aware multi-resource solver
+    │
+    ├─ 无有效证书 / LB ≤ capacity ─────────────→ defer
+    └─ witness LB > capacity
+         ├─ shadow ─────────────────────────────→ 记录并继续
+         └─ enforce ─→ UBLowerBoundOverflow ────→ autotune 丢弃 config
 ```
 
-模块分层：
+模块职责：
 
 ```text
 TTIRSourceAnalyzer
-  只从 TTIR 建立候选资源和来源关系
+  识别完整 SSA 子图并建立候选资源、source facts 和初始关系
 
 MandatoryUBResourceGraph
-  保存必需资源及其证明关系，不执行概率估算
+  保存资源、alias、distinct、lifetime、scope、witness 和 trace
 
 PipelineContractRegistry
-  按真实 pass 顺序应用 UBResourceContract
+  按真实 stage 顺序验证或变换整张图
 
 LowerBoundSolver
-  只从仍有效的 singleton/coexistence witness 求下界
+  以多资源 witness 为主，singleton 为退化路径，按 scope 求下界
 
 PythonPolicy
-  执行 off/shadow/enforce，记录 metadata 或抛出资源异常
+  执行 off/shadow/enforce、metadata、debug dump 和异常策略
+
+Oracle
+  对照 full compiler、PlanMemory 和 exact semantic replay，生成候选 profile
 ```
 
-## 5. Mandatory UB Resource Graph
+## 5. MURG：多资源证明中间表示
 
-### 5.1 目的
+### 5.1 为什么称为“证明图”
 
-`Mandatory UB Resource Graph`，简称 MURG，是证明中间表示。它不表示所有 TTIR tensor，
-只表示已经证明在受支持 lowering 中必然占用 UB 的资源。没有证明的 tensor 不进入图。
+图中的节点和边不是对最终编译结果的猜测，而是当前合同链已经证明、且仍然有效的事实：
 
-MURG 解决三个常见的错误建模问题：
+- 节点证明某个 payload 至少需要多少字节、至少有几个实例；
+- alias 边证明资源是否共享存储；
+- distinct 边证明资源必须落在不同 allocation；
+- lifetime 和 witness 证明哪些资源在同一时刻必须存在；
+- execution scope 证明这些资源属于哪个物理 UB domain；
+- trace 证明每个事实经过了哪些精确 stage 合同。
 
-1. 一个 TTIR tensor 可能被融合、scalarize 或消除，不能看到 shape 就计入 UB。
-2. 两个逻辑值可能 alias 同一物理 buffer，不能直接相加。
-3. 两个独立 buffer 可能生命周期不重叠，也不能直接相加。
+图本身不是最终证书。solver 从仍有效的图事实中选择一个可验证子集，生成
+`LowerBoundCertificate`。
 
 ### 5.2 资源节点
 
-每个 `MandatoryUBResource` 至少包含：
+当前资源核心字段为：
 
 ```cpp
 struct MandatoryUBResource {
   ResourceId id;
-  OperationOrigin origin;
+  std::string debugName;
   int64_t minPayloadBytes;
-  int64_t minInstances;          // 下界，首版固定为 1
-  AddressSpace addressSpace;     // 必须为 UB
-  MaterializationKind kind;      // 例如 GMToUBLoad
+  int64_t minInstances;
+  OperationOrigin origin;
+  UBAddressSpace addressSpace;
+  UBExecutionScope executionScope; // SingleCore / AIC / AIV
+  MaterializationKind kind;
   ProgramPoint birth;
   ProgramPoint lastRequiredUse;
+  SourceFacts sourceFacts;
   ContractTrace trace;
   ValidityState validity;
 };
 ```
 
-`minPayloadBytes` 首版不向上补 alignment。若 raw payload 已超过物理容量即可确定拒绝；
-alignment 和 multi-buffer 只会增加真实使用量，暂时不计不会破坏下界。
+数值含义：
+
+\[
+bytes(r) = minPayloadBytes(r) \times minInstances(r)
+\]
+
+两项都必须是有证明的下界。乘法、加法、stable ID 分配均使用 checked arithmetic。
 
 ### 5.3 图关系
 
-MURG 包含四类关系：
+- `derives-from`：记录 TTIR value、逻辑资源和后续物理资源之间的来源关系；
+- `mayAlias(a,b)`：当前不能证明共享，也不能证明独立；
+- `mustAlias(a,b)`：两个逻辑资源确定落在同一 allocation；
+- `mustDistinct(a,b)`：两个 alias class 确定落在不同 allocation；
+- `CoexistenceWitness(point, resources)`：这些资源在同一个 program point 必须存活。
 
-- `derives-from`：资源从哪个 TTIR value 及后续哪个逻辑资源变换而来，用于 provenance。
-- `may-alias` / `must-alias`：描述可能或确定共享存储的资源。
-- `must-distinct`：证明两个资源不可能复用同一物理存储。
-- `alive-at`：资源必须在某个已证明的 witness program point 存活。
+关系不能互相冲突。同一 pair 同时出现 `mustAlias` 与 `mustDistinct`、跨 execution scope
+建立 alias/witness、重复或越界 ID，都会使图 malformed 并 `defer`。
 
-多资源下界不能仅依赖两两 `must-coexist`。三个资源两两存在重叠，不代表三者同时存在。
-因此 MURG 使用显式 `CoexistenceWitness`：
+### 5.4 生命周期
 
-```cpp
-struct CoexistenceWitness {
-  WitnessId id;
-  ProgramPoint point;
-  SmallVector<ResourceId> resources;
-  ContractTrace trace;
-};
+`birth` 和 `lastRequiredUse` 是资源的最小生存区间。source matcher 可以先记录保守事实，
+后续 materialization/lifetime contract 再确认真实 lowering 中的 program point。
+
+“两个资源都出现在 IR”不等于“必须同时存在”。多资源求和必须有显式 witness。
+
+## 6. Scope-aware 多资源求解
+
+solver 按以下顺序执行：
+
+1. 丢弃 invalid resource，但保留其 trace 用于 defer 诊断。
+2. 用 `mustAlias` 构造 alias equivalence class。
+3. 每个 alias class 只取成员中的最大有效下界，禁止重复计数 view。
+4. 检查 witness 中所有资源有效且属于同一 execution scope。
+5. 检查 witness 中不同 alias class 两两具有 `mustDistinct`。
+6. 对该 witness 的 alias classes 做 checked sum。
+7. 在所有有效 witness 和 singleton 中取最大下界。
+
+多资源 witness：
+
+\[
+LB_w =
+\sum_{c \in AliasClasses(w)}
+\max_{r \in c} bytes(r)
+\]
+
+有效条件：
+
+\[
+\forall c_i \ne c_j,\ MustDistinct(c_i,c_j)
+\]
+
+最终证书：
+
+\[
+LB = \max(\max_r bytes(r), \max_w LB_w)
+\]
+
+这里的 `max(singleton, witness)` 是安全兜底，不表示方案以 singleton 为主。
+
+### 6.1 跨 scope 示例
+
+Dynamic CV lowering 可能产生：
+
+```text
+AIC Fixpipe resource = 512 bytes
+AIV vector resource  = 512 bytes
 ```
 
-只有 witness 中所有资源都有效、两两 `must-distinct`，才能对它们求和。可能 alias 的资源
-在首版不得参与组合证书。
+两个 core 各有独立 UB，因此正确下界是：
 
-### 5.4 下界求解
-
-单资源证书：
-
-\[
-LB_{single} = bytes(r) \times minInstances(r)
-\]
-
-共存证书：
-
-\[
-LB_{witness} = \sum_{r \in witness} bytes(r) \times minInstances(r)
-\]
-
-最终结果：
-
-\[
-LB = \max(LB_{single}, LB_{witness})
-\]
-
-首版只启用 singleton witness。图结构预留多资源能力，但在 `must-distinct` 和 `alive-at`
-合同完成前不能启用求和。
-
-### 5.5 失效语义
-
-资源证书在任一 stage 遇到以下情况即失效：
-
-- pass 可能消除该资源；
-- pass 可能把它切成更小 tile，但没有已证明的尺寸传递函数；
-- address space 可能不再是 UB；
-- alias 或生命周期关系变得未知；
-- pipeline identity、target 或选项不在合同范围内。
-
-失效资源可保留在调试 trace 中，但不能进入 `LowerBoundSolver`。
-
-## 6. UBResourceContract
-
-### 6.1 目的
-
-`UBResourceContract` 描述一个 lowering rule 或 pipeline stage 对 MURG 结论的影响。分析器
-并不在 TTIR 上复刻所有真实 pass，而是要求每个会影响证书的阶段给出可审核的传递保证。
-
-```cpp
-class UBResourceContract {
-public:
-  virtual StringRef id() const = 0;
-  virtual StringRef version() const = 0;
-  virtual bool matches(const PipelineStageContext &) const = 0;
-  virtual ContractResult apply(MandatoryUBResourceGraph &,
-                               const PipelineStageContext &) const = 0;
-};
+```text
+LB_AIC = 512 bytes
+LB_AIV = 512 bytes
 ```
 
-`ContractResult` 对每个受影响资源返回：
+不能生成 `1024 bytes` 的跨核 witness。任何跨 scope alias、distinct 或 coexistence
+关系都应 fail closed。
 
-- `Preserve`：该阶段不会降低资源下界或破坏关系。
-- `Transform`：使用已证明的单调传递函数更新最小字节数、实例数或 witness。
-- `Invalidate`：无法证明保留，下游不得使用该证书。
-- `InternalError`：分析实现异常；整个分析 fail-open 为 `defer`。
+## 7. Source matcher
 
-### 6.2 合同必须声明的信息
+matcher 的单位是一个受支持的 SSA 语义 pattern，不是一行 TTIR，也不是每个 operation
+单独建立一套 identity。
 
-每个合同必须声明：
+输入是整个 canonical `ModuleOp`。matcher：
 
-- 精确 stage/pass 名称及顺序位置；
-- 适用的 operation 形态；
-- target 和编译器版本范围；
-- 相关编译选项和默认值；
+1. 先做结构和 dialect preflight；
+2. 在完整 SSA use-def graph 中定位受支持 pattern；
+3. 验证 operation 集合、shape、类型、属性、region、use 数量和控制流；
+4. 为该 pattern 一次性建立完整候选资源集合；
+5. 建立 source 阶段可知的 `mayAlias`、lifetime 和 witness；
+6. 遇到额外 operation 或动态事实立即返回结构化 reason。
+
+PipelineIdentity 属于整个 config/pipeline，不属于某个 operation。
+
+### 7.1 当前已实现的安全切片
+
+| Pattern | 候选资源 | 关键关系 |
+|---|---|---|
+| direct copy | GM→UB input | singleton |
+| binary add | lhs input、rhs input | 初始 mayAlias；物化后 mustDistinct；同点 witness |
+| reshape copy | load、logical view | 物化后 mustAlias；alias class 只计一次 |
+| reduction sum | input、scratch、accumulator | suffix 后 pairwise mustDistinct；reduce witness |
+| loop-carried add | accumulator、step input | 跨迭代 lifetime；loop witness |
+| loop multibuffer factor=2 | accumulator、step input×2 | `minInstances=2`；loop witness |
+| Dynamic CV MIX dot→exp | AIC Fixpipe、AIV vector | 分 scope singleton，禁止跨核相加 |
+
+Irregular indirect-add 的真实 boundary 在 gather 前存在动态
+`memref.alloc(%dim) : memref<?xf32>`。TTIR 无法证明 source extent，因此必须返回
+`unsupported-irregular-source-extent`，不能只计算 index/value 两个小资源。
+
+## 8. UBResourceContract
+
+### 8.1 Transfer function 的含义
+
+合同是一个精确 stage 对 MURG 事实的状态变换：
+
+```text
+MURG_before_stage
+    │
+    ├─ Preserve   → 事实和下界保持
+    ├─ Transform  → 按已证明的单调规则更新 payload/instances/relations/lifetime/scope
+    ├─ Invalidate → 相关事实失效
+    └─ Error      → 整体 defer
+    ▼
+MURG_after_stage
+```
+
+它不是完整模拟 pass，也不是只返回一个经验公式。实现可以是：
+
+- 精确结构检查；
+- 有证明的整数传递公式；
+- alias/lifetime/scope 关系精化；
+- 对 exact semantic replay 结果的 identity-bound 使用；
+- 无法证明时主动 Invalidate。
+
+与完整语义重放的区别：
+
+- 语义重放尝试模拟 pass 后的抽象 IR 状态；
+- ResourceContract 只传递“拒绝证书所需的最小事实”；
+- replay 可以作为某个合同的 oracle 或实现依据，但不能替代 pipeline identity 和
+  production profile 审核。
+
+### 8.2 合同必须绑定的信息
+
+- 精确 stage 名称、序号和关键参数；
+- operation family 和 source facts；
+- target、compile mode、compiler kind/content hash；
+- canonical TTIR hash；
+- Triton/Ascend/CANN/BiSheng 版本；
 - 前置不变量；
-- 对 resource、alias、distinct、lifetime 的后置保证；
+- 对资源、alias、distinct、lifetime、scope 的后置保证；
 - 失效条件；
-- 对应单元测试和真实 oracle fixture。
+- unit test、fixture、PlanMemory 和 replay 证据。
 
-“当前实现看起来不会改变 buffer”不是合同。没有代码证据或真实 compiler oracle 支持的路径
-必须 `Invalidate`。
+### 8.3 当前合同族
 
-### 6.3 Pipeline contract chain
+生产 loader 当前认识以下已版本化切片：
 
-`PipelineContractRegistry` 按真实编译顺序应用合同：
+- `invalidate-unmodeled-stage@1`
+- `direct-copy-preserve@1`
+- `direct-copy-max-tiles@1`
+- `binary-add-preserve@1`
+- `binary-add-max-tiles@1`
+- `reshape-copy-preserve@1`
+- `reshape-copy-max-tiles@1`
+- `reduction-sum-preserve@1`
+- `reduction-sum-max-tiles@1`
+- `reduction-sum-extra-buffer@1`
+- `loop-carried-add-preserve@1`
+- `loop-carried-add-max-tiles@1`
+- `loop-carried-add-multibuffer@1`
+- `dynamic-cv-source-preserve@1`
+- `dynamic-cv-replay@1`
+- `dynamic-cv-result-preserve@1`
+- `ub-alignment@1`（P5 leaf candidate primitive，不允许 standalone profile）
+- `<family-contract>+ub-alignment@1`（同一真实 stage 内的有序 composite：
+  先执行 family materialization，再逐物理资源 alignment；证书 trace 展开 leaf IDs）
+
+未知 stage 或不匹配参数不得使用 family-wide 默认 Preserve。
+
+PlanMemory 的三种 alignment 语义必须分开：
+
+- payload rounding：`alignedConstBits = AlignUp(constBits, alignUnit)`，属于本方案
+  可以建模的逐 allocation 强制下界；
+- offset alignment：planner 用 aligned extent 排布/复用 offset，不代表再增加一份
+  payload；
+- scope reservation：UB capacity 是 planner 的上限检查，不作为额外资源加入 MURG。
+
+## 9. PipelineIdentity
+
+分析器绑定完整 pipeline，而不是为每个 operation 建立 identity：
 
 ```text
-canonicalized TTIR
-  → AutoBlockify contract
-  → TritonToStructure/Unstructure contract
-  → TritonToHIVM/HFusion/Linalg materialization contract
-  → DynamicCVPipeline contract
-  → BiSheng tiling/canonicalization contract
-  → SplitMix/InlineScope/TileAndBindSubBlock contract
-  → bufferization/decompose/scope/alignment/multibuffer contract
-  → PlanMemory interpretation contract
-```
-
-未知 pass 默认视为可能缩小或消除资源，并使相关证书失效。只有合同明确声明“只增加资源、
-不缩小现有资源”时，才可以直接保留下界。
-
-### 6.4 Pipeline identity
-
-分析器必须绑定实际 pipeline，而不能维护一份容易漂移的静态 pass 名单。将
-`ttir_to_linalg` 的 PassManager 构造重构为共享 builder，同时生成规范化 fingerprint：
-
-```text
-PipelineIdentity = hash(
-  normalized open-source pass pipeline,
-  relevant compile options,
-  target arch,
-  Triton/Ascend plugin version,
-  CANN/BiSheng version hash
+PipelineIdentity = SHA256(
+  normalized pipeline/stage order
+  + canonical TTIR SHA256
+  + UB-affecting options
+  + target arch / compile mode / core kind
+  + Triton and Ascend versions
+  + selected compiler kind and content hash
+  + CANN/BiSheng hash
+  + libdevice and effective environment switches
 )
 ```
 
-- Python 实际编译和 analyzer 使用同一 builder 的 pipeline 描述。
-- fingerprint 未命中审核过的 contract profile 时，运行时 `defer`。
-- CI 对 fingerprint 做 golden 检查；pass 新增、删除或调序必须触发审核。
+实际编译与分析器必须共享同一 pipeline builder 和规范化 option 集合。任何 pass
+新增、删除、调序、默认值或二进制内容变化都必须改变 identity。profile 未精确命中时
+只能 `defer`。
 
-## 7. 首版证明规则
+## 10. UB capacity
 
-### 7.1 DirectTensorLoadMaterialization
+capacity 必须来自 C++ `getUBCapacityBytes(target)`，Python runtime 使用同一 binding。
+未知 target 没有默认值。
 
-首版只为满足全部条件的 ranked `tt.load` 建立 singleton resource：
+当前 target contract：
 
-- static ranked tensor result；
-- pure SIMD/AIV；
-- 连续且可静态证明的 GM pointer 访问；
-- 无 mask、boundary padding、descriptor、unstructured、discrete 或 deinterleave 路径；
-- element type 大小静态已知；
-- load 结果存在不可 DCE 的数据使用并最终到达 store；
-- 无 reduction、dot、atomic、loop-carried value 和未知 region control flow；
-- 所有可能 scalarize、消除或缩小 tile 的 stage 均有匹配合同。
+| Target family | PlanMemory allocator capacity |
+|---|---:|
+| Ascend910B / 910_93 aliases | 192 KiB |
+| Ascend310B1–B4 | 248 KiB |
+| Ascend910_95 / Ascend950 aliases | 192 KiB |
 
-源规则建立逻辑 load 候选。`TritonToLinalgLoadContract` 根据当前 converter 中 ranked load
-创建同形状 `memref.alloc` 和 GM→local copy 的行为，证明 `GMToUBLoad` 物化。后续每个
-合同继续传递这一结论。
+910_95/950 的 nominal UB 为 256 KiB，但当前 identity 绑定的 PlanMemory 会保留 64 KiB，
+真实拒绝阈值是 192 KiB。早期设计中的 256 KiB 已废止。
 
-如果 `auto_blockify`、sub-block tiling、CVPipeline 或 UB-saving 路径可能缩小资源，且没有
-精确传递函数，则证书失效。首版宁可多数配置 `defer`，也不能拿原始 TTIR tile 大小直接
-拒绝。
+## 11. C++、binding 与 Python policy
 
-### 7.2 首版不启用的规则
-
-- 两个输入 buffer 相加：需要 `must-distinct` 和同一 `CoexistenceWitness`。
-- 输出 buffer：可能通过 DPS/inplace 复用输入。
-- alignment：需要证明最终 planner 的强制对齐下界。
-- multi-buffer 倍数：首版 `minInstances=1`。
-- reduction accumulator/scratch：lowering 会产生 init/empty，后续仍可能改变。
-- MIX/CV buffer：需要 SplitMix 和各 CV pass 的合同。
-
-这些都作为后续独立合同增加，不能以 heuristic 填入 MURG。
-
-## 8. C++ 与 Python 接口
-
-### 8.1 建议目录
-
-```text
-third_party/ascend/include/Analysis/TTIRUBLowerBound/
-  TTIRUBLowerBound.h
-  MandatoryUBResourceGraph.h
-  UBResourceContract.h
-  PipelineContractRegistry.h
-
-third_party/ascend/lib/Analysis/TTIRUBLowerBound/
-  TTIRUBLowerBound.cpp
-  MandatoryUBResourceGraph.cpp
-  UBResourceContract.cpp
-  DirectTensorLoadMaterialization.cpp
-
-third_party/ascend/backend/
-  ub_lower_bound.py
-  errors.py
-```
-
-`include/Analysis` 和 `lib/Analysis` 分别加入 CMake。pybind 初始化放在独立源文件并由
-`triton_ascend.cc` 注册：
-
-```python
-ascend.analysis.ttir_ub_lower_bound(module, options) -> dict
-```
-
-### 8.2 返回结构
+公开分析结果：
 
 ```json
 {
   "decision": "reject|defer",
-  "lower_bound_bytes": 262144,
+  "lower_bound_bytes": 524288,
   "capacity_bytes": 196608,
-  "certificates": [
-    {
-      "kind": "singleton",
-      "resource": "gm_to_ub_load",
-      "origin": "kernel.ttir.mlir:12:9",
-      "bytes": 262144,
-      "contract_trace": [
-        "ttir-direct-load-v1",
-        "triton-to-linalg-load-v1",
-        "post-lowering-profile-v1"
-      ]
-    }
-  ],
+  "certificates": [{
+    "kind": "witness",
+    "resource_ids": [0, 1],
+    "bytes": 524288,
+    "contract_trace": ["...", "..."]
+  }],
   "unsupported_reasons": [],
+  "defer_trace": [],
   "pipeline_identity": "...",
   "contract_version": "ttir-ub-lb-v1"
 }
 ```
 
-`lower_bound_bytes` 始终表示有效证书中的最大下界；没有有效证书时为 0，决策必须是
-`defer`。调试估算如需保留，必须使用独立字段且不得传入拒绝策略。
+Python policy 必须二次验证 schema、capacity、identity、certificate 和严格大于关系。
+`off` 不调用分析器；`shadow` 记录但不拒绝；`enforce` 只对经过 production profile
+验证的 `reject` 抛出可 pickle 的 `UBLowerBoundOverflow`。
 
-## 9. 编译与 Autotune 集成
+完整证书只进入 debug dump。普通 metadata 保持紧凑且 JSON serializable。
 
-### 9.1 运行模式
+## 12. Oracle 与 profile promotion
 
-在 `NPUOptions` 中增加 `ub_lower_bound_mode`：
-
-- `off`：默认值，不调用分析器。
-- `shadow`：运行分析并记录结果，不拒绝。
-- `enforce`：仅对 `decision=reject` 抛出异常。
-
-选项参与 compiler cache key。非法值在 option parsing 阶段报错。
-
-### 9.2 接入位置
-
-`make_ttir()` 完成现有 canonicalization/CSE/LICM/unroll 后调用 Python policy。分析发生在
-真实 per-config TTIR 上，因此 config 的 constexpr tile 已经实例化。
-
-这一位置仍需支付 TTIR 前端成本，但可以跳过：
-
-- TTIR→Linalg/HIVM lowering；
-- Dynamic CVPipeline；
-- BiShengIR 后端 pass；
-- bufferization 和 PlanMemory；
-- 二进制生成及无效 config benchmark。
-
-### 9.3 异常合同
-
-新增可 pickle 的 `UBLowerBoundOverflow(OutOfResources)`：
-
-- `required` 为证明下界；
-- `limit` 为物理 UB 容量；
-- 附带 primary certificate、origin、pipeline identity。
-
-核心 compiler stage wrapper 必须原样重新抛出 `OutOfResources`，不能包装成普通
-`MLIRCompilationError`。Ascend autotuner 的串行和并行 `_batch_bench` 都捕获该异常并
-丢弃对应 config。
-
-若所有 config 均被证明溢出，autotuner 报告 `No valid triton configs`，并展示最小下界
-及其证书。不能为了保证至少一个候选而保留已证明溢出的 config。
-
-### 9.4 Metadata 与日志
-
-shadow 或成功通过的 enforce 编译把以下字段写入 metadata：
+每个候选 operation family 必须同时具备：
 
 ```text
-ub_lower_bound_mode
-ub_lower_bound_decision
-ub_lower_bound_bytes
-ub_capacity_bytes
-ub_lower_bound_contract_version
-ub_lower_bound_pipeline_identity
-ub_lower_bound_certificate_count
-ub_lower_bound_unsupported_reasons
+canonical TTIR
+  ├─ analyzer → MURG / certificate / LB
+  ├─ full compiler → before-CVPipelining boundary
+  ├─ suffix compiler → PlanMemory peak/overflow
+  └─ exact semantic replay → expected scope/resource state
 ```
-
-完整证书只在 debug dump 中写入 `kernel.ttir.ub-lower-bound.json`。普通模式不逐配置输出，
-`TRITON_PRINT_AUTOTUNING=1` 时只打印聚合的 analyzed/rejected/deferred/backend-compiled
-数量。
-
-分析器异常不传播到用户编译；policy 记录 `internal-error` reason 后返回 `defer`。
-
-## 10. 容量单一来源
-
-`UBResourceContract` 模块提供 `getUBCapacityBytes(target)`，C++ 分析器直接使用。现有
-`third_party/ascend/backend/runtime/utils.py` 的 192/256 KiB 判断改为调用同一 pybind
-接口，避免 TileGenerator 与过滤器对硬件容量理解不一致。
-
-测试可以直接构造 target contract，不增加可由生产 config 覆盖容量的公开选项，避免
-用户把错误容量变成误杀来源。
-
-## 11. 测试设计
-
-### 11.1 C++/MLIR 单元测试
-
-- static direct load 的正向资源和完整 trace；
-- `LB < capacity`、`LB == capacity`、`LB > capacity`；
-- 192 KiB、256 KiB 和未知 target；
-- shape 字节乘法溢出返回 `defer`；
-- scalar、masked、dynamic、descriptor、unstructured、discrete、DCE load；
-- reduction、dot、loop、atomic 和未知 op；
-- 每个 contract 的 Preserve、Transform、Invalidate；
-- MURG alias/distinct/witness 求解，尤其验证两两 overlap 不会被错误地三项求和；
-- pipeline fingerprint mismatch 使证书失效。
-
-### 11.2 Python/Autotune 测试
-
-- `off` 不调用绑定；
-- `shadow` 写 metadata 且继续编译；
-- `enforce` 只拒绝证明溢出；
-- analyzer error 和未知 target fail-open；
-- `UBLowerBoundOverflow` 穿过 compiler wrapper；
-- 串行和并行 autotune 都丢弃该 config；
-- 所有 config 被拒绝时诊断完整；
-- cache hit 不重复分析；
-- off/shadow 不改变 best config。
-
-### 11.3 真实 compiler oracle
-
-对每个 TTIR/config 同时运行 lower-bound analyzer 和完整真实编译：
-
-```text
-canonicalized TTIR ─→ analyzer ─→ LB/certificate
-         └──────────→ TTIR→HIVM→PlanMemory ─→ actual peak/overflow
-```
-
-oracle 必须从 `PlanMemory` 或 `--enable-print-memory-allocated-size` 获取 UB 数值。编译失败
-时直接解析 stdout/stderr；不能把任意失败当作 UB overflow。
-
-数据矩阵覆盖：
-
-- vector add、elementwise chain、broadcast 和 DCE；
-- threshold 附近多档静态 tile；
-- FP16/BF16/FP32 和常见整数类型；
-- A2/A3、910_95/950；
-- multibuffer、`num_stages`、auto blockify、sub-block tiling；
-- dynamic CV、MIX、SIMT、reduction、dot、mask 等 defer 路径；
-- PlanMemory seed `0..19`。
 
 硬门禁：
 
 \[
-LB(config) \le \min_{seed=0..19} ActualUBPeak(config, seed)
+LB_s(config) \le
+\min_{seed=0..19,retry} ActualUBPeak_s(config, seed)
 \]
 
-- 每个 analyzer `reject` 必须由真实 PlanMemory 证明 overflow。
-- 下界违规数必须为 0。
-- 真实可编译 config 被拒绝数必须为 0。
+- 每个 analyzer reject 都必须是真实 UB overflow；
+- overflow scope 必须是 UB，不能把 L1 或普通编译失败当 UB；
+- violations 必须为 0；
+- unavailable 必须为 0；
+- binary hashes、fixture hashes、identity 和 auto-tile outcome 必须写入报告；
+- deliberate-defer case 不得生成 production profile。
 
-## 12. 性能、上线与回退
+oracle 只能输出候选 profile，不能自动编辑 packaged profile。安装需要人工审核。
 
-分析器遍历 operation 和 MURG 边，目标复杂度为 `O(V+E)`。代表性 corpus 的 p95 分析
-耗时目标小于 5 ms。
+## 13. Operation family 覆盖策略
+
+“全量 operation”指 coverage matrix 中必须有明确状态，不表示首版全部支持。
+
+| Family | 当前策略 |
+|---|---|
+| direct memory | 受限 direct-copy candidate |
+| elementwise | 受限 binary-add candidate；其他 defer |
+| view | 受限 reshape-copy candidate；其他 defer |
+| reduction | 受限 f32 sum candidate；其他 defer |
+| control flow | 受限 loop-carried-add candidate；其他 defer |
+| multibuffer | 受限 factor=2 candidate；其他 defer |
+| Dynamic CV/MIX | dot→exp replay-shadow；等待 P4 server gate |
+| descriptor / irregular | deliberate defer |
+| layout transform | deliberate defer |
+| dot general | P5；A/B 通常进入 L1、accumulator 进入 L0C，不能计入 UB；只有真实 lowering 证明的 Fixpipe/后续 AIV UB allocation 才能建资源 |
+| atomic | P5；先 defer |
+| alignment | P5；需证明 allocator 强制 padding 下界 |
+| custom ops | P5；逐 op explicit contract，默认 defer |
+
+扩展一个 family 的最小提交单元是：
+
+1. strict matcher；
+2. 完整 MURG resources；
+3. alias/distinct/lifetime/scope/witness；
+4. 全 stage contract chain；
+5. full-compiler fixture；
+6. PlanMemory + exact replay oracle；
+7. coverage matrix 和 defer mutations。
+
+缺少任一项不得扩大 matcher。
+
+## 14. 性能、rollout 与回退
+
+图构造和求解目标复杂度为 `O(V + E + W·K²)`；`K` 是单个 witness 的资源数，受支持
+pattern 必须保持有界。代表性 corpus 的 p95 目标仍为每 module 小于 5 ms。
 
 上线顺序：
 
-1. 默认 `off`，完成单元测试、ASan/UBSan 和 oracle 工具。
-2. CI 与代表性 autotune workload 开启 `shadow`。
-3. 审核所有证书反例；任一反例立即使对应 contract profile 失效。
-4. 满足零违规门禁后，允许用户显式开启 `enforce`。
-5. 稳定后再评估默认模式，不在首版自动切换。
+1. 默认 `off`；
+2. CI 和代表性 workload 开 `shadow`；
+3. 持续比较每张多资源证书与真实 per-scope PlanMemory peak；
+4. 任一反例立即撤销对应 identity/profile；
+5. 零违规稳定后，仅允许用户显式 `enforce`；
+6. 最后再评估默认模式，首版不自动切换。
 
-紧急回退只需设置 `ub_lower_bound_mode=off`。过滤器不会修改 TTIR，因此关闭后恢复现有
-编译路径。
+紧急回退设置 `ub_lower_bound_mode=off`。过滤器不修改 TTIR，关闭后恢复旧编译路径。
 
-## 13. 演进路线
+## 15. 当前完成边界
 
-在保持同一证明合同的前提下逐步增加：
+- P0–P3 的代码切片已按多资源语义实现并有本地测试和历史 CANN oracle 证据；
+- P4 Dynamic CV/MIX 和 irregular fail-closed 代码已完成；
+- P4 仍缺目标 CANN 环境的 rebuilt binary hashes、seeds 0..19、retry 和 exact replay
+  最终门禁；
+- packaged production profile 仍为空；
+- P5 的 Alignment primitive、同-stage composite、profile/oracle schema 和所有 long-tail
+  structured defer 已完成本地实现；general dot/atomic 的正向资源模型仍等待真实 boundary；
+- rollout 尚未开始 production promotion。
 
-1. `TileAndBindSubBlock` 的最小 tile 传递函数；
-2. 确定不 alias 且必须共存的双输入 elementwise witness；
-3. reduction accumulator/scratch resource；
-4. loop-carried resource 和 multi-buffer 的 `minInstances`；
-5. SplitMix 后 AIV 投影以及 MIX/CVPipeline 合同；
-6. 已稳定规则前移到 AST/TileGenerator，在生成 TTIR 前过滤同一批配置。
-
-每项扩展必须新增 `UBResourceContract`、MURG 证明关系和真实 oracle fixture。不能只增加
-一个经验公式或扩大 matcher。
-
-## 14. 已知环境前置条件
-
-设计 worktree 创建时仓库状态干净，但本机基线测试环境不完整：系统 Python 缺少
-`pytest`，Anaconda Python 有 `pytest` 但没有安装 `triton`，仓库内也没有已有构建产物。
-进入实现和验证阶段前需要按项目安装指南建立可导入当前 worktree `triton` 的构建环境。
-
-该环境限制只影响本地基线验证，不改变本文的正确性合同和验收门禁。
+实施状态和可执行步骤以同目录
+`../plans/2026-07-21-ttir-ub-conservative-filter-implementation.md` 为准。

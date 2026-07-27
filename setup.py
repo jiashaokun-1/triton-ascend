@@ -760,14 +760,18 @@ def get_package_dirs():
         if backend.language_dir:
             # Install the contents of each backend's `language` directory into
             # `triton.language.extra`.
-            for x in os.listdir(backend.language_dir):
-                yield (f"triton.language.extra.{x}", os.path.join(backend.language_dir, x))
+            for x in sorted(os.listdir(backend.language_dir)):
+                source_dir = os.path.join(backend.language_dir, x)
+                if os.path.isdir(source_dir):
+                    yield (f"triton.language.extra.{x}", source_dir)
 
         if backend.tools_dir:
             # Install the contents of each backend's `tools` directory into
             # `triton.tools.extra`.
-            for x in os.listdir(backend.tools_dir):
-                yield (f"triton.tools.extra.{x}", os.path.join(backend.tools_dir, x))
+            for x in sorted(os.listdir(backend.tools_dir)):
+                source_dir = os.path.join(backend.tools_dir, x)
+                if os.path.isdir(source_dir):
+                    yield (f"triton.tools.extra.{x}", source_dir)
 
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         yield ("triton.profiler", "third_party/proton/proton")
@@ -783,14 +787,16 @@ def get_packages():
         if backend.language_dir:
             # Install the contents of each backend's `language` directory into
             # `triton.language.extra`.
-            for x in os.listdir(backend.language_dir):
-                yield f"triton.language.extra.{x}"
+            for x in sorted(os.listdir(backend.language_dir)):
+                if os.path.isdir(os.path.join(backend.language_dir, x)):
+                    yield f"triton.language.extra.{x}"
 
         if backend.tools_dir:
             # Install the contents of each backend's `tools` directory into
             # `triton.tools.extra`.
-            for x in os.listdir(backend.tools_dir):
-                yield f"triton.tools.extra.{x}"
+            for x in sorted(os.listdir(backend.tools_dir)):
+                if os.path.isdir(os.path.join(backend.tools_dir, x)):
+                    yield f"triton.tools.extra.{x}"
 
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         yield "triton.profiler"
@@ -808,19 +814,21 @@ def add_link_to_backends(external_only):
             # `triton.language.extra`.
             extra_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "python", "triton", "language",
                                                      "extra"))
-            for x in os.listdir(backend.language_dir):
+            for x in sorted(os.listdir(backend.language_dir)):
                 src_dir = os.path.join(backend.language_dir, x)
-                install_dir = os.path.join(extra_dir, x)
-                update_symlink(install_dir, src_dir)
+                if os.path.isdir(src_dir):
+                    install_dir = os.path.join(extra_dir, x)
+                    update_symlink(install_dir, src_dir)
 
         if backend.tools_dir:
             # Link the contents of each backend's `tools` directory into
             # `triton.tools.extra`.
             extra_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "python", "triton", "tools", "extra"))
-            for x in os.listdir(backend.tools_dir):
+            for x in sorted(os.listdir(backend.tools_dir)):
                 src_dir = os.path.join(backend.tools_dir, x)
-                install_dir = os.path.join(extra_dir, x)
-                update_symlink(install_dir, src_dir)
+                if os.path.isdir(src_dir):
+                    install_dir = os.path.join(extra_dir, x)
+                    update_symlink(install_dir, src_dir)
 
 
 def add_link_to_proton():

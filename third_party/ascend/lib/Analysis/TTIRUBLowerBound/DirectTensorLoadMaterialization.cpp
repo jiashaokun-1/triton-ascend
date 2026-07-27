@@ -1110,9 +1110,11 @@ LogicalResult materializeDynamicCVDotExp(
     return defer(reasons, "unsupported-dynamic-cv-accumulator");
 
   if (!dot.getResult().hasOneUse())
-    return defer(reasons, "unsupported-dynamic-cv-dataflow");
+    return defer(reasons, "unsupported-dot-result-use");
   auto exp = dyn_cast<math::ExpOp>(*dot.getResult().getUsers().begin());
-  if (!exp || !isDirectlyInEntryBlock(exp, function) ||
+  if (!exp)
+    return defer(reasons, "unsupported-dot-requires-full-boundary");
+  if (!isDirectlyInEntryBlock(exp, function) ||
       exp->getNumOperands() != 1 || exp->getNumResults() != 1 ||
       exp->getNumRegions() != 0 || exp->getNumSuccessors() != 0 ||
       exp.getOperand().getType() != outputType ||

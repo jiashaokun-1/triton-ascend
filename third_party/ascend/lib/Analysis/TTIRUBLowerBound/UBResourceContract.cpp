@@ -121,6 +121,107 @@ private:
   int64_t maxTiles;
 };
 
+class UBAlignmentContract final : public UBResourceContract {
+public:
+  UBAlignmentContract(const PipelineStageContext &stage,
+                      int64_t expectedResourceCount, int64_t alignmentBytes)
+      : stageName(stage.stageName),
+        expectedResourceCount(expectedResourceCount),
+        alignmentBytes(alignmentBytes) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef id() const override { return "ub-alignment"; }
+  StringRef version() const override { return "1"; }
+
+  bool matches(const PipelineStageContext &context) const override {
+    return context.stageName == stageName &&
+           haveEqualOptions(context.options, options);
+  }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &) const override {
+    if (expectedResourceCount <= 0 || alignmentBytes <= 0 ||
+        graph.resources().size() !=
+            static_cast<size_t>(expectedResourceCount) ||
+        llvm::any_of(graph.resources(), [](const auto &resource) {
+          return resource.validity != ValidityState::Valid ||
+                 resource.minPayloadBytes <= 0 ||
+                 resource.minInstances <= 0;
+        }))
+      return ContractDisposition::Invalidate;
+    for (size_t ordinal = 0; ordinal < graph.resources().size(); ++ordinal) {
+      if (failed(graph.alignResourcePayload(
+              static_cast<ResourceId>(ordinal), alignmentBytes, id())))
+        return ContractDisposition::InternalError;
+    }
+    return ContractDisposition::Transform;
+  }
+
+private:
+  std::string stageName;
+  StringMap<std::string> options;
+  int64_t expectedResourceCount;
+  int64_t alignmentBytes;
+};
+
+class SequentialContract final : public UBResourceContract {
+public:
+  SequentialContract(
+      StringRef contractId, StringRef contractVersion,
+      const PipelineStageContext &stage,
+      std::vector<std::unique_ptr<UBResourceContract>> contracts)
+      : contractId(contractId.str()), contractVersion(contractVersion.str()),
+        stageName(stage.stageName), contracts(std::move(contracts)) {
+    for (const auto &option : stage.options)
+      options[option.getKey()] = option.getValue();
+  }
+
+  StringRef id() const override { return contractId; }
+  StringRef version() const override { return contractVersion; }
+
+  bool matches(const PipelineStageContext &context) const override {
+    if (context.stageName != stageName ||
+        !haveEqualOptions(context.options, options) || contracts.empty())
+      return false;
+    return llvm::all_of(contracts, [&](const auto &contract) {
+      return contract && contract->matches(context);
+    });
+  }
+
+  ContractDisposition
+  apply(MandatoryUBResourceGraph &graph,
+        const PipelineStageContext &context) const override {
+    if (!matches(context))
+      return ContractDisposition::InternalError;
+    bool transformed = false;
+    for (const auto &contract : contracts) {
+      switch (contract->apply(graph, context)) {
+      case ContractDisposition::Preserve:
+        break;
+      case ContractDisposition::Transform:
+        transformed = true;
+        break;
+      case ContractDisposition::Invalidate:
+        return ContractDisposition::Invalidate;
+      case ContractDisposition::InternalError:
+        return ContractDisposition::InternalError;
+      }
+    }
+    return transformed ? ContractDisposition::Transform
+                       : ContractDisposition::Preserve;
+  }
+
+private:
+  std::string contractId;
+  std::string contractVersion;
+  std::string stageName;
+  StringMap<std::string> options;
+  std::vector<std::unique_ptr<UBResourceContract>> contracts;
+};
+
 class DirectCopyContractBase : public UBResourceContract {
 public:
   DirectCopyContractBase(const PipelineStageContext &stage,
@@ -1081,6 +1182,21 @@ LogicalResult PipelineContractRegistry::applyOrInvalidateAll(
 std::unique_ptr<UBResourceContract> makeFixedTileContract(StringRef stageName,
                                                           int64_t maxTiles) {
   return std::make_unique<FixedTileContract>(stageName, maxTiles);
+}
+
+std::unique_ptr<UBResourceContract> makeUBAlignmentContract(
+    const PipelineStageContext &stage, int64_t expectedResourceCount,
+    int64_t alignmentBytes) {
+  return std::make_unique<UBAlignmentContract>(
+      stage, expectedResourceCount, alignmentBytes);
+}
+
+std::unique_ptr<UBResourceContract> makeSequentialContract(
+    StringRef contractId, StringRef contractVersion,
+    const PipelineStageContext &stage,
+    std::vector<std::unique_ptr<UBResourceContract>> contracts) {
+  return std::make_unique<SequentialContract>(
+      contractId, contractVersion, stage, std::move(contracts));
 }
 
 std::unique_ptr<UBResourceContract>
