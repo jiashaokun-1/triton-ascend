@@ -233,8 +233,10 @@ ctest --test-dir .build-ttir-ub \
 以下任务必须在用户提供的 CANN 容器完成；本地开发阶段明确跳过：
 
 - [~] 在同一环境重建 `libtriton`、suffix compiler、`cvpipeline_ub_model_cpp`：
-  `libtriton` 已在 2026-07-27 CANN 9.0.0 环境重建；后两个组件受匹配 LLVM/MLIR
-  development package 缺失阻塞，不能用安装版 BiShengIR 替代。
+  `libtriton` 已在 2026-07-27 CANN 9.0.0 环境重建；完整 LLVM/MLIR development
+  build 也已成功，但 pinned LLVM 19.1.7 快照缺少官方 `0051` 补丁所需的
+  `LinalgExtensions.cpp`，因此不能生成真实 `BiShengIRLinalgDialectExt`。后两个
+  组件仍受 source/patch-version incompatibility 阻塞，不能用安装版 BiShengIR 替代。
 - [~] 记录 binaries 和 semantic model 的 SHA256：已记录 `libtriton` 和安装版
   BiShengIR hash；suffix/model 因未能构建而无有效 hash。
 - [~] 运行完整 C++ GTest 和 pybind/Python focused tests：focused suite 已在 rebuilt

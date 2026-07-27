@@ -45,4 +45,34 @@ def test_suffix_oracle_configure_enables_ascend_backend():
     assert "-DTRITON_CODEGEN_BACKENDS=ascend" in command
     assert "-DTRITON_ASCEND_BUILD_BISHENGIR_ORACLE_TOOLS=ON" in command
     assert "-DBISHENGIR_BUILD_PYTHON_BINDINGS=OFF" in command
+    assert "-DBSPUB_DAVINCI_BISHENGIR=ON" in command
     assert command[-1] == "-DCUSTOM=ON"
+
+
+def test_suffix_oracle_rejects_llvm_snapshot_without_required_extension(
+    tmp_path: Path,
+):
+    source = tmp_path / "AscendNPU-IR"
+    linalg_dir = (
+        source
+        / "third-party"
+        / "llvm-project"
+        / "mlir"
+        / "lib"
+        / "Dialect"
+        / "Linalg"
+        / "IR"
+    )
+    linalg_dir.mkdir(parents=True)
+    (linalg_dir / "CMakeLists.txt").write_text("add_mlir_dialect_library(MLIRLinalgDialect)\n")
+    patch = tmp_path / prepare.LLVM_LINALG_EXTENSION_PATCH_NAME
+    patch.write_text("not reached when LinalgExtensions.cpp is absent\n")
+
+    # The required source disappeared from a newer LLVM snapshot.  The oracle
+    # must fail closed instead of faking the missing library.
+    try:
+        prepare.llvm_linalg_extension_patch_state(source, patch)
+    except RuntimeError as error:
+        assert "LinalgExtensions.cpp is absent" in str(error)
+    else:
+        raise AssertionError("incompatible LLVM snapshot unexpectedly accepted")

@@ -18,6 +18,7 @@ PATCH_NAME = "0001-feat-port-same-schema-CVPipeline-suffix-oracle.patch"
 COMPAT_PATCH_NAME = (
     "0002-fix-disable-bishengir-python-bindings-for-suffix-oracle.patch"
 )
+LLVM_LINALG_EXTENSION_PATCH_NAME = "0051-[Huawei]-Modify-CMakeLists.patch"
 ORACLE_CODEGEN_BACKEND = "ascend"
 BASE_FILE_SHA256 = {
     "bishengir/include/bishengir/Dialect/HIVM/Transforms/Passes.td":
@@ -157,6 +158,48 @@ def compat_patch_state(source: Path, patch: Path) -> str:
     return state
 
 
+def llvm_linalg_extension_patch_state(source: Path, patch: Path) -> str:
+    """Return whether the required BiShengIR MLIR extension is available.
+
+    ``BiShengIRLinalgDialectExt`` is not defined by AscendNPU-IR itself.  It is
+    added to the matching LLVM/MLIR source by AscendNPU-IR patch 0051.  Do not
+    configure the suffix oracle against a newer LLVM snapshot and silently
+    replace that library with a dummy target: doing so would change the suffix
+    pipeline that the oracle is intended to validate.
+    """
+    llvm_source = source / "third-party" / "llvm-project"
+    linalg_dir = llvm_source / "mlir" / "lib" / "Dialect" / "Linalg" / "IR"
+    cmake = linalg_dir / "CMakeLists.txt"
+    extension_source = linalg_dir / "LinalgExtensions.cpp"
+    if not cmake.is_file():
+        raise RuntimeError(
+            "same-schema suffix LLVM source is missing "
+            "mlir/lib/Dialect/Linalg/IR/CMakeLists.txt"
+        )
+    if "BiShengIRLinalgDialectExt" in cmake.read_text():
+        return "applied"
+    if not extension_source.is_file():
+        raise RuntimeError(
+            "same-schema suffix LLVM/MLIR source is incompatible with "
+            f"AscendNPU-IR patch {patch.name}: required "
+            "mlir/lib/Dialect/Linalg/IR/LinalgExtensions.cpp is absent. "
+            "Use an AscendNPU-IR revision whose LLVM submodule and patch "
+            "series match, or supply a prebuilt same-schema BiShengIR "
+            "toolchain. The oracle will not synthesize a replacement target."
+        )
+    result = _run(
+        ["git", "apply", "--check", str(patch)],
+        check=False,
+        cwd=llvm_source,
+    )
+    if result.returncode == 0:
+        return "ready"
+    raise RuntimeError(
+        "same-schema suffix LLVM/MLIR source does not accept required "
+        f"AscendNPU-IR patch {patch.name}:\n{result.stderr.strip()}"
+    )
+
+
 def _require_clean_source(source: Path) -> None:
     if source_revision(source) is None:
         return
@@ -189,6 +232,7 @@ def _configure_command(
         "-DTRITON_BUILD_UT=OFF",
         "-DTRITON_BUILD_PYTHON_MODULE=OFF",
         "-DBISHENGIR_BUILD_PYTHON_BINDINGS=OFF",
+        "-DBSPUB_DAVINCI_BISHENGIR=ON",
         *cmake_args,
     ]
 
@@ -212,6 +256,20 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=tool.parent / "patches" / COMPAT_PATCH_NAME,
     )
+    parser.add_argument(
+        "--llvm-linalg-extension-patch",
+        type=Path,
+        default=(
+            triton_root
+            / "third_party"
+            / "ascend"
+            / "AscendNPU-IR"
+            / "build-tools"
+            / "patches"
+            / "llvm-project"
+            / LLVM_LINALG_EXTENSION_PATCH_NAME
+        ),
+    )
     parser.add_argument("--apply-patch", action="store_true")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--cmake", default="cmake")
@@ -227,12 +285,18 @@ def main(argv: list[str] | None = None) -> int:
     source = arguments.source.resolve()
     patch = arguments.patch.resolve()
     compat_patch = arguments.compat_patch.resolve()
+    llvm_linalg_extension_patch = arguments.llvm_linalg_extension_patch.resolve()
     if not (source / "CMakeLists.txt").is_file():
         parser.error(f"invalid AscendNPU-IR source: {source}")
     if not patch.is_file():
         parser.error(f"missing same-schema suffix patch: {patch}")
     if not compat_patch.is_file():
         parser.error(f"missing same-schema suffix compatibility patch: {compat_patch}")
+    if not llvm_linalg_extension_patch.is_file():
+        parser.error(
+            "missing same-schema suffix LLVM Linalg extension patch: "
+            f"{llvm_linalg_extension_patch}"
+        )
     if arguments.jobs <= 0:
         parser.error("--jobs must be positive")
 
@@ -244,23 +308,46 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     state = patch_state(source, patch)
-    if state == "ready" and arguments.apply_patch:
+    compat_state = compat_patch_state(source, compat_patch)
+    llvm_linalg_extension_state = llvm_linalg_extension_patch_state(
+        source, llvm_linalg_extension_patch
+    )
+    needs_apply = (
+        state == "ready"
+        or compat_state == "ready"
+        or llvm_linalg_extension_state == "ready"
+    )
+    if needs_apply and arguments.apply_patch:
         _require_clean_source(source)
+
+    if state == "ready" and arguments.apply_patch:
         _run(["git", "apply", str(patch)], cwd=source)
         state = patch_state(source, patch)
 
-    compat_state = compat_patch_state(source, compat_patch)
     if compat_state == "ready" and arguments.apply_patch:
-        _require_clean_source(source)
         _run(["git", "apply", "--ignore-space-change", str(compat_patch)],
              cwd=source)
         compat_state = compat_patch_state(source, compat_patch)
 
+    if llvm_linalg_extension_state == "ready" and arguments.apply_patch:
+        _run(
+            ["git", "apply", str(llvm_linalg_extension_patch)],
+            cwd=source / "third-party" / "llvm-project",
+        )
+        llvm_linalg_extension_state = llvm_linalg_extension_patch_state(
+            source, llvm_linalg_extension_patch
+        )
+
     binary = None
     if arguments.build_dir is not None:
-        if state != "applied" or compat_state != "applied":
+        if (
+            state != "applied"
+            or compat_state != "applied"
+            or llvm_linalg_extension_state != "applied"
+        ):
             raise RuntimeError(
-                "--build-dir requires applied patches; pass --apply-patch"
+                "--build-dir requires applied BiShengIR and LLVM/MLIR "
+                "patches; pass --apply-patch"
             )
         build_dir = arguments.build_dir.resolve()
         _run(_configure_command(
@@ -288,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
         "patch_state": state,
         "compat_patch": str(compat_patch),
         "compat_patch_state": compat_state,
+        "llvm_linalg_extension_patch": str(llvm_linalg_extension_patch),
+        "llvm_linalg_extension_patch_state": llvm_linalg_extension_state,
         "binary": str(binary) if binary is not None else None,
     }, sort_keys=True))
     return 0
