@@ -1,0 +1,196 @@
+diff --git a/bishengir/tools/bishengir-cvpipeline-suffix-compile/CMakeLists.txt b/bishengir/tools/bishengir-cvpipeline-suffix-compile/CMakeLists.txt
+--- a/bishengir/tools/bishengir-cvpipeline-suffix-compile/CMakeLists.txt
++++ b/bishengir/tools/bishengir-cvpipeline-suffix-compile/CMakeLists.txt
+@@ -11,6 +11,8 @@
+ get_property(PRIVATE_BISHENGIR_CONVERSION_LIBS GLOBAL PROPERTY BISHENGIR_CONVERSION_LIBS)
+ get_property(PRIVATE_BISHENGIR_TRANSLATION_LIBS GLOBAL PROPERTY BISHENGIR_TRANSLATION_LIBS)
+ get_property(PUBLIC_BISHENGIR_CONVERSION_LIBS GLOBAL PROPERTY BISHENGIR_CONVERSION_OPEN_SOURCE_LIBS)
++get_property(triton_dialect_registration_deps GLOBAL PROPERTY TRITON_DIALECT_REGISTRATION_DEPS)
++get_property(BISHENGIR_TRITON_LIBS GLOBAL PROPERTY TRITON_LIBS)
+ 
+ set(LIBS
+   ${TEST_LIBS}
+@@ -18,12 +20,15 @@
+   ${PRIVATE_BISHENGIR_CONVERSION_LIBS}
+   ${PRIVATE_BISHENGIR_TRANSLATION_LIBS}
+   ${PUBLIC_BISHENGIR_CONVERSION_LIBS}
++  ${BISHENGIR_TRITON_LIBS}
++  BiShengIRRegBaseCompileLib
+ )
+ 
+ add_bishengir_publish_tool(bishengir-cvpipeline-suffix-compile
+   bishengir-cvpipeline-suffix-compile.cpp
+ 
+   DEPENDS
++  ${triton_dialect_registration_deps}
+   ${LIBS}
+ )
+ 
+@@ -34,4 +39,12 @@
+     PRIVATE -Wshadow -Werror=shadow)
+ endif()
+ target_link_libraries(bishengir-cvpipeline-suffix-compile PRIVATE ${LIBS})
++# InitAllDialects.h may include Triton's bundled Proton pass declarations.  In
++# newer BiShengIR trees their generated header is not pulled in through LIBS.
++# Keep the dependency conditional so older source trees without Proton remain
++# buildable.
++if(TARGET ProtonGPUTransformsIncGen)
++  add_dependencies(bishengir-cvpipeline-suffix-compile
++    ProtonGPUTransformsIncGen)
++endif()
+ mlir_check_all_link_libraries(bishengir-cvpipeline-suffix-compile)
+diff --git a/bishengir/tools/bishengir-cvpipeline-suffix-compile/bishengir-cvpipeline-suffix-compile.cpp b/bishengir/tools/bishengir-cvpipeline-suffix-compile/bishengir-cvpipeline-suffix-compile.cpp
+--- a/bishengir/tools/bishengir-cvpipeline-suffix-compile/bishengir-cvpipeline-suffix-compile.cpp
++++ b/bishengir/tools/bishengir-cvpipeline-suffix-compile/bishengir-cvpipeline-suffix-compile.cpp
+@@ -79,6 +79,7 @@
+ #include <map>
+ #include <mutex>
+ #include <thread>
++#include <type_traits>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -849,7 +850,7 @@
+     pm.nest<func::FuncOp>().addPass(createMarkStrideAlignPass());
+   pm.nest<func::FuncOp>().addPass(memref::createFoldAllocReshapePass());
+   if (!disableEnableStrideAlign)
+-    pm.nest<func::FuncOp>().addPass(createEnableStrideAlignPass());
++    pm.addPass(createEnableStrideAlignPass());
+ }
+ 
+ static void addSyncBlockLockPreparePipeline(OpPassManager &pm) {
+@@ -952,7 +953,76 @@
+   pm.nest<func::FuncOp>().addPass(createPlanMemoryPass(planMemoryOption));
+ }
+ 
+-static void buildSuffixPipeline(OpPassManager &pm) {
++template <typename T, typename = void>
++struct HasEnableAutoBalance : std::false_type {};
++
++template <typename T>
++struct HasEnableAutoBalance<
++    T, std::void_t<decltype(std::declval<T &>().enableAutoBalance)>>
++    : std::true_type {};
++
++template <typename T, typename = void>
++struct HasEnableAutoPreload : std::false_type {};
++
++template <typename T>
++struct HasEnableAutoPreload<
++    T, std::void_t<decltype(std::declval<T &>().enableAutoPreload)>>
++    : std::true_type {};
++
++template <typename T, typename = void>
++struct HasEnableSkewMode : std::false_type {};
++
++template <typename T>
++struct HasEnableSkewMode<
++    T, std::void_t<decltype(std::declval<T &>().enableSkewMode)>>
++    : std::true_type {};
++
++template <typename Options>
++static LogicalResult configureCVPipeliningOptions(Options &pipelineOptions) {
++  if constexpr (HasEnableAutoBalance<Options>::value) {
++    pipelineOptions.enableAutoBalance = enableHIVMAutoCVBalance;
++  } else if (!enableHIVMAutoCVBalance) {
++    llvm::errs()
++        << "[ERROR] current CVPipeliningOptions fixes auto CV balance on; "
++           "--enable-hivm-auto-cv-balance=false is unsupported by this "
++           "suffix toolchain\n";
++    return failure();
++  }
++
++  if constexpr (HasEnableAutoPreload<Options>::value) {
++    pipelineOptions.enableAutoPreload = enablePreload;
++  } else if constexpr (HasEnableSkewMode<Options>::value) {
++    pipelineOptions.enableSkewMode = enablePreload;
++  } else {
++    llvm::errs()
++        << "[ERROR] current CVPipeliningOptions has no preload/skew option; "
++           "cannot reproduce the suffix pipeline\n";
++    return failure();
++  }
++  return success();
++}
++
++static LogicalResult addModuleOrFuncPass(OpPassManager &pm,
++                                         std::unique_ptr<Pass> pass) {
++  const auto opName = pass->getOpName();
++  if (!opName) {
++    llvm::errs() << "[ERROR] suffix pass has no target operation\n";
++    return failure();
++  }
++  if (*opName == ModuleOp::getOperationName()) {
++    pm.addPass(std::move(pass));
++    return success();
++  }
++  if (*opName == func::FuncOp::getOperationName()) {
++    pm.nest<func::FuncOp>().addPass(std::move(pass));
++    return success();
++  }
++  llvm::errs() << "[ERROR] unexpected suffix pass target: " << *opName
++               << '\n';
++  return failure();
++}
++
++static LogicalResult buildSuffixPipeline(OpPassManager &pm) {
+   if (localPlanMemoryOnly) {
+     if (!excludeDumpLayersForRuntimeTiming())
+       pm.addPass(createDumpIRBeforeLocalPlanMemoryPass());
+@@ -962,13 +1032,13 @@
+     planMemoryOption.restrictInplaceAsISA = restrictInplaceAsISA;
+     planMemoryOption.ubOracleOnly = ubOracleOnly;
+     pm.nest<func::FuncOp>().addPass(createPlanMemoryPass(planMemoryOption));
+-    return;
++    return success();
+   }
+ 
+   if (!disableAutoCVWorkSpaceManage && !disableCVPipelining) {
+     CVPipeliningOptions pipelineOptions;
+-    pipelineOptions.enableAutoBalance = enableHIVMAutoCVBalance;
+-    pipelineOptions.enableAutoPreload = enablePreload;
++    if (failed(configureCVPipeliningOptions(pipelineOptions)))
++      return failure();
+     pm.nest<func::FuncOp>().addPass(createCVPipeliningPass(pipelineOptions));
+   }
+   if (!excludeDumpLayersForRuntimeTiming() &&
+@@ -980,7 +1050,7 @@
+     pm.addPass(std::make_unique<DumpC1SemanticOraclePass>(
+         dumpC1SemanticOracle.getValue(), dumpC1GenericIR.getValue()));
+   if (stopAfterCVPipelining)
+-    return;
++    return success();
+ 
+   if (tileMixCubeLoop != 1 || tileMixVectorLoop != 1) {
+     pm.addPass(createTileCubeVectorLoopPass(
+@@ -1006,7 +1076,9 @@
+ 
+   if (enableTritonKernelCompile && !disableAutoCVWorkSpaceManage &&
+       !disableAutoCVGlobalWorkspacePlan) {
+-    pm.nest<func::FuncOp>().addPass(createInsertInferWorkSpaceSizeFuncPass());
++    if (failed(addModuleOrFuncPass(
++            pm, createInsertInferWorkSpaceSizeFuncPass())))
++      return failure();
+   }
+ 
+   if (enableTritonKernelCompile)
+@@ -1041,6 +1113,7 @@
+ 
+   addBufferizationPipeline(pm);
+   addPostBufferizationToLocalPlanMemoryPipeline(pm);
++  return success();
+ }
+ 
+ static void printVersion(llvm::raw_ostream &os) {
+@@ -1215,7 +1288,10 @@
+   }
+   PassManager pm(&context);
+   RuntimePassTimingState runtimePassTiming;
+-  buildSuffixPipeline(pm);
++  if (failed(buildSuffixPipeline(pm))) {
++    llvm::errs() << "[ERROR] Failed to construct CVPipeline suffix\n";
++    return EXIT_FAILURE;
++  }
+   if (failed(applyPassManagerCLOptions(pm))) {
+     llvm::errs() << "[ERROR] Failed to apply pass manager options\n";
+     return EXIT_FAILURE;

@@ -244,6 +244,16 @@ ctest --test-dir .build-ttir-ub \
 - [~] 记录 binaries 和 semantic model 的 SHA256：已记录 `libtriton` 和安装版
   BiShengIR hash；旧 LLVM `2f203398` suffix 的 hash 已记录于 validation record，
   但它不能消费当前 boundary，因而不是有效 same-schema hash；semantic model 仍无有效 hash。
+- [~] 2026-07-28 对 public BiShengIR master (`c6b8b55e…`，LLVM
+  `c195c…`) 完成诊断性构建：`0003-fix-master-suffix-api-compat.patch` 已对隔离
+  源码通过 reversible check，suffix SHA256 为
+  `6a4273727e9c0187b2cb08a21d2a66a50f5753294c56b2a866180fe8e6c16f15`，
+  并能解析 P4 boundary、输出 seed 0 PlanMemory（AIV peak=4096 bits）。但统一
+  oracle 的 9 个 case 仍有 1 个 violation：Dynamic fixture 的真实
+  `auto_tile` 为 `false`，而当前 producer-identity fixture 期望 `true`。这说明
+  “能解析 schema”不足以替代完整 PipelineIdentity；该 master patch 仅是可复现
+  diagnostic artifact，不接入 same-schema helper、不生成 profile，也不替代
+  seeds/retry/replay final gate。
 - [~] 运行完整 C++ GTest 和 pybind/Python focused tests：focused suite 已在 rebuilt
   binary 上 `348 passed`；C++ GTest target 未构建。
 - [ ] Dynamic seeds `0..19`（需要 same-schema suffix oracle）。
