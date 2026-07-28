@@ -233,13 +233,14 @@ ctest --test-dir .build-ttir-ub \
 以下任务必须在用户提供的 CANN 容器完成；本地开发阶段明确跳过：
 
 - [~] 在同一环境重建 `libtriton`、suffix compiler、`cvpipeline_ub_model_cpp`：
-  `libtriton` 已在 2026-07-27 CANN 9.0.0 环境重建；完整 LLVM/MLIR development
-  build 也已成功，但 pinned LLVM 19.1.7 快照缺少官方 `0051` 补丁所需的
-  `LinalgExtensions.cpp`，因此不能生成真实 `BiShengIRLinalgDialectExt`。后两个
-  组件仍受 source/patch-version incompatibility 阻塞，不能用安装版 BiShengIR 替代。
-  另一个可生成该 target 的旧 Ascend LLVM `2f203398` 已成功构建 suffix，但不能解析
-  当前 P4 boundary 的 `eviction_policy=<EvictFirst>`，因此同样不能用于 same-schema
-  验证。
+  `libtriton` 已在 2026-07-27 CANN 9.0.0 环境重建；当前 source 的完整 vendor LLVM
+  patch series 也已在隔离副本成功构建 suffix（SHA256
+  `0f1bb44d67cb9ed07c545d340bda7f4a391d6687d57158ca169a43759eeeb762`）。这证明
+  `0051` 不能单独应用并非最终 blocker；完整有序补丁链可恢复开发 API。实际 P4
+  boundary 仍包含该 source 的 `hivm.hir.load` parser 未定义的
+  `eviction_policy=<EvictFirst>` 和 `core_type=<CUBE>` 字段，因此 suffix 无法生成
+  post-TileAndBindSubBlock snapshot，same-schema final gate 仍不可用。不能用安装版
+  BiShengIR 或旧 LLVM 通过改写/忽略这些字段替代。
 - [~] 记录 binaries 和 semantic model 的 SHA256：已记录 `libtriton` 和安装版
   BiShengIR hash；旧 LLVM `2f203398` suffix 的 hash 已记录于 validation record，
   但它不能消费当前 boundary，因而不是有效 same-schema hash；semantic model 仍无有效 hash。
