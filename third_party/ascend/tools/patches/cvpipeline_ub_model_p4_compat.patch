@@ -61,7 +61,11 @@ diff --git a/cvpipeline_ub_model_cpp/src/ir/generic_op_semantics.hpp b/cvpipelin
 +          "destination memref operands and no results");
    }
  }
-@@ -265,0 +290,9 @@
+@@ -266,5 +291,14 @@ inline void ApplyOperationSemantics(GenericOperation &operation) {
+   } else if (operation.name == "memref.store" &&
+              operation.operands.size() >= 2) {
+     operation.effects = GenericMemoryEffect(
+         "write", std::to_string(operation.operands[1]), false);
 +  } else if (operation.name == "memref.copy" &&
 +             operation.operands.size() == 2) {
 +    operation.effects = JoinDelimited(
@@ -71,6 +75,7 @@ diff --git a/cvpipeline_ub_model_cpp/src/ir/generic_op_semantics.hpp b/cvpipelin
 +            GenericMemoryEffect(
 +                "write", std::to_string(operation.operands[1]), true),
 +        }, ", ");
+   } else if (operation.name == "hivm.hir.atomic_cas") {
 diff --git a/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp b/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp
 --- a/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp
 +++ b/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp
@@ -83,7 +88,14 @@ diff --git a/cvpipeline_ub_model_cpp/src/ir/hivm_op_semantics.hpp b/cvpipeline_u
 diff --git a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp b/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp
 --- a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp
 +++ b/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysis.hpp
-@@ -1071,0 +1072,15 @@
+@@ -1065,8 +1065,23 @@ inline MemLivenessAnalysis buildMemLivenessAnalysis(
+     if (op.opName == "memref.store") {
+       std::vector<std::string> operands = operationOperandNames(op);
+       if (operands.size() >= 2)
+         UpdateOpGenInfo(info, operands[1]);
+       OpKillHandle(info);
+       continue;
+     }
 +    if (op.opName == "memref.copy") {
 +      std::vector<std::string> operands = operationOperandNames(op);
 +      if (!operands.empty())
@@ -99,6 +111,7 @@ diff --git a/cvpipeline_ub_model_cpp/src/passes/plan_memory/mem_liveness_analysi
 +      OpKillHandle(info);
 +      continue;
 +    }
+     if (IsDestinationStyleOp(op.opName)) {
 diff --git a/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp b/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp
 --- a/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp
 +++ b/cvpipeline_ub_model_cpp/src/pipeline/plan_memory_input_semantic_ir.hpp

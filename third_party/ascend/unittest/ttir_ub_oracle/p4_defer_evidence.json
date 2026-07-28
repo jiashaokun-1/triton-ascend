@@ -10,19 +10,35 @@
       "name": "cvpipeline-ub-post-model",
       "source_revision": "ecc3209a2b9d8171c170dbfcc2e0012ef98711c2",
       "vendor_llvm_revision": "cd708029e0b2869e80abe31ddb175f7c35361f90",
-      "suffix_compiler_sha256": "f9a2692a71a5af11052b7723fdd14713b132ac6f39c16ae4e11c4f910a35c8ea",
-      "semantic_model_sha256": "948acdc0d41f4a011cbcd9590e7ba1a57ada28fbe9990031918b77cb68ad8381",
+      "suffix_compiler_sha256": "5658d600f2bea30398ef5fd8c660658ade23dfffd842189d60026ab506370db8",
+      "semantic_model_sha256": "0d398b32d46f7e93af8bfca44a75abf61afddc524d04d3cf5cf89385f5fb6b40",
       "seed": 0,
       "boundary_parse": "accepted",
-      "last_successful_stage": "suffix-5-InferHIVMMemScope",
-      "failure": "segfault before MarkMultiBuffer/PlanMemoryInputBridge",
-      "local_planmemory_from_own_generic_snapshot": {
-        "AIV": 4096,
-        "AIC": null
+      "compatibility_patch": "cvpipeline_suffix_default_memory_space.patch",
+      "default_alignment_replay": {
+        "command_overrides": [],
+        "peak_bits_by_execution_scope": {
+          "AIC": {
+            "UB": 4096,
+            "L0A": 16384,
+            "L0C": 8192
+          },
+          "AIV": {
+            "UB": 4096
+          }
+        },
+        "result": "success"
       },
       "semantic_model_canonical_boundary": "generic IR parser: malformed operand list",
+      "semantic_model_before_planmemory_generic_snapshot": {
+        "result": "unsafe-empty-replay",
+        "reported_function": "debug_aiv",
+        "reported_ub_peak_bits": 0,
+        "expected_aic_ub_peak_bits": 4096,
+        "expected_aiv_ub_peak_bits": 4096
+      },
       "promotion_allowed": false,
-      "reason": "candidate loses required AIC scope and cannot complete the exact replay path"
+      "reason": "suffix reaches PlanMemory with default options after the default-memory-space fix, but the semantic model parses the generic snapshot as empty and cannot provide exact replay"
     }
   ],
   "cases": [

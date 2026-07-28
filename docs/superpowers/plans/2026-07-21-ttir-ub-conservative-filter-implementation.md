@@ -256,15 +256,16 @@ ctest --test-dir .build-ttir-ub \
   seeds/retry/replay final gate。
 - [~] 2026-07-28 对本地 `cvpipeline-ub-post-model` source（revision
   `ecc3209a…`，vendor LLVM `cd708029…`）在同一 CANN 容器完成隔离构建：suffix SHA256
-  `f9a2692a71a5af11052b7723fdd14713b132ac6f39c16ae4e11c4f910a35c8ea`，semantic
-  model SHA256 `948acdc0d41f4a011cbcd9590e7ba1a57ada28fbe9990031918b77cb68ad8381`。
-  suffix 能解析原始 P4 boundary 并生成 `post-8-TileAndBindSubBlock` snapshot，却在
-  `suffix-5-InferHIVMMemScope` 之后、`MarkMultiBuffer`/PlanMemory input bridge
-  之前稳定 segfault。对该工具自身 `suffix-5` generic snapshot 单独运行 local
-  PlanMemory 可得到 AIV=4096 bits，但缺少 producer boundary 必须保留的 AIC Fixpipe
-  scope；semantic model 也只接受 generic IR，直接读 canonical boundary 报
-  `generic IR parser: malformed operand list`。因此该 source 同样不是 matching
-  consumer：不得通过跳过崩溃 pass、generic/canonical 改写或仅采用 AIV peak 来完成 P4。
+  `5658d600f2bea30398ef5fd8c660658ade23dfffd842189d60026ab506370db8`，semantic
+  model SHA256 `0d398b32d46f7e93af8bfca44a75abf61afddc524d04d3cf5cf89385f5fb6b40`。
+  suffix 的 `MarkStrideAlign` 曾对合法 default memory space 解引用空 attribute；
+  仓库的 `cvpipeline_suffix_default_memory_space.patch` 可无冲突应用并修复它。修复后默认
+  alignment pipeline（无任何跳过 pass 的参数）完整抵达 PlanMemory：AIC UB=4096 bits、
+  AIV UB=4096 bits（另有 AIC L0A=16384、L0C=8192）。但 semantic model 直接读 canonical
+  boundary 仍报 `generic IR parser: malformed operand list`；即使对 suffix 导出的
+  `suffix-11` generic snapshot 重建并应用 P4 semantic compatibility patch，它仍把输入错误
+  地解析为空 `debug_aiv`，返回 0 bits。因此 suffix chain 已打通、exact semantic replay
+  仍未打通；该 source 不是 matching consumer，不能 promotion。
 - [~] 运行完整 C++ GTest 和 pybind/Python focused tests：focused suite 已在 rebuilt
   binary 上 `348 passed`；C++ GTest target 未构建。
 - [ ] Dynamic seeds `0..19`（需要 same-schema suffix oracle）。

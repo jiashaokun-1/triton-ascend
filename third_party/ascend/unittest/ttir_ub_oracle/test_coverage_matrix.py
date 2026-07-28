@@ -118,14 +118,24 @@ def test_p4_replay_shadow_evidence_is_hash_bound_and_never_promotable():
         assert len(candidate[key]) == 40 or len(candidate[key]) == 64
         assert set(candidate[key]) <= set("0123456789abcdef")
     assert candidate["boundary_parse"] == "accepted"
-    assert candidate["last_successful_stage"] == "suffix-5-InferHIVMMemScope"
-    assert candidate["failure"] == "segfault before MarkMultiBuffer/PlanMemoryInputBridge"
-    assert candidate["local_planmemory_from_own_generic_snapshot"] == {
-        "AIV": 4096,
-        "AIC": None,
+    assert candidate["compatibility_patch"] == \
+        "cvpipeline_suffix_default_memory_space.patch"
+    default_replay = candidate["default_alignment_replay"]
+    assert default_replay["command_overrides"] == []
+    assert default_replay["peak_bits_by_execution_scope"] == {
+        "AIC": {"UB": 4096, "L0A": 16384, "L0C": 8192},
+        "AIV": {"UB": 4096},
     }
+    assert default_replay["result"] == "success"
     assert candidate["semantic_model_canonical_boundary"] == \
         "generic IR parser: malformed operand list"
+    assert candidate["semantic_model_before_planmemory_generic_snapshot"] == {
+        "result": "unsafe-empty-replay",
+        "reported_function": "debug_aiv",
+        "reported_ub_peak_bits": 0,
+        "expected_aic_ub_peak_bits": 4096,
+        "expected_aiv_ub_peak_bits": 4096,
+    }
     assert candidate["promotion_allowed"] is False
     assert {case["name"] for case in evidence["cases"]} == {
         "dynamic-cv-mix-dot-exp",
