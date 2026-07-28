@@ -254,6 +254,17 @@ ctest --test-dir .build-ttir-ub \
   “能解析 schema”不足以替代完整 PipelineIdentity；该 master patch 仅是可复现
   diagnostic artifact，不接入 same-schema helper、不生成 profile，也不替代
   seeds/retry/replay final gate。
+- [~] 2026-07-28 对本地 `cvpipeline-ub-post-model` source（revision
+  `ecc3209a…`，vendor LLVM `cd708029…`）在同一 CANN 容器完成隔离构建：suffix SHA256
+  `f9a2692a71a5af11052b7723fdd14713b132ac6f39c16ae4e11c4f910a35c8ea`，semantic
+  model SHA256 `948acdc0d41f4a011cbcd9590e7ba1a57ada28fbe9990031918b77cb68ad8381`。
+  suffix 能解析原始 P4 boundary 并生成 `post-8-TileAndBindSubBlock` snapshot，却在
+  `suffix-5-InferHIVMMemScope` 之后、`MarkMultiBuffer`/PlanMemory input bridge
+  之前稳定 segfault。对该工具自身 `suffix-5` generic snapshot 单独运行 local
+  PlanMemory 可得到 AIV=4096 bits，但缺少 producer boundary 必须保留的 AIC Fixpipe
+  scope；semantic model 也只接受 generic IR，直接读 canonical boundary 报
+  `generic IR parser: malformed operand list`。因此该 source 同样不是 matching
+  consumer：不得通过跳过崩溃 pass、generic/canonical 改写或仅采用 AIV peak 来完成 P4。
 - [~] 运行完整 C++ GTest 和 pybind/Python focused tests：focused suite 已在 rebuilt
   binary 上 `348 passed`；C++ GTest target 未构建。
 - [ ] Dynamic seeds `0..19`（需要 same-schema suffix oracle）。

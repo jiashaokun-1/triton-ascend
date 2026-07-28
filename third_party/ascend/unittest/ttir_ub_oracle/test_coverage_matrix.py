@@ -103,12 +103,30 @@ def test_p5_is_explicitly_fail_closed_until_server_oracle_gates_pass():
 def test_p4_replay_shadow_evidence_is_hash_bound_and_never_promotable():
     evidence = json.loads(P4_EVIDENCE.read_text(encoding="utf-8"))
     assert evidence["schema"] == "ttir-ub-p4-defer-evidence-v2"
-    assert evidence["server_validation"] == "pending-server-unavailable"
+    assert evidence["server_validation"] == "blocked-no-matching-consumer-toolchain"
     producer = evidence["producer_libtriton_sha256"]
     assert len(producer) == 64
     assert set(producer) <= set("0123456789abcdef")
     assert evidence["consumer_suffix_compiler_sha256"] is None
     assert evidence["consumer_semantic_model_sha256"] is None
+    candidates = evidence["diagnostic_candidates"]
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["name"] == "cvpipeline-ub-post-model"
+    for key in ("source_revision", "vendor_llvm_revision",
+                "suffix_compiler_sha256", "semantic_model_sha256"):
+        assert len(candidate[key]) == 40 or len(candidate[key]) == 64
+        assert set(candidate[key]) <= set("0123456789abcdef")
+    assert candidate["boundary_parse"] == "accepted"
+    assert candidate["last_successful_stage"] == "suffix-5-InferHIVMMemScope"
+    assert candidate["failure"] == "segfault before MarkMultiBuffer/PlanMemoryInputBridge"
+    assert candidate["local_planmemory_from_own_generic_snapshot"] == {
+        "AIV": 4096,
+        "AIC": None,
+    }
+    assert candidate["semantic_model_canonical_boundary"] == \
+        "generic IR parser: malformed operand list"
+    assert candidate["promotion_allowed"] is False
     assert {case["name"] for case in evidence["cases"]} == {
         "dynamic-cv-mix-dot-exp",
         "irregular-indirect-add",

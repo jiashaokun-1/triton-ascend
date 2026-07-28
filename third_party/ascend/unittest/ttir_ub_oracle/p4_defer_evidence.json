@@ -1,10 +1,30 @@
 {
   "schema": "ttir-ub-p4-defer-evidence-v2",
-  "captured_on": "2026-07-24",
-  "server_validation": "pending-server-unavailable",
+  "captured_on": "2026-07-28",
+  "server_validation": "blocked-no-matching-consumer-toolchain",
   "producer_libtriton_sha256": "ff7cfbcd21fa392ccb4146f3e5c6c21be13cba013a4d3bc12a4aa53af35aafa8",
   "consumer_suffix_compiler_sha256": null,
   "consumer_semantic_model_sha256": null,
+  "diagnostic_candidates": [
+    {
+      "name": "cvpipeline-ub-post-model",
+      "source_revision": "ecc3209a2b9d8171c170dbfcc2e0012ef98711c2",
+      "vendor_llvm_revision": "cd708029e0b2869e80abe31ddb175f7c35361f90",
+      "suffix_compiler_sha256": "f9a2692a71a5af11052b7723fdd14713b132ac6f39c16ae4e11c4f910a35c8ea",
+      "semantic_model_sha256": "948acdc0d41f4a011cbcd9590e7ba1a57ada28fbe9990031918b77cb68ad8381",
+      "seed": 0,
+      "boundary_parse": "accepted",
+      "last_successful_stage": "suffix-5-InferHIVMMemScope",
+      "failure": "segfault before MarkMultiBuffer/PlanMemoryInputBridge",
+      "local_planmemory_from_own_generic_snapshot": {
+        "AIV": 4096,
+        "AIC": null
+      },
+      "semantic_model_canonical_boundary": "generic IR parser: malformed operand list",
+      "promotion_allowed": false,
+      "reason": "candidate loses required AIC scope and cannot complete the exact replay path"
+    }
+  ],
   "cases": [
     {
       "name": "dynamic-cv-mix-dot-exp",
