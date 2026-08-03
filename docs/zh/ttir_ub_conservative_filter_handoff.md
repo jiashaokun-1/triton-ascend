@@ -949,3 +949,43 @@ profile 为空。
 报告和 rebuilt binary hashes。irregular 必须继续具名 defer，除非未来能从 TTIR 或 config
 获得可证明的 source extent 上界并重新提交 matcher、MURG、全 stage contracts 与 oracle。
 任一 schema、capacity、stage、execution scope 或结果漂移都继续 fail closed。
+
+## 18. 暂停快照（2026-08-03）
+
+本次工作由两个仓库的同名映射分支共同承载：
+
+| 仓库 | 暂停/恢复分支 | 暂停时提交 | 说明 |
+| --- | --- | --- | --- |
+| `triton-ascend` | `codex/ttir-ub-conservative-filter` | `40aa8072f`（P4 修复提交；本 handoff 的后续提交见该分支 HEAD） | 主实现、oracle、patch、证据和报告。 |
+| `AscendNPU-IR` | `codex/ttir-ub-conservative-filter` | `0cdf76ff8` | 映射到 `codex/cvpipeline-ub-post-model` 当前源码快照；该 worktree 的语义模型构建输出不纳入 git。 |
+
+P4 的可复现定位结论：
+
+1. post-model suffix 原先在 `hivm-mark-stride-align` 崩溃，原因是默认 memory space
+   合法为空但 pass 解引用空 Attribute；应用
+   `cvpipeline_suffix_default_memory_space.patch` 后，**默认** alignment pipeline 可完整
+   跑到 PlanMemory。
+2. 目标容器 seed 0 的该 suffix replay 结果为 AIC UB=4096 bits、AIV UB=4096 bits；AIC
+   另有 L0A=16384 bits、L0C=8192 bits。它与 analyzer 的每 scope 4096-bit 下界一致。
+3. 当前唯一 P4 gate 是 semantic model：canonical boundary 报
+   `generic IR parser: malformed operand list`；对 suffix-11 generic snapshot 则错误解析为
+   空 `debug_aiv` 并给出 0 bits。这个结果必须继续视为不可用，不能 promotion。
+
+恢复时从 triton worktree 开始：
+
+```bash
+cd /Users/sky/Code/triton-ascend/.worktrees/ttir-ub-conservative-filter
+git status --short
+git log --oneline -6
+```
+
+AscendNPU-IR 对应 worktree 为：
+
+```bash
+cd /Users/sky/Code/AscendNPU-IR/.worktrees/cvpipeline-ub-post-model
+git status --short
+git log --oneline -6
+```
+
+两处未跟踪内容都应保留在本地、但不应提交：triton 的 `.build-ttir-ub/` 与
+`memory_info_aiv.json`，以及 AscendNPU-IR 的 `cvpipeline_ub_model_cpp/output/` 构建输出。
